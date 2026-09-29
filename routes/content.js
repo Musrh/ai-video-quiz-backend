@@ -1,11 +1,27 @@
 const express = require('express');
 const axios = require('axios');
+const { fetchTranscript } = require('youtube-transcript');
 
 const router = express.Router();
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-router.get('/content', async (req, res) => {
+function cleanTranscript(items) {
+  if (!Array.isArray(items)) {
+    return '';
+  }
+
+  return items
+    .map(function (item) {
+      return item && item.text ? String(item.text).trim() : '';
+    })
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+router.get('/content', async function (req, res) {
   try {
     const videoId = String(req.query.videoId || '').trim();
 
@@ -23,7 +39,11 @@ router.get('/content', async (req, res) => {
       });
     }
 
-    console.log('Content diagnostic for video: ' + videoId);
+    console.log('Content request for video: ' + videoId);
+
+    // ------------------------------------------------------------
+    // 1. Verify video with YouTube Data API
+    // ------------------------------------------------------------
 
     const response = await axios.get(
       'https://www.googleapis.com/youtube/v3/videos',
@@ -37,7 +57,9 @@ router.get('/content', async (req, res) => {
       }
     );
 
-    const item = response.data.items && response.data.items[0];
+    const item =
+      response.data.items &&
+      response.data.items[0];
 
     if (!item) {
       return res.status(404).json({
@@ -48,75 +70,165 @@ router.get('/content', async (req, res) => {
     }
 
     const snippet = item.snippet || {};
-    const contentDetails = item.contentDetails || {};
+    const contentDetails =
+      item.contentDetails || {};
     const status = item.status || {};
-
-    const title = snippet.title || '';
-    const description = snippet.description || '';
-    const defaultLanguage = snippet.defaultLanguage || null;
-    const defaultAudioLanguage =
-      snippet.defaultAudioLanguage || null;
 
     const captionAvailable =
       contentDetails.caption === 'true';
 
-    const embeddable =
-      status.embeddable === true;
+    // ------------------------------------------------------------
+    // 2. Try to retrieve transcript
+    // ------------------------------------------------------------
 
-    const publicStatus =
-      status.privacyStatus === 'public';
+    console.log(
+      'Trying transcript extraction for: ' +
+      videoId
+    );
+
+    let transcriptItems = [];
+    let transcriptText = '';
+    let transcriptError = null;
+
+    try {
+      transcriptItems = await fetchTranscript(videoId);
+
+      transcriptText =
+        cleanTranscript(transcriptItems);
+
+      console.log(
+        'Transcript segments: ' +
+        transcriptItems.length
+      );
+
+      console.log(
+        'Transcript characters: ' +
+        transcriptText.length
+      );
+
+    } catch (error) {
+      transcriptError =
+        error && error.message
+          ? error.message
+          : String(error);
+
+      console.error(
+        'Transcript extraction failed: ' +
+        transcriptError
+      );
+    }
+
+    // ------------------------------------------------------------
+    // 3. Validate transcript
+    // ------------------------------------------------------------
+
+    const transcriptRetrieved =
+      transcriptText.length >= 200;
+
+    if (!transcriptRetrieved) {
+      return res.status(422).json({
+        ok: false,
+        videoId: videoId,
+
+        video: {
+          title: snippet.title || '',
+          description: snippet.description || '',
+          channelTitle:
+            snippet.channelTitle || '',
+          publishedAt:
+            snippet.publishedAt || null
+        },
+
+        language: {
+          defaultLanguage:
+            snippet.defaultLanguage || null,
+          defaultAudioLanguage:
+            snippet.defaultAudioLanguage || null
+        },
+
+        availability: {
+          captionAvailable:
+            captionAvailable,
+          embeddable:
+            status.embeddable === true,
+          public:
+            status.privacyStatus === 'public',
+          privacyStatus:
+            status.privacyStatus || null
+        },
+
+        textAccess: {
+          transcriptRetrieved: false,
+          transcriptCharacters:
+            transcriptText.length,
+          transcriptSegments:
+            Array.isArray(transcriptItems)
+              ? transcriptItems.length
+              : 0,
+          transcript: null,
+          error: transcriptError,
+          message:
+            'No usable transcript was retrieved.'
+        }
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 4. Return transcript
+    // ------------------------------------------------------------
 
     return res.json({
       ok: true,
       videoId: videoId,
 
       video: {
-        title: title,
-        description: description,
-        channelTitle: snippet.channelTitle || '',
-        publishedAt: snippet.publishedAt || null
+        title: snippet.title || '',
+        description: snippet.description || '',
+        channelTitle:
+          snippet.channelTitle || '',
+        publishedAt:
+          snippet.publishedAt || null
       },
 
       language: {
-        defaultLanguage: defaultLanguage,
-        defaultAudioLanguage: defaultAudioLanguage
+        defaultLanguage:
+          snippet.defaultLanguage || null,
+        defaultAudioLanguage:
+          snippet.defaultAudioLanguage || null
       },
 
       availability: {
-        captionAvailable: captionAvailable,
-        embeddable: embeddable,
-        public: publicStatus,
-        privacyStatus: status.privacyStatus || null
+        captionAvailable:
+          captionAvailable,
+        embeddable:
+          status.embeddable === true,
+        public:
+          status.privacyStatus === 'public',
+        privacyStatus:
+          status.privacyStatus || null
       },
 
       textAccess: {
-        transcriptRetrieved: false,
-        transcript: null,
-        message: captionAvailable
-          ? 'Captions are reported as available, but their text has not been retrieved.'
-          : 'No captions are reported for this video.'
+        transcriptRetrieved: true,
+        transcriptCharacters:
+          transcriptText.length,
+        transcriptSegments:
+          transcriptItems.length,
+        transcript: transcriptText,
+        error: null
       }
     });
 
   } catch (error) {
-    console.error('Content diagnostic error:', error.message);
-
-    if (error.response) {
-      console.error(
-        'YouTube API response:',
-        JSON.stringify(error.response.data)
-      );
-    }
+    console.error(
+      'Content route error:',
+      error.message
+    );
 
     return res.status(500).json({
       ok: false,
-      error: 'YouTube API request failed',
-      details:
-        error.response &&
-        error.response.data &&
-        error.response.data.error
-          ? error.response.data.error.message
-          : error.message
+      error: 'Content extraction failed',
+      details: error.message
     });
   }
 });
