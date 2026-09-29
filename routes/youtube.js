@@ -48,6 +48,10 @@ const CATEGORIES = {
   }
 };
 
+const MIN_DURATION_SECONDS = 180;
+const MAX_DURATION_SECONDS = 3600;
+const MIN_DESCRIPTION_LENGTH = 80;
+
 function parseDuration(duration) {
   if (!duration) {
     return 0;
@@ -104,16 +108,13 @@ function normalizeLanguage(language) {
     .trim();
 }
 
-/*
- * IMPORTANT:
- *
- * defaultAudioLanguage is the strongest signal available
- * from the public YouTube Data API for the language spoken
- * in the default audio track.
- *
- * defaultLanguage identifies the language of the title
- * and description metadata.
- */
+function normalizeText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
 function getLanguageStatus(video, requestedLanguage) {
   const audioLanguage = normalizeLanguage(
     video.defaultAudioLanguage
@@ -127,10 +128,6 @@ function getLanguageStatus(video, requestedLanguage) {
     requestedLanguage
   );
 
-  /*
-   * Strong confirmation:
-   * audio + metadata match requested language.
-   */
   if (
     audioLanguage === requested &&
     metadataLanguage === requested
@@ -138,9 +135,6 @@ function getLanguageStatus(video, requestedLanguage) {
     return 'strong';
   }
 
-  /*
-   * Audio is correct, metadata language missing.
-   */
   if (
     audioLanguage === requested &&
     !metadataLanguage
@@ -148,11 +142,6 @@ function getLanguageStatus(video, requestedLanguage) {
     return 'strong';
   }
 
-  /*
-   * Audio language is correct but metadata is another
-   * language. We still accept because the spoken language
-   * is the most important signal for the quiz.
-   */
   if (
     audioLanguage === requested &&
     metadataLanguage !== requested
@@ -160,10 +149,6 @@ function getLanguageStatus(video, requestedLanguage) {
     return 'audio_only';
   }
 
-  /*
-   * Metadata says the requested language but YouTube did
-   * not specify the audio language.
-   */
   if (
     !audioLanguage &&
     metadataLanguage === requested
@@ -171,16 +156,10 @@ function getLanguageStatus(video, requestedLanguage) {
     return 'metadata_only';
   }
 
-  /*
-   * No language information at all.
-   */
   if (!audioLanguage && !metadataLanguage) {
     return 'unknown';
   }
 
-  /*
-   * Explicitly another language.
-   */
   return 'wrong';
 }
 
@@ -188,31 +167,17 @@ function languageMatches(
   video,
   requestedLanguage
 ) {
-  const status = getLanguageStatus(
-    video,
-    requestedLanguage
-  );
+  const status =
+    getLanguageStatus(
+      video,
+      requestedLanguage
+    );
 
-  /*
-   * V3 policy:
-   *
-   * We do NOT accept "unknown" anymore.
-   *
-   * This prevents us from returning videos whose language
-   * cannot be verified.
-   */
   return (
     status === 'strong' ||
     status === 'audio_only' ||
     status === 'metadata_only'
   );
-}
-
-function normalizeText(text) {
-  return String(text || '')
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '');
 }
 
 function categoryMatches(
@@ -242,7 +207,11 @@ function categoryMatches(
       'olympics',
       'joueur',
       'match',
-      'championnat'
+      'championnat',
+      'entraineur',
+      'coach',
+      'competition',
+      'competition sportive'
     ],
 
     sciences: [
@@ -264,8 +233,6 @@ function categoryMatches(
       'technology',
       'intelligence artificielle',
       'artificial intelligence',
-      'ia',
-      'ai',
       'univers',
       'terre',
       'planete',
@@ -277,7 +244,19 @@ function categoryMatches(
       'cerveau',
       'brain',
       'genetique',
-      'genetics'
+      'genetics',
+      'medecine',
+      'medicine',
+      'climat',
+      'climate',
+      'environnement',
+      'environment',
+      'astronomique',
+      'astronomical',
+      'geologie',
+      'geology',
+      'evolution',
+      'evolution'
     ],
 
     cuisine: [
@@ -302,7 +281,15 @@ function categoryMatches(
       'viande',
       'poisson',
       'legumes',
-      'vegetable'
+      'vegetable',
+      'vegetables',
+      'sauce',
+      'pasta',
+      'pates',
+      'pain',
+      'bread',
+      'chocolat',
+      'chocolate'
     ],
 
     culture: [
@@ -328,7 +315,12 @@ function categoryMatches(
       'patrimoine',
       'heritage',
       'philosophie',
-      'philosophy'
+      'philosophy',
+      'monument',
+      'historique',
+      'historical',
+      'biographie',
+      'biography'
     ]
   };
 
@@ -340,6 +332,77 @@ function categoryMatches(
       normalizeText(keyword)
     );
   });
+}
+
+function hasExcludedContent(
+  title,
+  description,
+  category
+) {
+  const value =
+    normalizeText(
+      title + ' ' + description
+    );
+
+  const commonExcludedTerms = [
+    'trailer',
+    'official trailer',
+    'bande annonce',
+    'bande-annonce',
+    'teaser',
+    'movie trailer',
+    'film trailer',
+    'court metrage',
+    'court-metrage',
+    'short film',
+    'short movie',
+    'clip officiel',
+    'official music video',
+    'music video',
+    'video musicale',
+    'clip musical',
+    'lyrics video',
+    'paroles',
+    'karaoke',
+    'remix',
+    'compilation',
+    'best of',
+    'shorts',
+    '#shorts'
+  ];
+
+  if (
+    commonExcludedTerms.some(term => {
+      return value.includes(
+        normalizeText(term)
+      );
+    })
+  ) {
+    return true;
+  }
+
+  if (category === 'sport') {
+    const sportExcludedTerms = [
+      'highlights',
+      'resume du match',
+      'resume match',
+      'full match replay',
+      'match replay',
+      'live score'
+    ];
+
+    if (
+      sportExcludedTerms.some(term => {
+        return value.includes(
+          normalizeText(term)
+        );
+      })
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function calculateQualityScore(
@@ -355,33 +418,60 @@ function calculateQualityScore(
       language
     );
 
-  if (languageStatus === 'strong') {
+  if (
+    languageStatus === 'strong'
+  ) {
     score += 50;
-  } else if (languageStatus === 'audio_only') {
-    score += 45;
-  } else if (languageStatus === 'metadata_only') {
-    score += 25;
+  } else if (
+    languageStatus === 'audio_only'
+  ) {
+    score += 42;
+  } else if (
+    languageStatus === 'metadata_only'
+  ) {
+    score += 20;
   }
 
   if (
-    categoryMatches(
-      video.title + ' ' + video.description,
-      category
-    )
+    video.categoryMatch
   ) {
     score += 25;
   }
 
-  if (video.captionAvailable) {
-    score += 10;
+  if (
+    video.captionAvailable
+  ) {
+    score += 15;
   }
 
-  if (video.durationSeconds >= 120) {
+  if (
+    video.durationSeconds >= 300
+  ) {
+    score += 8;
+  } else if (
+    video.durationSeconds >= 240
+  ) {
     score += 5;
   }
 
-  if (video.durationSeconds >= 300) {
+  if (
+    video.descriptionLength >= 300
+  ) {
     score += 5;
+  } else if (
+    video.descriptionLength >= 150
+  ) {
+    score += 3;
+  }
+
+  if (
+    video.viewCount >= 100000
+  ) {
+    score += 3;
+  } else if (
+    video.viewCount >= 10000
+  ) {
+    score += 2;
   }
 
   return score;
@@ -399,30 +489,38 @@ async function searchYouTube(
     CATEGORIES[category];
 
   const params = {
-    key: process.env.YOUTUBE_API_KEY,
+    key:
+      process.env.YOUTUBE_API_KEY,
 
     part: 'snippet',
 
     type: 'video',
 
-    q: categoryInfo.query,
+    q:
+      categoryInfo.query,
 
     relevanceLanguage:
       languageInfo.relevanceLanguage,
 
-    videoEmbeddable: 'true',
+    videoEmbeddable:
+      'true',
 
-    videoSyndicated: 'true',
+    videoSyndicated:
+      'true',
 
-    videoCaption: 'closedCaption',
+    videoCaption:
+      'closedCaption',
 
-    safeSearch: 'moderate',
+    safeSearch:
+      'moderate',
 
-    maxResults: 50
+    maxResults:
+      50
   };
 
   if (pageToken) {
-    params.pageToken = pageToken;
+    params.pageToken =
+      pageToken;
   }
 
   const response =
@@ -452,19 +550,23 @@ async function getVideoDetails(
       YOUTUBE_VIDEOS_URL,
       {
         params: {
-          key: process.env.YOUTUBE_API_KEY,
+          key:
+            process.env.YOUTUBE_API_KEY,
 
           part:
             'snippet,contentDetails,status,statistics',
 
-          id: videoIds.join(',')
+          id:
+            videoIds.join(',')
         },
 
         timeout: 20000
       }
     );
 
-  return response.data.items || [];
+  return (
+    response.data.items || []
+  );
 }
 
 router.get(
@@ -483,9 +585,12 @@ router.get(
       ) {
         return res.status(400).json({
           ok: false,
-          error: 'Invalid language',
+          error:
+            'Invalid language',
           allowedLanguages:
-            Object.keys(LANGUAGES)
+            Object.keys(
+              LANGUAGES
+            )
         });
       }
 
@@ -495,9 +600,12 @@ router.get(
       ) {
         return res.status(400).json({
           ok: false,
-          error: 'Invalid category',
+          error:
+            'Invalid category',
           allowedCategories:
-            Object.keys(CATEGORIES)
+            Object.keys(
+              CATEGORIES
+            )
         });
       }
 
@@ -512,7 +620,7 @@ router.get(
       }
 
       console.log(
-        'YouTube V3 search: ' +
+        'YouTube V4 search: ' +
         LANGUAGES[language].name +
         ' / ' +
         CATEGORIES[category].name
@@ -546,20 +654,28 @@ router.get(
         return res.json({
           ok: true,
 
+          version: 'v4',
+
           language: {
             code: language,
             name:
-              LANGUAGES[language].name
+              LANGUAGES[
+                language
+              ].name
           },
 
           category: {
             code: category,
             name:
-              CATEGORIES[category].name
+              CATEGORIES[
+                category
+              ].name
           },
 
           searched:
             searchItems.length,
+
+          accepted: 0,
 
           count: 0,
 
@@ -580,42 +696,69 @@ router.get(
         details.map(video => {
           const durationSeconds =
             parseDuration(
-              video.contentDetails
+              video
+                .contentDetails
                 ?.duration
             );
 
           const title =
-            video.snippet?.title || '';
+            video
+              .snippet
+              ?.title || '';
 
           const description =
-            video.snippet?.description ||
-            '';
+            video
+              .snippet
+              ?.description || '';
 
           const channelTitle =
-            video.snippet?.channelTitle ||
-            '';
+            video
+              .snippet
+              ?.channelTitle || '';
 
           const captionAvailable =
-            video.contentDetails
+            video
+              .contentDetails
               ?.caption === 'true';
 
           const embeddable =
-            video.status?.embeddable === true;
+            video
+              .status
+              ?.embeddable === true;
 
           const publicStatus =
-            video.status
-              ?.privacyStatus === 'public';
+            video
+              .status
+              ?.privacyStatus ===
+            'public';
 
           const defaultLanguage =
-            video.snippet
+            video
+              .snippet
               ?.defaultLanguage || '';
 
           const defaultAudioLanguage =
-            video.snippet
-              ?.defaultAudioLanguage || '';
+            video
+              .snippet
+              ?.defaultAudioLanguage ||
+            '';
+
+          const viewCount =
+            video
+              .statistics
+              ?.viewCount
+              ? Number(
+                  video.statistics
+                    .viewCount
+                )
+              : 0;
+
+          const descriptionLength =
+            description.trim().length;
 
           const videoObject = {
-            videoId: video.id,
+            videoId:
+              video.id,
 
             title,
 
@@ -624,16 +767,27 @@ router.get(
             channelTitle,
 
             publishedAt:
-              video.snippet
-                ?.publishedAt || null,
+              video
+                .snippet
+                ?.publishedAt ||
+              null,
 
             thumbnail:
-              video.snippet
-                ?.thumbnails?.high?.url ||
-              video.snippet
-                ?.thumbnails?.medium?.url ||
-              video.snippet
-                ?.thumbnails?.default?.url ||
+              video
+                .snippet
+                ?.thumbnails
+                ?.high
+                ?.url ||
+              video
+                .snippet
+                ?.thumbnails
+                ?.medium
+                ?.url ||
+              video
+                .snippet
+                ?.thumbnails
+                ?.default
+                ?.url ||
               null,
 
             duration:
@@ -650,21 +804,18 @@ router.get(
             publicStatus,
 
             categoryId:
-              video.snippet
-                ?.categoryId || null,
+              video
+                .snippet
+                ?.categoryId ||
+              null,
 
             defaultLanguage,
 
             defaultAudioLanguage,
 
-            viewCount:
-              video.statistics
-                ?.viewCount
-                ? Number(
-                    video.statistics
-                      .viewCount
-                  )
-                : 0,
+            viewCount,
+
+            descriptionLength,
 
             language,
 
@@ -685,7 +836,16 @@ router.get(
 
           videoObject.categoryMatch =
             categoryMatches(
-              title + ' ' + description,
+              title +
+              ' ' +
+              description,
+              category
+            );
+
+          videoObject.excludedContent =
+            hasExcludedContent(
+              title,
+              description,
               category
             );
 
@@ -706,30 +866,39 @@ router.get(
         tooLong: 0,
         wrongLanguage: 0,
         unknownLanguage: 0,
-        wrongCategory: 0
+        wrongCategory: 0,
+        noCaptions: 0,
+        poorDescription: 0,
+        excludedContent: 0
       };
 
       const accepted =
         videos.filter(video => {
-          if (!video.embeddable) {
+          if (
+            !video.embeddable
+          ) {
             rejected.notEmbeddable++;
             return false;
           }
 
-          if (!video.publicStatus) {
+          if (
+            !video.publicStatus
+          ) {
             rejected.notPublic++;
             return false;
           }
 
           if (
-            video.durationSeconds < 60
+            video.durationSeconds <
+            MIN_DURATION_SECONDS
           ) {
             rejected.tooShort++;
             return false;
           }
 
           if (
-            video.durationSeconds > 3600
+            video.durationSeconds >
+            MAX_DURATION_SECONDS
           ) {
             rejected.tooLong++;
             return false;
@@ -758,12 +927,35 @@ router.get(
             return false;
           }
 
+          if (
+            !video.captionAvailable
+          ) {
+            rejected.noCaptions++;
+            return false;
+          }
+
+          if (
+            video.descriptionLength <
+            MIN_DESCRIPTION_LENGTH
+          ) {
+            rejected.poorDescription++;
+            return false;
+          }
+
+          if (
+            video.excludedContent
+          ) {
+            rejected.excludedContent++;
+            return false;
+          }
+
           return true;
         });
 
       const uniqueVideos = [];
 
-      const seenIds = new Set();
+      const seenIds =
+        new Set();
 
       for (
         const video of accepted
@@ -787,46 +979,65 @@ router.get(
 
       uniqueVideos.sort(
         (a, b) => {
-          return (
-            b.qualityScore -
+          if (
+            b.qualityScore !==
             a.qualityScore
+          ) {
+            return (
+              b.qualityScore -
+              a.qualityScore
+            );
+          }
+
+          return (
+            b.viewCount -
+            a.viewCount
           );
         }
       );
 
       const finalVideos =
-        uniqueVideos.slice(0, 20);
+        uniqueVideos.slice(
+          0,
+          20
+        );
 
       console.log(
-        'YouTube V3 searched: ' +
+        'YouTube V4 searched: ' +
         searchItems.length
       );
 
       console.log(
-        'YouTube V3 accepted: ' +
+        'YouTube V4 accepted: ' +
         finalVideos.length
       );
 
       console.log(
-        'YouTube V3 rejected: ' +
-        JSON.stringify(rejected)
+        'YouTube V4 rejected: ' +
+        JSON.stringify(
+          rejected
+        )
       );
 
       return res.json({
         ok: true,
 
-        version: 'v3',
+        version: 'v4',
 
         language: {
           code: language,
           name:
-            LANGUAGES[language].name
+            LANGUAGES[
+              language
+            ].name
         },
 
         category: {
           code: category,
           name:
-            CATEGORIES[category].name
+            CATEGORIES[
+              category
+            ].name
         },
 
         searched:
@@ -844,13 +1055,14 @@ router.get(
           finalVideos,
 
         nextPageToken:
-          searchData.nextPageToken ||
+          searchData
+            .nextPageToken ||
           null
       });
 
     } catch (error) {
       console.error(
-        'YouTube V3 error:',
+        'YouTube V4 error:',
         error.response?.data ||
         error.message
       );
@@ -859,7 +1071,7 @@ router.get(
         ok: false,
 
         error:
-          'YouTube V3 search failed',
+          'YouTube V4 search failed',
 
         details:
           error.response?.data
