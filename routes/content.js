@@ -7,10 +7,24 @@ const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 const TRANSCRIPT_API_KEY =
   process.env.YOUTUBE_TRANSCRIPT_API_KEY;
 
+const TRANSCRIPT_API_URL =
+  'https://www.youtubetranscript.dev/api/v2/transcribe';
+
+const MIN_TRANSCRIPT_LENGTH = 500;
+
 router.get('/content', async function (req, res) {
   try {
     const videoId =
       String(req.query.videoId || '').trim();
+
+    const requestedLanguage =
+      String(req.query.language || 'fr')
+        .trim()
+        .toLowerCase();
+
+    // ------------------------------------------------------------
+    // 1. Validation
+    // ------------------------------------------------------------
 
     if (!videoId) {
       return res.status(400).json({
@@ -34,14 +48,14 @@ router.get('/content', async function (req, res) {
     }
 
     // ------------------------------------------------------------
-    // 1. Verify video
+    // 2. Get YouTube video information
     // ------------------------------------------------------------
 
     const youtubeResponse = await axios.get(
       'https://www.googleapis.com/youtube/v3/videos',
       {
         params: {
-          part: 'snippet,contentDetails,status',
+          part: 'snippet,contentDetails,status,statistics',
           id: videoId,
           key: YOUTUBE_API_KEY
         },
@@ -65,21 +79,53 @@ router.get('/content', async function (req, res) {
     const contentDetails =
       item.contentDetails || {};
     const status = item.status || {};
+    const statistics = item.statistics || {};
 
     // ------------------------------------------------------------
-    // 2. Request transcript service
+    // 3. Basic availability checks
+    // ------------------------------------------------------------
+
+    const isPublic =
+      status.privacyStatus === 'public';
+
+    const isEmbeddable =
+      status.embeddable === true;
+
+    const captionAvailable =
+      contentDetails.caption === 'true';
+
+    if (!isPublic) {
+      return res.status(400).json({
+        ok: false,
+        videoId: videoId,
+        error: 'Video is not public'
+      });
+    }
+
+    if (!isEmbeddable) {
+      return res.status(400).json({
+        ok: false,
+        videoId: videoId,
+        error: 'Video is not embeddable'
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 4. Request transcript
     // ------------------------------------------------------------
 
     console.log(
-      'Requesting external transcript for ' +
-      videoId
+      'Requesting transcript for video ' +
+      videoId +
+      ' language=' +
+      requestedLanguage
     );
 
     const transcriptResponse = await axios.post(
-      'https://www.youtubetranscript.dev/api/v2/transcribe',
+      TRANSCRIPT_API_URL,
       {
         video: videoId,
-        language: 'fr',
+        language: requestedLanguage,
         source: 'auto'
       },
       {
@@ -93,50 +139,161 @@ router.get('/content', async function (req, res) {
       }
     );
 
-    const data = transcriptResponse.data;
-
-    console.log(
-      'Transcript API response received'
-    );
+    const transcriptData =
+      transcriptResponse.data || {};
 
     // ------------------------------------------------------------
-    // 3. Return raw service response for diagnosis
+    // 5. Check service status
     // ------------------------------------------------------------
 
-    return res.json({
+    if (
+      transcriptData.status !== 'completed'
+    ) {
+      return res.status(422).json({
+        ok: false,
+        videoId: videoId,
+        error: 'Transcript was not completed',
+        transcriptStatus:
+          transcriptData.status || null
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 6. Extract transcript
+    // ------------------------------------------------------------
+
+    const transcriptObject =
+      transcriptData.data &&
+      transcriptData.data.transcript
+        ? transcriptData.data.transcript
+        : null;
+
+    const transcriptText =
+      transcriptObject &&
+      typeof transcriptObject.text === 'string'
+        ? transcriptObject.text.trim()
+        : '';
+
+    const transcriptLanguage =
+      transcriptObject &&
+      transcriptObject.language
+        ? transcriptObject.language
+        : null;
+
+    const transcriptSource =
+      transcriptObject &&
+      transcriptObject.source
+        ? transcriptObject.source
+        : null;
+
+    // ------------------------------------------------------------
+    // 7. Validate transcript
+    // ------------------------------------------------------------
+
+    if (!transcriptText) {
+      return res.status(422).json({
+        ok: false,
+        videoId: videoId,
+        error: 'No transcript text returned',
+        captionAvailable: captionAvailable
+      });
+    }
+
+    if (
+      transcriptText.length <
+      MIN_TRANSCRIPT_LENGTH
+    ) {
+      return res.status(422).json({
+        ok: false,
+        videoId: videoId,
+        error: 'Transcript is too short',
+        transcriptCharacters:
+          transcriptText.length,
+        minimumCharacters:
+          MIN_TRANSCRIPT_LENGTH
+      });
+    }
+
+    // ------------------------------------------------------------
+    // 8. Prepare clean result
+    // ------------------------------------------------------------
+
+    const result = {
       ok: true,
+
       videoId: videoId,
 
       video: {
-        title: snippet.title || '',
+        title:
+          snippet.title || '',
+        description:
+          snippet.description || '',
         channelTitle:
           snippet.channelTitle || '',
+        publishedAt:
+          snippet.publishedAt || null,
+
         defaultLanguage:
           snippet.defaultLanguage || null,
+
         defaultAudioLanguage:
-          snippet.defaultAudioLanguage || null
+          snippet.defaultAudioLanguage || null,
+
+        categoryId:
+          snippet.categoryId || null,
+
+        duration:
+          contentDetails.duration || null,
+
+        viewCount:
+          statistics.viewCount
+            ? Number(statistics.viewCount)
+            : 0
       },
 
       availability: {
+        public: isPublic,
+        embeddable: isEmbeddable,
         captionAvailable:
-          contentDetails.caption === 'true',
-        embeddable:
-          status.embeddable === true,
-        public:
-          status.privacyStatus === 'public'
+          captionAvailable
       },
 
-      transcriptService: {
-        ok: true,
-        response: data
+      transcript: {
+        retrieved: true,
+
+        language:
+          transcriptLanguage,
+
+        source:
+          transcriptSource,
+
+        characters:
+          transcriptText.length,
+
+        text:
+          transcriptText
       }
-    });
+    };
+
+    console.log(
+      'Transcript retrieved successfully: ' +
+      videoId +
+      ' (' +
+      transcriptText.length +
+      ' characters)'
+    );
+
+    return res.json(result);
 
   } catch (error) {
     console.error(
-      'Transcript service error:',
+      'Content route error:',
       error.message
     );
+
+    // ------------------------------------------------------------
+    // External API error
+    // ------------------------------------------------------------
 
     if (error.response) {
       console.error(
@@ -145,25 +302,43 @@ router.get('/content', async function (req, res) {
       );
 
       console.error(
-        'Response:',
+        'API response:',
         JSON.stringify(
           error.response.data
         )
       );
+
+      return res.status(
+        error.response.status >= 400 &&
+        error.response.status < 600
+          ? error.response.status
+          : 500
+      ).json({
+        ok: false,
+
+        error:
+          'Transcript service request failed',
+
+        httpStatus:
+          error.response.status,
+
+        details:
+          error.response.data || null
+      });
     }
+
+    // ------------------------------------------------------------
+    // Network / timeout error
+    // ------------------------------------------------------------
 
     return res.status(500).json({
       ok: false,
-      error: 'Transcript service request failed',
-      httpStatus:
-        error.response
-          ? error.response.status
-          : null,
+
+      error:
+        'Unable to contact transcript service',
+
       details:
-        error.response &&
-        error.response.data
-          ? error.response.data
-          : error.message
+        error.message
     });
   }
 });
