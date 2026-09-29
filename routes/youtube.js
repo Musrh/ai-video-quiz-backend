@@ -12,32 +12,17 @@ const YOUTUBE_VIDEOS_URL =
 const LANGUAGES = {
   fr: {
     name: 'Francais',
-    relevanceLanguage: 'fr',
-    keywords: [
-      'francais',
-      'france',
-      'francophone'
-    ]
+    relevanceLanguage: 'fr'
   },
 
   en: {
     name: 'English',
-    relevanceLanguage: 'en',
-    keywords: [
-      'english',
-      'learn',
-      'explained'
-    ]
+    relevanceLanguage: 'en'
   },
 
   ar: {
     name: 'Arabic',
-    relevanceLanguage: 'ar',
-    keywords: [
-      'arabic',
-      'العربية',
-      'عربي'
-    ]
+    relevanceLanguage: 'ar'
   }
 };
 
@@ -59,7 +44,7 @@ const CATEGORIES = {
 
   culture: {
     name: 'Culture generale',
-    query: 'culture general knowledge'
+    query: 'culture history general knowledge'
   }
 };
 
@@ -107,6 +92,122 @@ function formatDuration(seconds) {
   );
 }
 
+function normalizeLanguage(language) {
+  if (!language) {
+    return '';
+  }
+
+  return String(language)
+    .toLowerCase()
+    .split('-')[0]
+    .split('_')[0]
+    .trim();
+}
+
+/*
+ * IMPORTANT:
+ *
+ * defaultAudioLanguage is the strongest signal available
+ * from the public YouTube Data API for the language spoken
+ * in the default audio track.
+ *
+ * defaultLanguage identifies the language of the title
+ * and description metadata.
+ */
+function getLanguageStatus(video, requestedLanguage) {
+  const audioLanguage = normalizeLanguage(
+    video.defaultAudioLanguage
+  );
+
+  const metadataLanguage = normalizeLanguage(
+    video.defaultLanguage
+  );
+
+  const requested = normalizeLanguage(
+    requestedLanguage
+  );
+
+  /*
+   * Strong confirmation:
+   * audio + metadata match requested language.
+   */
+  if (
+    audioLanguage === requested &&
+    metadataLanguage === requested
+  ) {
+    return 'strong';
+  }
+
+  /*
+   * Audio is correct, metadata language missing.
+   */
+  if (
+    audioLanguage === requested &&
+    !metadataLanguage
+  ) {
+    return 'strong';
+  }
+
+  /*
+   * Audio language is correct but metadata is another
+   * language. We still accept because the spoken language
+   * is the most important signal for the quiz.
+   */
+  if (
+    audioLanguage === requested &&
+    metadataLanguage !== requested
+  ) {
+    return 'audio_only';
+  }
+
+  /*
+   * Metadata says the requested language but YouTube did
+   * not specify the audio language.
+   */
+  if (
+    !audioLanguage &&
+    metadataLanguage === requested
+  ) {
+    return 'metadata_only';
+  }
+
+  /*
+   * No language information at all.
+   */
+  if (!audioLanguage && !metadataLanguage) {
+    return 'unknown';
+  }
+
+  /*
+   * Explicitly another language.
+   */
+  return 'wrong';
+}
+
+function languageMatches(
+  video,
+  requestedLanguage
+) {
+  const status = getLanguageStatus(
+    video,
+    requestedLanguage
+  );
+
+  /*
+   * V3 policy:
+   *
+   * We do NOT accept "unknown" anymore.
+   *
+   * This prevents us from returning videos whose language
+   * cannot be verified.
+   */
+  return (
+    status === 'strong' ||
+    status === 'audio_only' ||
+    status === 'metadata_only'
+  );
+}
+
 function normalizeText(text) {
   return String(text || '')
     .toLowerCase()
@@ -114,7 +215,10 @@ function normalizeText(text) {
     .replace(/[\u0300-\u036f]/g, '');
 }
 
-function categoryMatches(text, category) {
+function categoryMatches(
+  text,
+  category
+) {
   const value = normalizeText(text);
 
   const keywords = {
@@ -135,7 +239,10 @@ function categoryMatches(text, category) {
       'cycling',
       'fitness',
       'olympique',
-      'olympics'
+      'olympics',
+      'joueur',
+      'match',
+      'championnat'
     ],
 
     sciences: [
@@ -158,7 +265,19 @@ function categoryMatches(text, category) {
       'intelligence artificielle',
       'artificial intelligence',
       'ia',
-      'ai'
+      'ai',
+      'univers',
+      'terre',
+      'planete',
+      'planet',
+      'quantique',
+      'quantum',
+      'energie',
+      'energy',
+      'cerveau',
+      'brain',
+      'genetique',
+      'genetics'
     ],
 
     cuisine: [
@@ -177,7 +296,13 @@ function categoryMatches(text, category) {
       'gateau',
       'cake',
       'patisserie',
-      'baking'
+      'baking',
+      'ingredient',
+      'ingredients',
+      'viande',
+      'poisson',
+      'legumes',
+      'vegetable'
     ],
 
     culture: [
@@ -197,98 +322,57 @@ function categoryMatches(text, category) {
       'civilization',
       'general knowledge',
       'connaissance',
-      'quiz'
+      'quiz',
+      'societe',
+      'society',
+      'patrimoine',
+      'heritage',
+      'philosophie',
+      'philosophy'
     ]
   };
 
-  const list = keywords[category] || [];
+  const list =
+    keywords[category] || [];
 
   return list.some(keyword => {
-    return value.includes(normalizeText(keyword));
+    return value.includes(
+      normalizeText(keyword)
+    );
   });
 }
 
-function languageLooksCorrect(video, language) {
-  const title = normalizeText(video.title);
-  const description = normalizeText(video.description);
-
-  const text = title + ' ' + description;
-
-  if (language === 'fr') {
-    const frenchIndicators = [
-      ' le ',
-      ' la ',
-      ' les ',
-      ' des ',
-      ' une ',
-      ' un ',
-      ' est ',
-      ' avec ',
-      ' pour ',
-      ' dans ',
-      ' comment ',
-      ' pourquoi ',
-      ' toutes ',
-      ' cette ',
-      ' science ',
-      ' recette ',
-      ' histoire '
-    ];
-
-    return frenchIndicators.some(word => {
-      return text.includes(word);
-    });
-  }
-
-  if (language === 'en') {
-    const englishIndicators = [
-      ' the ',
-      ' and ',
-      ' with ',
-      ' for ',
-      ' this ',
-      ' that ',
-      ' how ',
-      ' why ',
-      ' what ',
-      ' science ',
-      ' recipe ',
-      ' history '
-    ];
-
-    return englishIndicators.some(word => {
-      return text.includes(word);
-    });
-  }
-
-  if (language === 'ar') {
-    const arabicPattern = /[\u0600-\u06FF]/;
-
-    return arabicPattern.test(
-      video.title + ' ' + video.description
-    );
-  }
-
-  return true;
-}
-
-function calculateQualityScore(video, category, language) {
+function calculateQualityScore(
+  video,
+  category,
+  language
+) {
   let score = 0;
 
-  const title = normalizeText(video.title);
-  const description = normalizeText(video.description);
+  const languageStatus =
+    getLanguageStatus(
+      video,
+      language
+    );
 
-  const combined = title + ' ' + description;
-
-  if (categoryMatches(combined, category)) {
-    score += 40;
+  if (languageStatus === 'strong') {
+    score += 50;
+  } else if (languageStatus === 'audio_only') {
+    score += 45;
+  } else if (languageStatus === 'metadata_only') {
+    score += 25;
   }
 
-  if (languageLooksCorrect(video, language)) {
-    score += 30;
+  if (
+    categoryMatches(
+      video.title + ' ' + video.description,
+      category
+    )
+  ) {
+    score += 25;
   }
 
-  if (video.durationSeconds >= 60) {
+  if (video.captionAvailable) {
     score += 10;
   }
 
@@ -296,15 +380,7 @@ function calculateQualityScore(video, category, language) {
     score += 5;
   }
 
-  if (video.durationSeconds <= 1800) {
-    score += 5;
-  }
-
-  if (video.description.length >= 50) {
-    score += 5;
-  }
-
-  if (video.captionAvailable) {
+  if (video.durationSeconds >= 300) {
     score += 5;
   }
 
@@ -314,14 +390,19 @@ function calculateQualityScore(video, category, language) {
 async function searchYouTube(
   language,
   category,
-  pageToken = null
+  pageToken
 ) {
-  const languageInfo = LANGUAGES[language];
-  const categoryInfo = CATEGORIES[category];
+  const languageInfo =
+    LANGUAGES[language];
+
+  const categoryInfo =
+    CATEGORIES[category];
 
   const params = {
     key: process.env.YOUTUBE_API_KEY,
+
     part: 'snippet',
+
     type: 'video',
 
     q: categoryInfo.query,
@@ -344,315 +425,449 @@ async function searchYouTube(
     params.pageToken = pageToken;
   }
 
-  const response = await axios.get(
-    YOUTUBE_SEARCH_URL,
-    {
-      params,
-      timeout: 20000
-    }
-  );
+  const response =
+    await axios.get(
+      YOUTUBE_SEARCH_URL,
+      {
+        params,
+        timeout: 20000
+      }
+    );
 
   return response.data;
 }
 
-async function getVideoDetails(videoIds) {
-  if (!videoIds || videoIds.length === 0) {
+async function getVideoDetails(
+  videoIds
+) {
+  if (
+    !videoIds ||
+    videoIds.length === 0
+  ) {
     return [];
   }
 
-  const response = await axios.get(
-    YOUTUBE_VIDEOS_URL,
-    {
-      params: {
-        key: process.env.YOUTUBE_API_KEY,
-        part: 'snippet,contentDetails,status,statistics',
-        id: videoIds.join(',')
-      },
-      timeout: 20000
-    }
-  );
+  const response =
+    await axios.get(
+      YOUTUBE_VIDEOS_URL,
+      {
+        params: {
+          key: process.env.YOUTUBE_API_KEY,
+
+          part:
+            'snippet,contentDetails,status,statistics',
+
+          id: videoIds.join(',')
+        },
+
+        timeout: 20000
+      }
+    );
 
   return response.data.items || [];
 }
 
-router.get('/search', async (req, res) => {
-  try {
-    const {
-      language,
-      category,
-      pageToken
-    } = req.query;
+router.get(
+  '/search',
+  async (req, res) => {
+    try {
+      const {
+        language,
+        category,
+        pageToken
+      } = req.query;
 
-    if (!language || !LANGUAGES[language]) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Invalid language',
-        allowedLanguages: Object.keys(LANGUAGES)
-      });
-    }
-
-    if (!category || !CATEGORIES[category]) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Invalid category',
-        allowedCategories: Object.keys(CATEGORIES)
-      });
-    }
-
-    if (!process.env.YOUTUBE_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: 'YOUTUBE_API_KEY is missing'
-      });
-    }
-
-    console.log(
-      'YouTube search: ' +
-      LANGUAGES[language].name +
-      ' / ' +
-      CATEGORIES[category].name
-    );
-
-    const searchData = await searchYouTube(
-      language,
-      category,
-      pageToken || null
-    );
-
-    const searchItems = searchData.items || [];
-
-    const candidateIds = searchItems
-      .filter(item => {
-        return item.id && item.id.videoId;
-      })
-      .map(item => item.id.videoId);
-
-    if (candidateIds.length === 0) {
-      return res.json({
-        ok: true,
-        language: {
-          code: language,
-          name: LANGUAGES[language].name
-        },
-        category: {
-          code: category,
-          name: CATEGORIES[category].name
-        },
-        count: 0,
-        candidates: [],
-        nextPageToken:
-          searchData.nextPageToken || null
-      });
-    }
-
-    const details = await getVideoDetails(
-      candidateIds
-    );
-
-    const videos = details
-      .map(video => {
-        const durationSeconds =
-          parseDuration(
-            video.contentDetails?.duration
-          );
-
-        const title =
-          video.snippet?.title || '';
-
-        const description =
-          video.snippet?.description || '';
-
-        const channelTitle =
-          video.snippet?.channelTitle || '';
-
-        const captionAvailable =
-          video.contentDetails?.caption === 'true';
-
-        const embeddable =
-          video.status?.embeddable === true;
-
-        const publicStatus =
-          video.status?.privacyStatus === 'public';
-
-        const regionRestricted =
-          video.contentDetails?.regionRestriction;
-
-        const videoObject = {
-          videoId: video.id,
-
-          title,
-
-          description,
-
-          channelTitle,
-
-          publishedAt:
-            video.snippet?.publishedAt || null,
-
-          thumbnail:
-            video.snippet?.thumbnails?.high?.url ||
-            video.snippet?.thumbnails?.medium?.url ||
-            video.snippet?.thumbnails?.default?.url ||
-            null,
-
-          duration:
-            formatDuration(durationSeconds),
-
-          durationSeconds,
-
-          captionAvailable,
-
-          embeddable,
-
-          publicStatus,
-
-          categoryId:
-            video.snippet?.categoryId || null,
-
-          defaultLanguage:
-            video.snippet?.defaultLanguage || null,
-
-          defaultAudioLanguage:
-            video.snippet?.defaultAudioLanguage ||
-            null,
-
-          viewCount:
-            video.statistics?.viewCount
-              ? Number(video.statistics.viewCount)
-              : 0,
-
-          language,
-
-          category
-        };
-
-        videoObject.qualityScore =
-          calculateQualityScore(
-            videoObject,
-            category,
-            language
-          );
-
-        videoObject.categoryMatch =
-          categoryMatches(
-            title + ' ' + description,
-            category
-          );
-
-        videoObject.languageMatch =
-          languageLooksCorrect(
-            videoObject,
-            language
-          );
-
-        return videoObject;
-      })
-
-      .filter(video => {
-        if (!video.embeddable) {
-          return false;
-        }
-
-        if (!video.publicStatus) {
-          return false;
-        }
-
-        return true;
-      })
-
-      .filter(video => {
-        if (!video.title) {
-          return false;
-        }
-
-        return true;
-      })
-
-      .filter(video => {
-        return video.durationSeconds >= 60;
-      })
-
-      .filter(video => {
-        return video.durationSeconds <= 3600;
-      })
-
-      .filter(video => {
-        return video.categoryMatch;
-      })
-
-      .filter(video => {
-        return video.languageMatch;
-      });
-
-    const uniqueVideos = [];
-
-    const seenIds = new Set();
-
-    for (const video of videos) {
-      if (seenIds.has(video.videoId)) {
-        continue;
+      if (
+        !language ||
+        !LANGUAGES[language]
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Invalid language',
+          allowedLanguages:
+            Object.keys(LANGUAGES)
+        });
       }
 
-      seenIds.add(video.videoId);
+      if (
+        !category ||
+        !CATEGORIES[category]
+      ) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Invalid category',
+          allowedCategories:
+            Object.keys(CATEGORIES)
+        });
+      }
 
-      uniqueVideos.push(video);
-    }
+      if (
+        !process.env.YOUTUBE_API_KEY
+      ) {
+        return res.status(500).json({
+          ok: false,
+          error:
+            'YOUTUBE_API_KEY is missing'
+        });
+      }
 
-    uniqueVideos.sort((a, b) => {
-      return b.qualityScore - a.qualityScore;
-    });
+      console.log(
+        'YouTube V3 search: ' +
+        LANGUAGES[language].name +
+        ' / ' +
+        CATEGORIES[category].name
+      );
 
-    const finalVideos =
-      uniqueVideos.slice(0, 20);
+      const searchData =
+        await searchYouTube(
+          language,
+          category,
+          pageToken || null
+        );
 
-    console.log(
-      'YouTube candidates found: ' +
-      searchItems.length
-    );
+      const searchItems =
+        searchData.items || [];
 
-    console.log(
-      'YouTube videos accepted: ' +
-      finalVideos.length
-    );
+      const candidateIds =
+        searchItems
+          .filter(item => {
+            return (
+              item.id &&
+              item.id.videoId
+            );
+          })
+          .map(item => {
+            return item.id.videoId;
+          });
 
-    return res.json({
-      ok: true,
+      if (
+        candidateIds.length === 0
+      ) {
+        return res.json({
+          ok: true,
 
-      language: {
-        code: language,
-        name: LANGUAGES[language].name
-      },
+          language: {
+            code: language,
+            name:
+              LANGUAGES[language].name
+          },
 
-      category: {
-        code: category,
-        name: CATEGORIES[category].name
-      },
+          category: {
+            code: category,
+            name:
+              CATEGORIES[category].name
+          },
 
-      searched: searchItems.length,
+          searched:
+            searchItems.length,
 
-      count: finalVideos.length,
+          count: 0,
 
-      videos: finalVideos,
+          videos: [],
 
-      nextPageToken:
-        searchData.nextPageToken || null
-    });
+          nextPageToken:
+            searchData.nextPageToken ||
+            null
+        });
+      }
 
-  } catch (error) {
-    console.error(
-      'YouTube search error:',
-      error.response?.data ||
-      error.message
-    );
+      const details =
+        await getVideoDetails(
+          candidateIds
+        );
 
-    return res.status(500).json({
-      ok: false,
-      error: 'YouTube search failed',
-      details:
-        error.response?.data?.error?.message ||
+      const videos =
+        details.map(video => {
+          const durationSeconds =
+            parseDuration(
+              video.contentDetails
+                ?.duration
+            );
+
+          const title =
+            video.snippet?.title || '';
+
+          const description =
+            video.snippet?.description ||
+            '';
+
+          const channelTitle =
+            video.snippet?.channelTitle ||
+            '';
+
+          const captionAvailable =
+            video.contentDetails
+              ?.caption === 'true';
+
+          const embeddable =
+            video.status?.embeddable === true;
+
+          const publicStatus =
+            video.status
+              ?.privacyStatus === 'public';
+
+          const defaultLanguage =
+            video.snippet
+              ?.defaultLanguage || '';
+
+          const defaultAudioLanguage =
+            video.snippet
+              ?.defaultAudioLanguage || '';
+
+          const videoObject = {
+            videoId: video.id,
+
+            title,
+
+            description,
+
+            channelTitle,
+
+            publishedAt:
+              video.snippet
+                ?.publishedAt || null,
+
+            thumbnail:
+              video.snippet
+                ?.thumbnails?.high?.url ||
+              video.snippet
+                ?.thumbnails?.medium?.url ||
+              video.snippet
+                ?.thumbnails?.default?.url ||
+              null,
+
+            duration:
+              formatDuration(
+                durationSeconds
+              ),
+
+            durationSeconds,
+
+            captionAvailable,
+
+            embeddable,
+
+            publicStatus,
+
+            categoryId:
+              video.snippet
+                ?.categoryId || null,
+
+            defaultLanguage,
+
+            defaultAudioLanguage,
+
+            viewCount:
+              video.statistics
+                ?.viewCount
+                ? Number(
+                    video.statistics
+                      .viewCount
+                  )
+                : 0,
+
+            language,
+
+            category
+          };
+
+          videoObject.languageStatus =
+            getLanguageStatus(
+              videoObject,
+              language
+            );
+
+          videoObject.languageMatch =
+            languageMatches(
+              videoObject,
+              language
+            );
+
+          videoObject.categoryMatch =
+            categoryMatches(
+              title + ' ' + description,
+              category
+            );
+
+          videoObject.qualityScore =
+            calculateQualityScore(
+              videoObject,
+              category,
+              language
+            );
+
+          return videoObject;
+        });
+
+      const rejected = {
+        notEmbeddable: 0,
+        notPublic: 0,
+        tooShort: 0,
+        tooLong: 0,
+        wrongLanguage: 0,
+        unknownLanguage: 0,
+        wrongCategory: 0
+      };
+
+      const accepted =
+        videos.filter(video => {
+          if (!video.embeddable) {
+            rejected.notEmbeddable++;
+            return false;
+          }
+
+          if (!video.publicStatus) {
+            rejected.notPublic++;
+            return false;
+          }
+
+          if (
+            video.durationSeconds < 60
+          ) {
+            rejected.tooShort++;
+            return false;
+          }
+
+          if (
+            video.durationSeconds > 3600
+          ) {
+            rejected.tooLong++;
+            return false;
+          }
+
+          if (
+            video.languageStatus ===
+            'wrong'
+          ) {
+            rejected.wrongLanguage++;
+            return false;
+          }
+
+          if (
+            video.languageStatus ===
+            'unknown'
+          ) {
+            rejected.unknownLanguage++;
+            return false;
+          }
+
+          if (
+            !video.categoryMatch
+          ) {
+            rejected.wrongCategory++;
+            return false;
+          }
+
+          return true;
+        });
+
+      const uniqueVideos = [];
+
+      const seenIds = new Set();
+
+      for (
+        const video of accepted
+      ) {
+        if (
+          seenIds.has(
+            video.videoId
+          )
+        ) {
+          continue;
+        }
+
+        seenIds.add(
+          video.videoId
+        );
+
+        uniqueVideos.push(
+          video
+        );
+      }
+
+      uniqueVideos.sort(
+        (a, b) => {
+          return (
+            b.qualityScore -
+            a.qualityScore
+          );
+        }
+      );
+
+      const finalVideos =
+        uniqueVideos.slice(0, 20);
+
+      console.log(
+        'YouTube V3 searched: ' +
+        searchItems.length
+      );
+
+      console.log(
+        'YouTube V3 accepted: ' +
+        finalVideos.length
+      );
+
+      console.log(
+        'YouTube V3 rejected: ' +
+        JSON.stringify(rejected)
+      );
+
+      return res.json({
+        ok: true,
+
+        version: 'v3',
+
+        language: {
+          code: language,
+          name:
+            LANGUAGES[language].name
+        },
+
+        category: {
+          code: category,
+          name:
+            CATEGORIES[category].name
+        },
+
+        searched:
+          searchItems.length,
+
+        accepted:
+          finalVideos.length,
+
+        rejected,
+
+        count:
+          finalVideos.length,
+
+        videos:
+          finalVideos,
+
+        nextPageToken:
+          searchData.nextPageToken ||
+          null
+      });
+
+    } catch (error) {
+      console.error(
+        'YouTube V3 error:',
+        error.response?.data ||
         error.message
-    });
+      );
+
+      return res.status(500).json({
+        ok: false,
+
+        error:
+          'YouTube V3 search failed',
+
+        details:
+          error.response?.data
+            ?.error?.message ||
+          error.message
+      });
+    }
   }
-});
+);
 
 module.exports = router;
