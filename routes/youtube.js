@@ -1,4 +1,4 @@
-```javascript
+
 const express = require('express');
 const axios = require('axios');
 
@@ -8,12 +8,12 @@ const YOUTUBE_API_URL =
   'https://www.googleapis.com/youtube/v3/search';
 
 // ---------------------------------------------------------
-// Langues autorisées
+// Supported languages
 // ---------------------------------------------------------
 
 const LANGUAGES = {
   fr: {
-    name: 'Français',
+    name: 'Francais',
     relevanceLanguage: 'fr'
   },
 
@@ -23,13 +23,13 @@ const LANGUAGES = {
   },
 
   ar: {
-    name: 'العربية',
+    name: 'Arabic',
     relevanceLanguage: 'ar'
   }
 };
 
 // ---------------------------------------------------------
-// Catégories de notre application
+// Application categories
 // ---------------------------------------------------------
 
 const CATEGORIES = {
@@ -49,15 +49,15 @@ const CATEGORIES = {
   },
 
   culture: {
-    name: 'Culture générale',
-    query: 'culture générale'
+    name: 'Culture generale',
+    query: 'culture general knowledge'
   }
 };
 
 // ---------------------------------------------------------
 // GET /api/youtube/search
 //
-// Exemple :
+// Example:
 // /api/youtube/search?language=fr&category=sciences
 // ---------------------------------------------------------
 
@@ -65,29 +65,29 @@ router.get('/search', async (req, res) => {
   try {
     const { language, category } = req.query;
 
-    // Vérification de la langue
+    // Check language
     if (!language || !LANGUAGES[language]) {
       return res.status(400).json({
         ok: false,
-        error: 'Langue invalide',
+        error: 'Invalid language',
         allowedLanguages: Object.keys(LANGUAGES)
       });
     }
 
-    // Vérification de la catégorie
+    // Check category
     if (!category || !CATEGORIES[category]) {
       return res.status(400).json({
         ok: false,
-        error: 'Catégorie invalide',
+        error: 'Invalid category',
         allowedCategories: Object.keys(CATEGORIES)
       });
     }
 
-    // Vérification de la clé API
+    // Check API key
     if (!process.env.YOUTUBE_API_KEY) {
       return res.status(500).json({
         ok: false,
-        error: 'YOUTUBE_API_KEY est absente des variables Railway'
+        error: 'YOUTUBE_API_KEY is missing'
       });
     }
 
@@ -95,7 +95,10 @@ router.get('/search', async (req, res) => {
     const categoryInfo = CATEGORIES[category];
 
     console.log(
-      `🔎 Recherche YouTube : ${languageInfo.name} / ${categoryInfo.name}`
+      'YouTube search: ' +
+      languageInfo.name +
+      ' / ' +
+      categoryInfo.name
     );
 
     const response = await axios.get(YOUTUBE_API_URL, {
@@ -169,13 +172,13 @@ router.get('/search', async (req, res) => {
   } catch (error) {
 
     console.error(
-      '❌ Erreur YouTube:',
+      'YouTube error:',
       error.response?.data || error.message
     );
 
     return res.status(500).json({
       ok: false,
-      error: 'Erreur lors de la recherche YouTube',
+      error: 'YouTube search failed',
 
       details:
         error.response?.data?.error?.message ||
@@ -185,4 +188,4 @@ router.get('/search', async (req, res) => {
 });
 
 module.exports = router;
-```
+
