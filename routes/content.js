@@ -1,25 +1,18 @@
 const express = require('express');
 const axios = require('axios');
-const { fetchTranscript } = require('youtube-transcript');
+
+const {
+  YouTubeTranscriptApi,
+  RequestBlocked,
+  TranscriptsDisabled,
+  NoTranscriptFound
+} = require('@hallelx/youtube-transcript');
 
 const router = express.Router();
 
 const YOUTUBE_API_KEY = process.env.YOUTUBE_API_KEY;
 
-function cleanTranscript(items) {
-  if (!Array.isArray(items)) {
-    return '';
-  }
-
-  return items
-    .map(function (item) {
-      return item && item.text ? String(item.text).trim() : '';
-    })
-    .filter(Boolean)
-    .join(' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-}
+const transcriptApi = new YouTubeTranscriptApi();
 
 router.get('/content', async function (req, res) {
   try {
@@ -39,10 +32,10 @@ router.get('/content', async function (req, res) {
       });
     }
 
-    console.log('Content request for video: ' + videoId);
+    console.log('Content request: ' + videoId);
 
     // ------------------------------------------------------------
-    // 1. Verify video with YouTube Data API
+    // 1. Verify the video with YouTube Data API
     // ------------------------------------------------------------
 
     const response = await axios.get(
@@ -78,32 +71,38 @@ router.get('/content', async function (req, res) {
       contentDetails.caption === 'true';
 
     // ------------------------------------------------------------
-    // 2. Try to retrieve transcript
+    // 2. Retrieve transcript
     // ------------------------------------------------------------
 
     console.log(
-      'Trying transcript extraction for: ' +
-      videoId
+      'Trying @hallelx/youtube-transcript...'
     );
 
-    let transcriptItems = [];
-    let transcriptText = '';
+    let transcript = null;
     let transcriptError = null;
+    let errorType = null;
 
     try {
-      transcriptItems = await fetchTranscript(videoId);
-
-      transcriptText =
-        cleanTranscript(transcriptItems);
-
-      console.log(
-        'Transcript segments: ' +
-        transcriptItems.length
+      transcript = await transcriptApi.fetch(
+        videoId,
+        {
+          languages: ['fr', 'en', 'ar']
+        }
       );
 
       console.log(
-        'Transcript characters: ' +
-        transcriptText.length
+        'Transcript language: ' +
+        transcript.languageCode
+      );
+
+      console.log(
+        'Transcript generated: ' +
+        transcript.isGenerated
+      );
+
+      console.log(
+        'Transcript snippets: ' +
+        transcript.snippets.length
       );
 
     } catch (error) {
@@ -112,27 +111,84 @@ router.get('/content', async function (req, res) {
           ? error.message
           : String(error);
 
+      errorType =
+        error && error.constructor
+          ? error.constructor.name
+          : 'UnknownError';
+
       console.error(
-        'Transcript extraction failed: ' +
+        'Transcript error: ' +
         transcriptError
+      );
+
+      console.error(
+        'Transcript error type: ' +
+        errorType
       );
     }
 
     // ------------------------------------------------------------
-    // 3. Validate transcript
+    // 3. Convert transcript to plain text
     // ------------------------------------------------------------
 
+    let transcriptText = '';
+
+    if (transcript) {
+      transcriptText = transcript.snippets
+        .map(function (snippet) {
+          return snippet &&
+            snippet.text
+            ? String(snippet.text).trim()
+            : '';
+        })
+        .filter(Boolean)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+
+    const transcriptCharacters =
+      transcriptText.length;
+
+    const transcriptSegments =
+      transcript
+        ? transcript.snippets.length
+        : 0;
+
     const transcriptRetrieved =
-      transcriptText.length >= 200;
+      transcriptCharacters >= 200;
+
+    // ------------------------------------------------------------
+    // 4. Handle failure
+    // ------------------------------------------------------------
 
     if (!transcriptRetrieved) {
+      let message =
+        'No usable transcript was retrieved.';
+
+      if (errorType === 'RequestBlocked') {
+        message =
+          'YouTube blocked the transcript request from the Railway server IP.';
+      }
+
+      if (errorType === 'TranscriptsDisabled') {
+        message =
+          'Transcripts are disabled for this video.';
+      }
+
+      if (errorType === 'NoTranscriptFound') {
+        message =
+          'No transcript was found in the requested languages.';
+      }
+
       return res.status(422).json({
         ok: false,
         videoId: videoId,
 
         video: {
           title: snippet.title || '',
-          description: snippet.description || '',
+          description:
+            snippet.description || '',
           channelTitle:
             snippet.channelTitle || '',
           publishedAt:
@@ -160,21 +216,27 @@ router.get('/content', async function (req, res) {
         textAccess: {
           transcriptRetrieved: false,
           transcriptCharacters:
-            transcriptText.length,
+            transcriptCharacters,
           transcriptSegments:
-            Array.isArray(transcriptItems)
-              ? transcriptItems.length
-              : 0,
+            transcriptSegments,
+          transcriptLanguage:
+            transcript
+              ? transcript.languageCode
+              : null,
+          transcriptGenerated:
+            transcript
+              ? transcript.isGenerated
+              : null,
           transcript: null,
           error: transcriptError,
-          message:
-            'No usable transcript was retrieved.'
+          errorType: errorType,
+          message: message
         }
       });
     }
 
     // ------------------------------------------------------------
-    // 4. Return transcript
+    // 5. Success
     // ------------------------------------------------------------
 
     return res.json({
@@ -183,7 +245,8 @@ router.get('/content', async function (req, res) {
 
       video: {
         title: snippet.title || '',
-        description: snippet.description || '',
+        description:
+          snippet.description || '',
         channelTitle:
           snippet.channelTitle || '',
         publishedAt:
@@ -211,17 +274,24 @@ router.get('/content', async function (req, res) {
       textAccess: {
         transcriptRetrieved: true,
         transcriptCharacters:
-          transcriptText.length,
+          transcriptCharacters,
         transcriptSegments:
-          transcriptItems.length,
+          transcriptSegments,
+        transcriptLanguage:
+          transcript.languageCode,
+        transcriptGenerated:
+          transcript.isGenerated,
         transcript: transcriptText,
-        error: null
+        error: null,
+        errorType: null,
+        message:
+          'Transcript successfully retrieved.'
       }
     });
 
   } catch (error) {
     console.error(
-      'Content route error:',
+      'Content route fatal error:',
       error.message
     );
 
