@@ -6,6 +6,7 @@ dotenv.config();
 
 const youtubeRouter = require('./routes/youtube');
 const contentRouter = require('./routes/content');
+const questionsRouter = require('./routes/questions');
 
 const app = express();
 
@@ -22,6 +23,7 @@ app.get('/', (req, res) => {
 
 app.use('/api/youtube', youtubeRouter);
 app.use('/api/youtube', contentRouter);
+app.use('/api/youtube', questionsRouter);
 
 const PORT = process.env.PORT || 8080;
 
