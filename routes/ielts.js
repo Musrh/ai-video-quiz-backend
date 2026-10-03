@@ -1,4 +1,4 @@
-````javascript
+
 const express = require('express');
 const axios = require('axios');
 
@@ -1545,4 +1545,3 @@ router.get(
 
 
 module.exports = router;
-````
