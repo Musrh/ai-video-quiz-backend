@@ -18,24 +18,14 @@ const execFileAsync = promisify(execFile);
 // CONFIGURATION
 // ============================================================
 
-const YOUTUBE_API_URL =
-  'https://www.googleapis.com/youtube/v3';
-
-const TRANSCRIPT_API_URL =
-  'https://www.youtubetranscript.dev/api/v2/transcribe';
-
-const ANTHROPIC_URL =
-  'https://api.anthropic.com/v1/messages';
-
-const CLAUDE_MODEL =
-  process.env.CLAUDE_MODEL || 'claude-sonnet-5';
+const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3';
+const TRANSCRIPT_API_URL = 'https://www.youtubetranscript.dev/api/v2/transcribe';
+const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
 
 // OCR
-const OCR_INTERVAL_SECONDS =
-  Number(process.env.IELTS_OCR_INTERVAL || 8);
-
-const OCR_MAX_FRAMES =
-  Number(process.env.IELTS_OCR_MAX_FRAMES || 180);
+const OCR_INTERVAL_SECONDS = Number(process.env.IELTS_OCR_INTERVAL || 8);
+const OCR_MAX_FRAMES = Number(process.env.IELTS_OCR_MAX_FRAMES || 180);
 
 // ============================================================
 // RECHERCHE YOUTUBE IELTS
@@ -122,10 +112,7 @@ function normalizeText(value) {
 
 function containsAny(text, terms) {
   const value = String(text || '').toLowerCase();
-
-  return terms.some(term =>
-    value.includes(term.toLowerCase())
-  );
+  return terms.some(term => value.includes(term.toLowerCase()));
 }
 
 function getVideoIdFromUrl(value) {
@@ -141,32 +128,19 @@ function getVideoIdFromUrl(value) {
   try {
     const url = new URL(input);
 
-    if (
-      url.hostname.includes('youtube.com') ||
-      url.hostname.includes('youtu.be')
-    ) {
+    if (url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
       if (url.hostname.includes('youtu.be')) {
-        return url.pathname
-          .replace('/', '')
-          .substring(0, 11);
+        return url.pathname.replace('/', '').substring(0, 11);
       }
 
       const id = url.searchParams.get('v');
-
-      if (id) {
-        return id;
-      }
+      if (id) return id;
 
       const parts = url.pathname.split('/');
-
       const embedIndex = parts.indexOf('embed');
 
-      if (
-        embedIndex !== -1 &&
-        parts[embedIndex + 1]
-      ) {
-        return parts[embedIndex + 1]
-          .substring(0, 11);
+      if (embedIndex !== -1 && parts[embedIndex + 1]) {
+        return parts[embedIndex + 1].substring(0, 11);
       }
     }
   } catch (_) {
@@ -179,44 +153,21 @@ function getVideoIdFromUrl(value) {
 function parseDuration(duration) {
   if (!duration) return 0;
 
-  const match =
-    String(duration).match(
-      /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/
-    );
-
+  const match = String(duration).match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
   if (!match) return 0;
 
-  const hours =
-    Number(match[1] || 0);
+  const hours = Number(match[1] || 0);
+  const minutes = Number(match[2] || 0);
+  const seconds = Number(match[3] || 0);
 
-  const minutes =
-    Number(match[2] || 0);
-
-  const seconds =
-    Number(match[3] || 0);
-
-  return (
-    hours * 3600 +
-    minutes * 60 +
-    seconds
-  );
+  return hours * 3600 + minutes * 60 + seconds;
 }
 
 function formatTime(seconds) {
-  const total =
-    Math.max(
-      0,
-      Math.floor(Number(seconds) || 0)
-    );
-
-  const h =
-    Math.floor(total / 3600);
-
-  const m =
-    Math.floor((total % 3600) / 60);
-
-  const s =
-    total % 60;
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
 
   if (h > 0) {
     return (
@@ -226,18 +177,12 @@ function formatTime(seconds) {
     );
   }
 
-  return (
-    `${String(m).padStart(2, '0')}:` +
-    `${String(s).padStart(2, '0')}`
-  );
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
 function safeNumber(value) {
   const n = Number(value);
-
-  return Number.isFinite(n)
-    ? n
-    : 0;
+  return Number.isFinite(n) ? n : 0;
 }
 
 // ============================================================
@@ -246,98 +191,49 @@ function safeNumber(value) {
 
 async function searchYouTube(query) {
   if (!process.env.YOUTUBE_API_KEY) {
-    throw new Error(
-      'YOUTUBE_API_KEY manquante'
-    );
+    throw new Error('YOUTUBE_API_KEY manquante');
   }
 
-  const response =
-    await axios.get(
-      `${YOUTUBE_API_URL}/search`,
-      {
-        params: {
-          key:
-            process.env.YOUTUBE_API_KEY,
+  const response = await axios.get(`${YOUTUBE_API_URL}/search`, {
+    params: {
+      key: process.env.YOUTUBE_API_KEY,
+      part: 'snippet',
+      q: query,
+      type: 'video',
+      maxResults: 50,
+      videoDuration: 'medium',
+      videoEmbeddable: 'true',
+      videoSyndicated: 'true',
+      relevanceLanguage: 'en',
+      regionCode: 'US'
+    },
+    timeout: 30000
+  });
 
-          part:
-            'snippet',
-
-          q:
-            query,
-
-          type:
-            'video',
-
-          maxResults:
-            50,
-
-          videoDuration:
-            'medium',
-
-          videoEmbeddable:
-            'true',
-
-          videoSyndicated:
-            'true',
-
-          relevanceLanguage:
-            'en',
-
-          regionCode:
-            'US'
-        },
-
-        timeout:
-          30000
-      }
-    );
-
-  return (
-    response.data.items || []
-  );
+  return response.data.items || [];
 }
 
 async function getVideoDetails(videoIds) {
   if (!process.env.YOUTUBE_API_KEY) {
-    throw new Error(
-      'YOUTUBE_API_KEY manquante'
-    );
+    throw new Error('YOUTUBE_API_KEY manquante');
   }
 
-  if (
-    !Array.isArray(videoIds) ||
-    videoIds.length === 0
-  ) {
+  if (!Array.isArray(videoIds) || videoIds.length === 0) {
     return [];
   }
 
-  const uniqueIds =
-    [...new Set(videoIds)]
-      .filter(Boolean);
+  const uniqueIds = [...new Set(videoIds)].filter(Boolean);
 
-  const response =
-    await axios.get(
-      `${YOUTUBE_API_URL}/videos`,
-      {
-        params: {
-          key:
-            process.env.YOUTUBE_API_KEY,
+  const response = await axios.get(`${YOUTUBE_API_URL}/videos`, {
+    params: {
+      key: process.env.YOUTUBE_API_KEY,
+      part: 'snippet,contentDetails,status,statistics',
+      id: uniqueIds.join(',')
+    },
+    timeout: 30000
+  });
 
-          part:
-            'snippet,contentDetails,status,statistics',
-
-          id:
-            uniqueIds.join(',')
-        },
-
-        timeout:
-          30000
-      }
-    );
-
-  return (
-    response.data.items || []
-  );
+  return response.data.items || [];
 }
 
 // ============================================================
@@ -345,22 +241,12 @@ async function getVideoDetails(videoIds) {
 // ============================================================
 
 function buildVideoObject(item) {
-  const snippet =
-    item.snippet || {};
+  const snippet = item.snippet || {};
+  const contentDetails = item.contentDetails || {};
+  const status = item.status || {};
+  const statistics = item.statistics || {};
 
-  const contentDetails =
-    item.contentDetails || {};
-
-  const status =
-    item.status || {};
-
-  const statistics =
-    item.statistics || {};
-
-  const durationSeconds =
-    parseDuration(
-      contentDetails.duration
-    );
+  const durationSeconds = parseDuration(contentDetails.duration);
 
   const language =
     snippet.defaultLanguage ||
@@ -368,111 +254,46 @@ function buildVideoObject(item) {
     '';
 
   return {
-    videoId:
-      item.id,
-
-    title:
-      snippet.title || '',
-
-    description:
-      snippet.description || '',
-
-    channelTitle:
-      snippet.channelTitle || '',
-
-    publishedAt:
-      snippet.publishedAt || null,
-
-    duration:
-      contentDetails.duration ||
-      null,
-
+    videoId: item.id,
+    title: snippet.title || '',
+    description: snippet.description || '',
+    channelTitle: snippet.channelTitle || '',
+    publishedAt: snippet.publishedAt || null,
+    duration: contentDetails.duration || null,
     durationSeconds,
-
-    language:
-      language || 'en',
-
+    language: language || 'en',
     thumbnail:
       snippet.thumbnails?.high?.url ||
       snippet.thumbnails?.medium?.url ||
       snippet.thumbnails?.default?.url ||
       null,
-
-    views:
-      safeNumber(
-        statistics.viewCount
-      ),
-
-    likes:
-      safeNumber(
-        statistics.likeCount
-      ),
-
-    privacyStatus:
-      status.privacyStatus ||
-      null,
-
-    embeddable:
-      status.embeddable !== false,
-
-    skill:
-      'listening'
+    views: safeNumber(statistics.viewCount),
+    likes: safeNumber(statistics.likeCount),
+    privacyStatus: status.privacyStatus || null,
+    embeddable: status.embeddable !== false,
+    skill: 'listening'
   };
 }
 
 function calculateQuality(video) {
   let score = 0;
 
-  const title =
-    video.title.toLowerCase();
+  const title = video.title.toLowerCase();
+  const description = video.description.toLowerCase();
 
-  const description =
-    video.description.toLowerCase();
-
-  if (
-    title.includes('ielts listening')
-  ) {
+  if (title.includes('ielts listening')) {
     score += 35;
-  } else if (
-    title.includes('ielts')
-  ) {
+  } else if (title.includes('ielts')) {
     score += 20;
   }
 
-  if (
-    title.includes('test')
-  ) {
-    score += 20;
-  }
+  if (title.includes('test')) score += 20;
+  if (title.includes('question')) score += 15;
+  if (title.includes('answer')) score += 10;
+  if (description.includes('listening')) score += 10;
+  if (video.embeddable) score += 5;
 
-  if (
-    title.includes('question')
-  ) {
-    score += 15;
-  }
-
-  if (
-    title.includes('answer')
-  ) {
-    score += 10;
-  }
-
-  if (
-    description.includes('listening')
-  ) {
-    score += 10;
-  }
-
-  if (
-    video.embeddable
-  ) {
-    score += 5;
-  }
-
-  return Math.min(
-    100,
-    score
-  );
+  return Math.min(100, score);
 }
 
 // ============================================================
@@ -483,66 +304,21 @@ function processVideos(items) {
   const candidates = [];
 
   for (const item of items) {
-    const video =
-      buildVideoObject(item);
+    const video = buildVideoObject(item);
 
-    const combined =
-      `${video.title} ${video.description}`
-        .toLowerCase();
+    const combined = `${video.title} ${video.description}`.toLowerCase();
 
-    if (
-      !containsAny(
-        combined,
-        IELTS_TERMS
-      )
-    ) {
-      continue;
-    }
+    if (!containsAny(combined, IELTS_TERMS)) continue;
+    if (containsAny(combined, EXCLUDED_TERMS)) continue;
 
-    if (
-      containsAny(
-        combined,
-        EXCLUDED_TERMS
-      )
-    ) {
-      continue;
-    }
+    if (video.privacyStatus && video.privacyStatus !== 'public') continue;
+    if (video.embeddable === false) continue;
+    if (video.title.length < 8) continue;
+    if (video.description.length < 20) continue;
 
-    if (
-      video.privacyStatus &&
-      video.privacyStatus !== 'public'
-    ) {
-      continue;
-    }
+    if (video.durationSeconds < 120 || video.durationSeconds > 3600) continue;
 
-    if (
-      video.embeddable === false
-    ) {
-      continue;
-    }
-
-    if (
-      video.title.length < 8
-    ) {
-      continue;
-    }
-
-    if (
-      video.description.length < 20
-    ) {
-      continue;
-    }
-
-    if (
-      video.durationSeconds < 120 ||
-      video.durationSeconds > 3600
-    ) {
-      continue;
-    }
-
-    video.quality =
-      calculateQuality(video);
-
+    video.quality = calculateQuality(video);
     candidates.push(video);
   }
 
@@ -554,9 +330,7 @@ function processVideos(items) {
 // ============================================================
 
 async function getTranscript(videoId) {
-  if (
-    !process.env.YOUTUBE_TRANSCRIPT_API_KEY
-  ) {
+  if (!process.env.YOUTUBE_TRANSCRIPT_API_KEY) {
     return {
       text: '',
       segments: [],
@@ -568,138 +342,64 @@ async function getTranscript(videoId) {
   }
 
   try {
-    const response =
-      await axios.post(
-        TRANSCRIPT_API_URL,
-        {
-          video:
-            videoId,
-
-          language:
-            'en',
-
-          source:
-            'auto',
-
-          format: {
-            timestamp:
-              true,
-
-            paragraphs:
-              true,
-
-            words:
-              false
-          }
-        },
-        {
-          headers: {
-            Authorization:
-              `Bearer ${process.env.YOUTUBE_TRANSCRIPT_API_KEY}`,
-
-            'Content-Type':
-              'application/json'
-          },
-
-          timeout:
-            60000
+    const response = await axios.post(
+      TRANSCRIPT_API_URL,
+      {
+        video: videoId,
+        language: 'en',
+        source: 'auto',
+        format: {
+          timestamp: true,
+          paragraphs: true,
+          words: false
         }
-      );
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.YOUTUBE_TRANSCRIPT_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 60000
+      }
+    );
 
-    const data =
-      response.data || {};
+    const data = response.data || {};
 
-    let rawSegments =
-      Array.isArray(data.segments)
-        ? data.segments
-        : [];
+    const rawSegments = Array.isArray(data.segments) ? data.segments : [];
 
-    let text =
-      data.text ||
-      data.transcript ||
-      '';
+    let text = data.text || data.transcript || '';
 
-    if (
-      !text &&
-      rawSegments.length > 0
-    ) {
-      text =
-        rawSegments
-          .map(item =>
-            item.text ||
-            item.content ||
-            ''
-          )
-          .join(' ');
+    if (!text && rawSegments.length > 0) {
+      text = rawSegments
+        .map(item => item.text || item.content || '')
+        .join(' ');
     }
 
-    const segments =
-      rawSegments.map(item => {
-        const start =
-          Number(
-            item.start ??
-            item.startTime ??
-            item.offset ??
-            0
-          );
-
-        const end =
-          Number(
-            item.end ??
-            item.endTime ??
-            start
-          );
+    const segments = rawSegments
+      .map(item => {
+        const start = Number(item.start ?? item.startTime ?? item.offset ?? 0);
+        const end = Number(item.end ?? item.endTime ?? start);
 
         return {
-          text:
-            normalizeText(
-              item.text ||
-              item.content ||
-              ''
-            ),
-
+          text: normalizeText(item.text || item.content || ''),
           start,
-
           end,
-
-          startFormatted:
-            formatTime(start),
-
-          endFormatted:
-            formatTime(end)
+          startFormatted: formatTime(start),
+          endFormatted: formatTime(end)
         };
-      }).filter(
-        item =>
-          item.text
-      );
+      })
+      .filter(item => item.text);
 
     return {
-      text:
-        normalizeText(text),
-
+      text: normalizeText(text),
       segments,
-
-      status:
-        data.status ||
-        'completed',
-
-      language:
-        data.language ||
-        'en',
-
-      source:
-        data.source ||
-        'transcript',
-
+      status: data.status || 'completed',
+      language: data.language || 'en',
+      source: data.source || 'transcript',
       videoId
     };
-
   } catch (error) {
-    console.error(
-      '⚠️ Transcript error:',
-      error.response?.data ||
-      error.message
-    );
+    console.error('⚠️ Transcript error:', error.response?.data || error.message);
 
     return {
       text: '',
@@ -708,8 +408,7 @@ async function getTranscript(videoId) {
       language: 'en',
       source: 'error',
       videoId,
-      error:
-        error.message
+      error: error.message
     };
   }
 }
@@ -719,55 +418,30 @@ async function getTranscript(videoId) {
 // ============================================================
 
 function hasQuestionMarkers(text) {
-  const value =
-    String(text || '')
-      .toLowerCase();
+  const value = String(text || '').toLowerCase();
 
-  const markers =
-    QUESTION_MARKERS.filter(
-      marker =>
-        value.includes(
-          marker
-        )
-    );
+  const markers = QUESTION_MARKERS.filter(marker => value.includes(marker));
 
   return {
-    found:
-      markers.length > 0,
-
+    found: markers.length > 0,
     markers
   };
 }
 
-function findQuestionSegments(
-  segments
-) {
+function findQuestionSegments(segments) {
   const zones = [];
 
-  for (
-    let i = 0;
-    i < segments.length;
-    i++
-  ) {
-    const segment =
-      segments[i];
-
-    const text =
-      segment.text || '';
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    const text = segment.text || '';
 
     if (
-      /^\s*(question\s*)?\d{1,2}[\.\):\-]/i
-        .test(text) ||
-      /questions?\s+\d{1,2}/i
-        .test(text)
+      /^\s*(question\s*)?\d{1,2}[\.\):\-]/i.test(text) ||
+      /questions?\s+\d{1,2}/i.test(text)
     ) {
       zones.push({
-        start:
-          segment.start,
-
-        end:
-          segment.end,
-
+        start: segment.start,
+        end: segment.end,
         text
       });
     }
@@ -781,135 +455,81 @@ function findQuestionSegments(
 // ============================================================
 
 async function createTempDir() {
-  return await fsp.mkdtemp(
-    path.join(
-      os.tmpdir(),
-      'ielts-'
-    )
-  );
+  return await fsp.mkdtemp(path.join(os.tmpdir(), 'ielts-'));
 }
 
-async function downloadYoutubeVideo(
-  videoId,
-  outputPath
-) {
-  const url =
-    `https://www.youtube.com/watch?v=${videoId}`;
+async function downloadYoutubeVideo(videoId, outputPath) {
+  const url = `https://www.youtube.com/watch?v=${videoId}`;
 
   const options = {
-    noPlaylist:
-      true,
+    noPlaylist: true,
 
+    // Format tolérant, limité à 720p (suffisant pour l'OCR)
     format:
-      'best[ext=mp4]/best',
+      'best[height<=720][ext=mp4]/bv*[height<=720]+ba/best[height<=720]/best',
 
-    output:
-      outputPath,
+    output: outputPath,
+    mergeOutputFormat: 'mp4',
 
-    noWarnings:
-      true,
+    // ffmpeg embarqué (ffmpeg-static) pour fusionner vidéo + audio si besoin
+    ffmpegLocation: ffmpegPath,
 
-    noCheckCertificates:
-      true,
+    // Résolution des défis JavaScript de YouTube
+    // (sinon yt-dlp ne voit que des images -> "Requested format is not available")
+    jsRuntimes: 'node',
+    remoteComponents: 'ejs:github',
 
-    preferFreeFormats:
-      true,
-
-    quiet:
-      true,
-
-    retries:
-      3
+    noWarnings: true,
+    noCheckCertificates: true,
+    preferFreeFormats: true,
+    quiet: true,
+    retries: 3
   };
 
   // ----------------------------------------------------------
   // Cookies optionnelles
   // ----------------------------------------------------------
 
-  let cookieFile = null;
-
-  if (
-    process.env.YOUTUBE_COOKIES_BASE64
-  ) {
+  if (process.env.YOUTUBE_COOKIES_BASE64) {
     try {
-      cookieFile =
-        path.join(
-          path.dirname(outputPath),
-          'cookies.txt'
-        );
+      const cookieFile = path.join(path.dirname(outputPath), 'cookies.txt');
 
       await fsp.writeFile(
         cookieFile,
-        Buffer.from(
-          process.env.YOUTUBE_COOKIES_BASE64,
-          'base64'
-        )
+        Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64')
       );
 
-      options.cookies =
-        cookieFile;
+      options.cookies = cookieFile;
 
-      console.log(
-        '🍪 Cookies YouTube temporaires utilisés'
-      );
-
+      console.log('🍪 Cookies YouTube temporaires utilisés');
     } catch (error) {
-      console.warn(
-        '⚠️ Impossible de créer cookies.txt:',
-        error.message
-      );
+      console.warn('⚠️ Impossible de créer cookies.txt:', error.message);
     }
   }
 
-  console.log(
-    `⬇️ Téléchargement vidéo ${videoId}...`
-  );
+  console.log(`⬇️ Téléchargement vidéo ${videoId}...`);
 
   try {
-    await youtubedl(
-      url,
-      options
-    );
+    await youtubedl(url, options);
 
-    if (
-      !fs.existsSync(outputPath)
-    ) {
-      throw new Error(
-        'yt-dlp terminé mais le fichier vidéo est introuvable'
-      );
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('yt-dlp terminé mais le fichier vidéo est introuvable');
     }
 
-    const stat =
-      await fsp.stat(
-        outputPath
-      );
+    const stat = await fsp.stat(outputPath);
 
-    if (
-      stat.size < 10000
-    ) {
-      throw new Error(
-        'Fichier vidéo téléchargé invalide ou vide'
-      );
+    if (stat.size < 10000) {
+      throw new Error('Fichier vidéo téléchargé invalide ou vide');
     }
 
-    console.log(
-      `✅ Vidéo téléchargée: ${Math.round(stat.size / 1024 / 1024)} MB`
-    );
+    console.log(`✅ Vidéo téléchargée: ${Math.round(stat.size / 1024 / 1024)} MB`);
 
     return outputPath;
-
   } catch (error) {
-    console.error(
-      '❌ Erreur téléchargement:',
-      error.stderr ||
-      error.message
-    );
+    console.error('❌ Erreur téléchargement:', error.stderr || error.message);
 
     throw new Error(
-      `Téléchargement YouTube impossible: ${
-        error.stderr ||
-        error.message
-      }`
+      `Téléchargement YouTube impossible: ${error.stderr || error.message}`
     );
   }
 }
@@ -918,27 +538,12 @@ async function downloadYoutubeVideo(
 // OCR : EXTRACTION DES FRAMES
 // ============================================================
 
-async function extractFrames(
-  videoPath,
-  framesDir
-) {
-  await fsp.mkdir(
-    framesDir,
-    {
-      recursive:
-        true
-    }
-  );
+async function extractFrames(videoPath, framesDir) {
+  await fsp.mkdir(framesDir, { recursive: true });
 
-  const outputPattern =
-    path.join(
-      framesDir,
-      'frame-%05d.jpg'
-    );
+  const outputPattern = path.join(framesDir, 'frame-%05d.jpg');
 
-  console.log(
-    `🎞️ Extraction des frames toutes les ${OCR_INTERVAL_SECONDS}s...`
-  );
+  console.log(`🎞️ Extraction des frames toutes les ${OCR_INTERVAL_SECONDS}s...`);
 
   await execFileAsync(
     ffmpegPath,
@@ -962,62 +567,32 @@ async function extractFrames(
       outputPattern
     ],
     {
-      timeout:
-        10 * 60 * 1000,
-
-      maxBuffer:
-        10 * 1024 * 1024
+      timeout: 10 * 60 * 1000,
+      maxBuffer: 10 * 1024 * 1024
     }
   );
 
-  const files =
-    (
-      await fsp.readdir(
-        framesDir
-      )
-    )
-      .filter(
-        file =>
-          file.endsWith('.jpg')
-      )
-      .sort();
+  const files = (await fsp.readdir(framesDir))
+    .filter(file => file.endsWith('.jpg'))
+    .sort();
 
-  console.log(
-    `🖼️ ${files.length} frames extraites`
-  );
+  console.log(`🖼️ ${files.length} frames extraites`);
 
-  return files.map(
-    (file, index) => ({
-      file:
-        path.join(
-          framesDir,
-          file
-        ),
-
-      index,
-
-      timestamp:
-        index *
-        OCR_INTERVAL_SECONDS
-    })
-  );
+  return files.map((file, index) => ({
+    file: path.join(framesDir, file),
+    index,
+    timestamp: index * OCR_INTERVAL_SECONDS
+  }));
 }
 
 // ============================================================
 // OCR : ANALYSE D'UNE FRAME
 // ============================================================
 
-function looksLikeQuestionText(
-  text
-) {
-  const value =
-    String(text || '')
-      .toLowerCase();
+function looksLikeQuestionText(text) {
+  const value = String(text || '').toLowerCase();
 
-  if (
-    !value ||
-    value.length < 15
-  ) {
+  if (!value || value.length < 15) {
     return false;
   }
 
@@ -1032,10 +607,7 @@ function looksLikeQuestionText(
     /\b[a-d][\.\)]\s+\w+/i
   ];
 
-  return patterns.some(
-    pattern =>
-      pattern.test(value)
-  );
+  return patterns.some(pattern => pattern.test(value));
 }
 
 function cleanOcrText(text) {
@@ -1047,90 +619,46 @@ function cleanOcrText(text) {
     .trim();
 }
 
-async function runOCR(
-  frames
-) {
-  if (
-    !frames ||
-    frames.length === 0
-  ) {
+async function runOCR(frames) {
+  if (!frames || frames.length === 0) {
     return [];
   }
 
-  console.log(
-    `🔎 OCR de ${frames.length} frames...`
-  );
+  console.log(`🔎 OCR de ${frames.length} frames...`);
 
-  const worker =
-    await createWorker(
-      'eng'
-    );
+  const worker = await createWorker('eng');
 
   const results = [];
 
   try {
-    for (
-      let i = 0;
-      i < frames.length;
-      i++
-    ) {
-      const frame =
-        frames[i];
+    for (let i = 0; i < frames.length; i++) {
+      const frame = frames[i];
 
       try {
-        const result =
-          await worker.recognize(
-            frame.file
-          );
+        const result = await worker.recognize(frame.file);
 
-        const text =
-          cleanOcrText(
-            result?.data?.text ||
-            ''
-          );
+        const text = cleanOcrText(result?.data?.text || '');
 
-        if (
-          text.length > 10
-        ) {
-          const isQuestion =
-            looksLikeQuestionText(
-              text
-            );
+        if (text.length > 10) {
+          const isQuestion = looksLikeQuestionText(text);
 
-          if (
-            isQuestion
-          ) {
-            console.log(
-              `📝 Question détectée vers ${formatTime(frame.timestamp)}`
-            );
+          if (isQuestion) {
+            console.log(`📝 Question détectée vers ${formatTime(frame.timestamp)}`);
           }
 
           results.push({
-            timestamp:
-              frame.timestamp,
-
-            timestampFormatted:
-              formatTime(
-                frame.timestamp
-              ),
-
+            timestamp: frame.timestamp,
+            timestampFormatted: formatTime(frame.timestamp),
             text,
-
-            questionLike:
-              isQuestion
+            questionLike: isQuestion
           });
         }
-
       } catch (error) {
-        console.warn(
-          `⚠️ OCR frame ${i} échoué:`,
-          error.message
-        );
+        console.warn(`⚠️ OCR frame ${i} échoué:`, error.message);
       }
     }
 
     return results;
-
   } finally {
     await worker.terminate();
   }
@@ -1140,113 +668,63 @@ async function runOCR(
 // EXTRACTION DES QUESTIONS À PARTIR DE L'OCR
 // ============================================================
 
-function extractQuestionsFromOcr(
-  ocrResults
-) {
+function extractQuestionsFromOcr(ocrResults) {
   const questions = [];
 
-  for (
-    const result of ocrResults
-  ) {
-    if (
-      !result.questionLike
-    ) {
+  for (const result of ocrResults) {
+    if (!result.questionLike) {
       continue;
     }
 
-    const lines =
-      result.text
-        .split('\n')
-        .map(
-          line =>
-            line.trim()
-        )
-        .filter(Boolean);
+    const lines = result.text
+      .split('\n')
+      .map(line => line.trim())
+      .filter(Boolean);
 
-    let currentQuestion =
-      null;
+    let currentQuestion = null;
 
-    for (
-      const line of lines
-    ) {
-      // Exemple:
+    for (const line of lines) {
+      // Exemples :
       // 1. What is the man's name?
       // 2) Where does...
       // Question 1 ...
-      const numberMatch =
-        line.match(
-          /^(?:question\s*)?(\d{1,2})[\.\):\-]\s*(.+)$/i
-        );
+      const numberMatch = line.match(
+        /^(?:question\s*)?(\d{1,2})[\.\):\-]\s*(.+)$/i
+      );
 
-      const questionWordMatch =
-        line.match(
-          /^question\s+(\d{1,2})\s*[:\.\-]?\s*(.*)$/i
-        );
+      const questionWordMatch = line.match(
+        /^question\s+(\d{1,2})\s*[:\.\-]?\s*(.*)$/i
+      );
 
-      if (
-        numberMatch ||
-        questionWordMatch
-      ) {
-        if (
-          currentQuestion
-        ) {
-          questions.push(
-            currentQuestion
-          );
+      if (numberMatch || questionWordMatch) {
+        if (currentQuestion) {
+          questions.push(currentQuestion);
         }
 
-        const number =
-          Number(
-            (
-              numberMatch ||
-              questionWordMatch
-            )[1]
-          );
+        const matched = numberMatch || questionWordMatch;
 
-        const questionText =
-          (
-            numberMatch ||
-            questionWordMatch
-          )[2] || '';
+        const number = Number(matched[1]);
+        const questionText = matched[2] || '';
 
         currentQuestion = {
           number,
-
-          text:
-            questionText.trim(),
-
+          text: questionText.trim(),
           choices: [],
-
-          startTime:
-            result.timestamp,
-
-          startTimeFormatted:
-            result.timestampFormatted,
-
-          source:
-            'video_ocr'
+          startTime: result.timestamp,
+          startTimeFormatted: result.timestampFormatted,
+          source: 'video_ocr'
         };
 
         continue;
       }
 
       // Choix A / B / C / D
-      const choiceMatch =
-        line.match(
-          /^([A-D])[\.\):\-]\s*(.+)$/i
-        );
+      const choiceMatch = line.match(/^([A-D])[\.\):\-]\s*(.+)$/i);
 
-      if (
-        choiceMatch &&
-        currentQuestion
-      ) {
+      if (choiceMatch && currentQuestion) {
         currentQuestion.choices.push({
-          letter:
-            choiceMatch[1]
-              .toUpperCase(),
-
-          text:
-            choiceMatch[2].trim()
+          letter: choiceMatch[1].toUpperCase(),
+          text: choiceMatch[2].trim()
         });
 
         continue;
@@ -1261,115 +739,65 @@ function extractQuestionsFromOcr(
           /write no more than/i.test(line)
         )
       ) {
-        currentQuestion.instructions =
-          line;
+        currentQuestion.instructions = line;
       }
 
       // Suite de la question
-      if (
-        currentQuestion &&
-        !choiceMatch &&
-        line.length > 2
-      ) {
-        if (
-          currentQuestion.text.length <
-          1000
-        ) {
-          currentQuestion.text +=
-            ` ${line}`;
+      if (currentQuestion && !choiceMatch && line.length > 2) {
+        if (currentQuestion.text.length < 1000) {
+          currentQuestion.text += ` ${line}`;
         }
       }
     }
 
-    if (
-      currentQuestion
-    ) {
-      questions.push(
-        currentQuestion
-      );
+    if (currentQuestion) {
+      questions.push(currentQuestion);
     }
   }
 
   // Déduplication
   const unique = [];
 
-  for (
-    const question of questions
-  ) {
-    const normalized =
-      normalizeText(
-        question.text
-      ).toLowerCase();
+  for (const question of questions) {
+    const normalized = normalizeText(question.text).toLowerCase();
 
-    if (
-      normalized.length < 5
-    ) {
+    if (normalized.length < 5) {
       continue;
     }
 
-    const exists =
-      unique.some(
-        item =>
-          item.number ===
-            question.number &&
-          normalizeText(
-            item.text
-          ).toLowerCase() ===
-            normalized
-      );
+    const exists = unique.some(
+      item =>
+        item.number === question.number &&
+        normalizeText(item.text).toLowerCase() === normalized
+    );
 
-    if (
-      !exists
-    ) {
+    if (!exists) {
       unique.push({
         ...question,
-
-        text:
-          normalizeText(
-            question.text
-          )
+        text: normalizeText(question.text)
       });
     }
   }
 
-  return unique
-    .sort(
-      (a, b) =>
-        a.number - b.number
-    );
+  return unique.sort((a, b) => a.number - b.number);
 }
 
 // ============================================================
 // REGROUPEMENT DES FRAMES OCR
 // ============================================================
 
-function buildOcrQuestionZones(
-  ocrResults
-) {
+function buildOcrQuestionZones(ocrResults) {
   const zones = [];
 
   let current = null;
 
-  for (
-    const result of ocrResults
-  ) {
-    if (
-      !result.questionLike
-    ) {
-      if (
-        current
-      ) {
-        current.endTime =
-          result.timestamp;
+  for (const result of ocrResults) {
+    if (!result.questionLike) {
+      if (current) {
+        current.endTime = result.timestamp;
+        current.endTimeFormatted = formatTime(result.timestamp);
 
-        current.endTimeFormatted =
-          formatTime(
-            result.timestamp
-          );
-
-        zones.push(
-          current
-        );
+        zones.push(current);
 
         current = null;
       }
@@ -1377,43 +805,24 @@ function buildOcrQuestionZones(
       continue;
     }
 
-    if (
-      !current
-    ) {
+    if (!current) {
       current = {
-        startTime:
-          result.timestamp,
-
-        startTimeFormatted:
-          result.timestampFormatted,
-
-        endTime:
-          result.timestamp,
-
-        endTimeFormatted:
-          result.timestampFormatted,
-
+        startTime: result.timestamp,
+        startTimeFormatted: result.timestampFormatted,
+        endTime: result.timestamp,
+        endTimeFormatted: result.timestampFormatted,
         texts: []
       };
     }
 
-    current.endTime =
-      result.timestamp;
+    current.endTime = result.timestamp;
+    current.endTimeFormatted = result.timestampFormatted;
 
-    current.endTimeFormatted =
-      result.timestampFormatted;
-
-    current.texts.push(
-      result.text
-    );
+    current.texts.push(result.text);
   }
 
-  if (
-    current
-  ) {
-    zones.push(
-      current
-    );
+  if (current) {
+    zones.push(current);
   }
 
   return zones;
@@ -1423,134 +832,62 @@ function buildOcrQuestionZones(
 // ANALYSE OCR D'UNE VIDEO
 // ============================================================
 
-async function analyzeVideoWithOCR(
-  video
-) {
-  const tempDir =
-    await createTempDir();
+async function analyzeVideoWithOCR(video) {
+  const tempDir = await createTempDir();
 
-  const videoPath =
-    path.join(
-      tempDir,
-      'video.mp4'
-    );
-
-  const framesDir =
-    path.join(
-      tempDir,
-      'frames'
-    );
+  const videoPath = path.join(tempDir, 'video.mp4');
+  const framesDir = path.join(tempDir, 'frames');
 
   try {
-    console.log(
-      `\n🔬 ANALYSE OCR IELTS: ${video.videoId}`
+    console.log(`\n🔬 ANALYSE OCR IELTS: ${video.videoId}`);
+
+    await downloadYoutubeVideo(video.videoId, videoPath);
+
+    const frames = await extractFrames(videoPath, framesDir);
+
+    const ocrResults = await runOCR(frames);
+
+    const questionZones = buildOcrQuestionZones(ocrResults);
+
+    const questions = extractQuestionsFromOcr(ocrResults);
+
+    const validQuestions = questions.filter(
+      question => question.text && question.text.length >= 5
     );
 
-    await downloadYoutubeVideo(
-      video.videoId,
-      videoPath
-    );
-
-    const frames =
-      await extractFrames(
-        videoPath,
-        framesDir
-      );
-
-    const ocrResults =
-      await runOCR(
-        frames
-      );
-
-    const questionZones =
-      buildOcrQuestionZones(
-        ocrResults
-      );
-
-    const questions =
-      extractQuestionsFromOcr(
-        ocrResults
-      );
-
-    const validQuestions =
-      questions.filter(
-        question =>
-          question.text &&
-          question.text.length >= 5
-      );
-
-    if (
-      validQuestions.length === 0
-    ) {
-      console.log(
-        '❌ Aucune question IELTS détectée par OCR'
-      );
+    if (validQuestions.length === 0) {
+      console.log('❌ Aucune question IELTS détectée par OCR');
 
       return null;
     }
 
-    console.log(
-      `✅ ${validQuestions.length} question(s) détectée(s) par OCR`
-    );
+    console.log(`✅ ${validQuestions.length} question(s) détectée(s) par OCR`);
 
     return {
       ...video,
 
-      verified:
-        true,
-
-      extractionMethod:
-        'video_ocr',
-
-      questionCount:
-        validQuestions.length,
-
-      questions:
-        validQuestions,
-
+      verified: true,
+      extractionMethod: 'video_ocr',
+      questionCount: validQuestions.length,
+      questions: validQuestions,
       questionZones,
 
-      ocrMatches:
-        ocrResults
-          .filter(
-            item =>
-              item.questionLike
-          )
-          .map(item => ({
-            timestamp:
-              item.timestamp,
-
-            timestampFormatted:
-              item.timestampFormatted,
-
-            text:
-              item.text
-          }))
+      ocrMatches: ocrResults
+        .filter(item => item.questionLike)
+        .map(item => ({
+          timestamp: item.timestamp,
+          timestampFormatted: item.timestampFormatted,
+          text: item.text
+        }))
     };
-
   } finally {
     // Nettoyage systématique
     try {
-      await fsp.rm(
-        tempDir,
-        {
-          recursive:
-            true,
+      await fsp.rm(tempDir, { recursive: true, force: true });
 
-          force:
-            true
-        }
-      );
-
-      console.log(
-        '🧹 Fichiers temporaires supprimés'
-      );
-
+      console.log('🧹 Fichiers temporaires supprimés');
     } catch (cleanupError) {
-      console.warn(
-        '⚠️ Nettoyage impossible:',
-        cleanupError.message
-      );
+      console.warn('⚠️ Nettoyage impossible:', cleanupError.message);
     }
   }
 }
@@ -1559,98 +896,47 @@ async function analyzeVideoWithOCR(
 // ANALYSE TRANSCRIPT + OCR
 // ============================================================
 
-async function analyzeListeningVideo(
-  video
-) {
+async function analyzeListeningVideo(video) {
   // ----------------------------------------------------------
   // 1. Essai transcript
   // ----------------------------------------------------------
 
-  const transcript =
-    await getTranscript(
-      video.videoId
-    );
+  const transcript = await getTranscript(video.videoId);
 
-  const transcriptText =
-    normalizeText(
-      transcript.text
-    );
+  const transcriptText = normalizeText(transcript.text);
 
   console.log(
     `🎧 Transcript ${video.videoId}: ${transcriptText.length} caractères`
   );
 
-  if (
-    transcriptText.length >= 50 &&
-    transcript.segments.length > 0
-  ) {
-    const markerInfo =
-      hasQuestionMarkers(
-        transcriptText
-      );
+  if (transcriptText.length >= 50 && transcript.segments.length > 0) {
+    const markerInfo = hasQuestionMarkers(transcriptText);
 
-    const questionZones =
-      findQuestionSegments(
-        transcript.segments
-      );
+    const questionZones = findQuestionSegments(transcript.segments);
 
-    if (
-      markerInfo.found &&
-      questionZones.length > 0
-    ) {
-      console.log(
-        '✅ Questions détectées dans le transcript'
-      );
+    if (markerInfo.found && questionZones.length > 0) {
+      console.log('✅ Questions détectées dans le transcript');
 
       return {
         ...video,
 
-        verified:
-          true,
+        verified: true,
+        extractionMethod: 'transcript',
+        questionCount: questionZones.length,
 
-        extractionMethod:
-          'transcript',
-
-        questionCount:
-          questionZones.length,
-
-        questions:
-          questionZones.map(
-            (zone, index) => ({
-              number:
-                index + 1,
-
-              text:
-                zone.text,
-
-              choices:
-                [],
-
-              startTime:
-                zone.start,
-
-              endTime:
-                zone.end,
-
-              startTimeFormatted:
-                formatTime(
-                  zone.start
-                ),
-
-              endTimeFormatted:
-                formatTime(
-                  zone.end
-                ),
-
-              source:
-                'transcript'
-            })
-          ),
+        questions: questionZones.map((zone, index) => ({
+          number: index + 1,
+          text: zone.text,
+          choices: [],
+          startTime: zone.start,
+          endTime: zone.end,
+          startTimeFormatted: formatTime(zone.start),
+          endTimeFormatted: formatTime(zone.end),
+          source: 'transcript'
+        })),
 
         questionZones,
-
-        transcript:
-          transcriptText
+        transcript: transcriptText
       };
     }
   }
@@ -1659,485 +945,251 @@ async function analyzeListeningVideo(
   // 2. Transcript inutilisable -> OCR
   // ----------------------------------------------------------
 
-  console.log(
-    '📺 Transcript inutilisable ou sans questions.'
-  );
+  console.log('📺 Transcript inutilisable ou sans questions.');
+  console.log('🔎 Passage à l’analyse OCR de la vidéo...');
 
-  console.log(
-    '🔎 Passage à l’analyse OCR de la vidéo...'
-  );
-
-  return await analyzeVideoWithOCR(
-    video
-  );
+  return await analyzeVideoWithOCR(video);
 }
 
 // ============================================================
 // GET /api/youtube/ielts
 // ============================================================
 
-router.get(
-  '/ielts',
-  async (req, res) => {
-    try {
-      const maxResults =
-        Math.min(
-          Number(
-            req.query.limit || 5
-          ),
-          10
-        );
+router.get('/ielts', async (req, res) => {
+  try {
+    const maxResults = Math.min(Number(req.query.limit || 5), 10);
 
-      console.log(
-        '\n========================================'
-      );
+    console.log('\n========================================');
+    console.log('🔎 RECHERCHE IELTS LISTENING');
+    console.log('========================================');
 
-      console.log(
-        '🔎 RECHERCHE IELTS LISTENING'
-      );
+    const allItems = [];
 
-      console.log(
-        '========================================'
-      );
+    for (const query of LISTENING_QUERIES) {
+      try {
+        console.log(`🔍 ${query}`);
 
-      const allItems = [];
+        const items = await searchYouTube(query);
 
-      for (
-        const query of LISTENING_QUERIES
-      ) {
-        try {
-          console.log(
-            `🔍 ${query}`
-          );
-
-          const items =
-            await searchYouTube(
-              query
-            );
-
-          allItems.push(
-            ...items
-          );
-
-        } catch (error) {
-          console.warn(
-            `⚠️ Recherche échouée "${query}":`,
-            error.message
-          );
-        }
+        allItems.push(...items);
+      } catch (error) {
+        console.warn(`⚠️ Recherche échouée "${query}":`, error.message);
       }
-
-      // Déduplication
-      const uniqueMap =
-        new Map();
-
-      for (
-        const item of allItems
-      ) {
-        if (
-          item.id?.videoId
-        ) {
-          uniqueMap.set(
-            item.id.videoId,
-            item
-          );
-        }
-      }
-
-      const uniqueItems =
-        [...uniqueMap.values()];
-
-      const details =
-        await getVideoDetails(
-          uniqueItems
-            .map(
-              item =>
-                item.id.videoId
-            )
-        );
-
-      let candidates =
-        processVideos(
-          details
-        );
-
-      candidates =
-        candidates
-          .sort(
-            (a, b) =>
-              b.quality -
-              a.quality
-          );
-
-      // ------------------------------------------------------
-      // Vérification réelle
-      // ------------------------------------------------------
-
-      const verifiedVideos = [];
-
-      for (
-        const video of candidates
-      ) {
-        if (
-          verifiedVideos.length >=
-          maxResults
-        ) {
-          break;
-        }
-
-        try {
-          const analyzed =
-            await analyzeListeningVideo(
-              video
-            );
-
-          if (
-            analyzed &&
-            analyzed.questions &&
-            analyzed.questions.length > 0
-          ) {
-            verifiedVideos.push(
-              analyzed
-            );
-          }
-
-        } catch (error) {
-          console.warn(
-            `⚠️ Vidéo ${video.videoId} rejetée:`,
-            error.message
-          );
-        }
-      }
-
-      return res.json({
-        ok:
-          true,
-
-        skill:
-          'listening',
-
-        count:
-          verifiedVideos.length,
-
-        videos:
-          verifiedVideos
-      });
-
-    } catch (error) {
-      console.error(
-        '❌ ERREUR /ielts:',
-        error.response?.data ||
-        error.message
-      );
-
-      return res.status(500).json({
-        ok:
-          false,
-
-        error:
-          error.message ||
-          'Erreur serveur'
-      });
     }
+
+    // Déduplication
+    const uniqueMap = new Map();
+
+    for (const item of allItems) {
+      if (item.id?.videoId) {
+        uniqueMap.set(item.id.videoId, item);
+      }
+    }
+
+    const uniqueItems = [...uniqueMap.values()];
+
+    const details = await getVideoDetails(
+      uniqueItems.map(item => item.id.videoId)
+    );
+
+    let candidates = processVideos(details);
+
+    candidates = candidates.sort((a, b) => b.quality - a.quality);
+
+    // ------------------------------------------------------
+    // Vérification réelle
+    // ------------------------------------------------------
+
+    const verifiedVideos = [];
+
+    for (const video of candidates) {
+      if (verifiedVideos.length >= maxResults) {
+        break;
+      }
+
+      try {
+        const analyzed = await analyzeListeningVideo(video);
+
+        if (analyzed && analyzed.questions && analyzed.questions.length > 0) {
+          verifiedVideos.push(analyzed);
+        }
+      } catch (error) {
+        console.warn(`⚠️ Vidéo ${video.videoId} rejetée:`, error.message);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      skill: 'listening',
+      count: verifiedVideos.length,
+      videos: verifiedVideos
+    });
+  } catch (error) {
+    console.error('❌ ERREUR /ielts:', error.response?.data || error.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || 'Erreur serveur'
+    });
   }
-);
+});
 
 // ============================================================
 // TEST DIRECT D'UNE VIDEO
 // ============================================================
 
-router.get(
-  '/ielts/test-video',
-  async (req, res) => {
-    try {
-      const videoId =
-        getVideoIdFromUrl(
-          req.query.videoId
-        );
+router.get('/ielts/test-video', async (req, res) => {
+  try {
+    const videoId = getVideoIdFromUrl(req.query.videoId);
 
-      if (!videoId) {
-        return res.status(400).json({
-          ok:
-            false,
-
-          error:
-            'videoId ou URL YouTube invalide'
-        });
-      }
-
-      console.log(
-        `\n🎯 TEST DIRECT VIDEO: ${videoId}`
-      );
-
-      const details =
-        await getVideoDetails([
-          videoId
-        ]);
-
-      if (
-        !details ||
-        details.length === 0
-      ) {
-        return res.status(404).json({
-          ok:
-            false,
-
-          videoId,
-
-          error:
-            'Vidéo YouTube introuvable'
-        });
-      }
-
-      const video =
-        buildVideoObject(
-          details[0]
-        );
-
-      video.quality =
-        100;
-
-      const result =
-        await analyzeListeningVideo(
-          video
-        );
-
-      if (!result) {
-        return res.json({
-          ok:
-            false,
-
-          videoId,
-
-          title:
-            video.title,
-
-          error:
-            'La vidéo ne contient pas de questions IELTS Listening exploitables'
-        });
-      }
-
-      return res.json({
-        ok:
-          true,
-
-        video:
-          result
-      });
-
-    } catch (error) {
-      console.error(
-        '\n❌ ERREUR TEST IELTS:',
-        error.response?.data ||
-        error.message
-      );
-
-      return res.status(500).json({
-        ok:
-          false,
-
-        error:
-          error.message ||
-          'Erreur serveur'
+    if (!videoId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'videoId ou URL YouTube invalide'
       });
     }
+
+    console.log(`\n🎯 TEST DIRECT VIDEO: ${videoId}`);
+
+    const details = await getVideoDetails([videoId]);
+
+    if (!details || details.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        videoId,
+        error: 'Vidéo YouTube introuvable'
+      });
+    }
+
+    const video = buildVideoObject(details[0]);
+
+    video.quality = 100;
+
+    const result = await analyzeListeningVideo(video);
+
+    if (!result) {
+      return res.json({
+        ok: false,
+        videoId,
+        title: video.title,
+        error:
+          'La vidéo ne contient pas de questions IELTS Listening exploitables'
+      });
+    }
+
+    return res.json({
+      ok: true,
+      video: result
+    });
+  } catch (error) {
+    console.error('\n❌ ERREUR TEST IELTS:', error.response?.data || error.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || 'Erreur serveur'
+    });
   }
-);
+});
 
 // ============================================================
 // TEST TRANSCRIPT UNIQUEMENT
 // ============================================================
 
-router.get(
-  '/ielts/test-transcript',
-  async (req, res) => {
-    try {
-      const videoId =
-        getVideoIdFromUrl(
-          req.query.videoId
-        );
+router.get('/ielts/test-transcript', async (req, res) => {
+  try {
+    const videoId = getVideoIdFromUrl(req.query.videoId);
 
-      if (!videoId) {
-        return res.status(400).json({
-          ok:
-            false,
-
-          error:
-            'videoId ou URL YouTube invalide'
-        });
-      }
-
-      const transcript =
-        await getTranscript(
-          videoId
-        );
-
-      const markerInfo =
-        hasQuestionMarkers(
-          transcript.text
-        );
-
-      const questionZones =
-        findQuestionSegments(
-          transcript.segments
-        );
-
-      return res.json({
-        ok:
-          true,
-
-        videoId,
-
-        status:
-          transcript.status,
-
-        language:
-          transcript.language,
-
-        textLength:
-          transcript.text.length,
-
-        segmentCount:
-          transcript.segments.length,
-
-        questionMarkers:
-          markerInfo,
-
-        questionZones,
-
-        transcript:
-          transcript.text,
-
-        segments:
-          transcript.segments
-      });
-
-    } catch (error) {
-      console.error(
-        '❌ ERREUR TEST TRANSCRIPT:',
-        error.message
-      );
-
-      return res.status(500).json({
-        ok:
-          false,
-
-        error:
-          error.message ||
-          'Erreur serveur'
+    if (!videoId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'videoId ou URL YouTube invalide'
       });
     }
+
+    const transcript = await getTranscript(videoId);
+
+    const markerInfo = hasQuestionMarkers(transcript.text);
+
+    const questionZones = findQuestionSegments(transcript.segments);
+
+    return res.json({
+      ok: true,
+      videoId,
+      status: transcript.status,
+      language: transcript.language,
+      textLength: transcript.text.length,
+      segmentCount: transcript.segments.length,
+      questionMarkers: markerInfo,
+      questionZones,
+      transcript: transcript.text,
+      segments: transcript.segments
+    });
+  } catch (error) {
+    console.error('❌ ERREUR TEST TRANSCRIPT:', error.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || 'Erreur serveur'
+    });
   }
-);
+});
 
 // ============================================================
 // TEST OCR UNIQUEMENT
 // ============================================================
 
-router.get(
-  '/ielts/test-ocr',
-  async (req, res) => {
-    try {
-      const videoId =
-        getVideoIdFromUrl(
-          req.query.videoId
-        );
+router.get('/ielts/test-ocr', async (req, res) => {
+  try {
+    const videoId = getVideoIdFromUrl(req.query.videoId);
 
-      if (!videoId) {
-        return res.status(400).json({
-          ok:
-            false,
-
-          error:
-            'videoId ou URL YouTube invalide'
-        });
-      }
-
-      const details =
-        await getVideoDetails([
-          videoId
-        ]);
-
-      if (
-        !details ||
-        details.length === 0
-      ) {
-        return res.status(404).json({
-          ok:
-            false,
-
-          error:
-            'Vidéo YouTube introuvable'
-        });
-      }
-
-      const video =
-        buildVideoObject(
-          details[0]
-        );
-
-      const result =
-        await analyzeVideoWithOCR(
-          video
-        );
-
-      if (!result) {
-        return res.json({
-          ok:
-            false,
-
-          videoId,
-
-          title:
-            video.title,
-
-          error:
-            'Aucune question IELTS détectée par OCR'
-        });
-      }
-
-      return res.json({
-        ok:
-          true,
-
-        videoId,
-
-        title:
-          video.title,
-
-        extractionMethod:
-          result.extractionMethod,
-
-        questionCount:
-          result.questionCount,
-
-        questions:
-          result.questions,
-
-        questionZones:
-          result.questionZones,
-
-        ocrMatches:
-          result.ocrMatches
-      });
-
-    } catch (error) {
-      console.error(
-        '❌ ERREUR TEST OCR:',
-        error.message
-      );
-
-      return res.status(500).json({
-        ok:
-          false,
-
-        error:
-          error.message ||
-          'Erreur OCR'
+    if (!videoId) {
+      return res.status(400).json({
+        ok: false,
+        error: 'videoId ou URL YouTube invalide'
       });
     }
+
+    const details = await getVideoDetails([videoId]);
+
+    if (!details || details.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Vidéo YouTube introuvable'
+      });
+    }
+
+    const video = buildVideoObject(details[0]);
+
+    const result = await analyzeVideoWithOCR(video);
+
+    if (!result) {
+      return res.json({
+        ok: false,
+        videoId,
+        title: video.title,
+        error: 'Aucune question IELTS détectée par OCR'
+      });
+    }
+
+    return res.json({
+      ok: true,
+      videoId,
+      title: video.title,
+      extractionMethod: result.extractionMethod,
+      questionCount: result.questionCount,
+      questions: result.questions,
+      questionZones: result.questionZones,
+      ocrMatches: result.ocrMatches
+    });
+  } catch (error) {
+    console.error('❌ ERREUR TEST OCR:', error.message);
+
+    return res.status(500).json({
+      ok: false,
+      error: error.message || 'Erreur OCR'
+    });
   }
-);
+});
 
 // ============================================================
 // EXPORT
