@@ -479,10 +479,9 @@ async function downloadYoutubeVideo(videoId, outputPath) {
     jsRuntimes: 'node',
     remoteComponents: 'ejs:github',
 
-    noWarnings: true,
     noCheckCertificates: true,
     preferFreeFormats: true,
-    quiet: true,
+    verbose: true, // TEMPORAIRE : diagnostic, à retirer ensuite
     retries: 3
   };
 
