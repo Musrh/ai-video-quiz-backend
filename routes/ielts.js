@@ -2,202 +2,284 @@ const express = require('express');
 const axios = require('axios');
 const fs = require('fs');
 const fsp = fs.promises;
-const os = require('os');
 const path = require('path');
-const { execFile } = require('child_process');
-const { promisify } = require('util');
 
-const ffmpegPath = require('ffmpeg-static');
-const youtubedl = require('youtube-dl-exec');
-const { createWorker } = require('tesseract.js');
+const ielts = require('./ielts');
+
+const helpers = ielts.helpers;
 
 const router = express.Router();
-const execFileAsync = promisify(execFile);
+
+const API = '/api/youtube/ielts/library';
 
 // ============================================================
 // CONFIGURATION
 // ============================================================
 
-const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3';
-const TRANSCRIPT_API_URL = 'https://www.youtubetranscript.dev/api/v2/transcribe';
-const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
-const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
+// Dossier de sauvegarde. Sur Railway, il faut un "Volume" monté sur /data,
+// sinon les données sont perdues à chaque redéploiement.
+const DATA_DIR =
+  process.env.IELTS_DATA_DIR ||
+  (fs.existsSync('/data') ? '/data' : path.join(process.cwd(), 'data'));
 
-// OCR
-const OCR_INTERVAL_SECONDS = Number(process.env.IELTS_OCR_INTERVAL || 8);
-const OCR_MAX_FRAMES = Number(process.env.IELTS_OCR_MAX_FRAMES || 180);
+const DATA_FILE = path.join(DATA_DIR, 'ielts-library.json');
 
-// Numérotation des questions IELTS Listening : 1 à 40
-const MAX_QUESTION_NUMBER = 40;
-
-// ============================================================
-// RECHERCHE YOUTUBE IELTS
-// ============================================================
-
-const LISTENING_QUERIES = [
-  'IELTS Listening test with questions',
-  'IELTS Listening practice test questions',
-  'IELTS Listening full test questions',
-  'IELTS Listening practice Cambridge questions',
-  'IELTS Listening test section 1 2 3 4',
-  'IELTS Listening test answers questions',
-  'IELTS Listening actual test questions',
-  'IELTS Listening mock test questions'
-];
-
-const IELTS_TERMS = [
-  'ielts',
-  'ielts academic',
-  'ielts general training',
-  'ielts preparation',
-  'ielts test',
-  'ielts practice',
-  'ielts listening',
-  'ielts listening test',
-  'ielts listening practice',
-  'cambridge ielts'
-];
-
-const EXCLUDED_TERMS = [
-  'shorts',
-  'music video',
-  'lyrics',
-  'karaoke',
-  'remix',
-  'trailer',
-  'teaser',
-  'livestream',
-  'live stream',
-  'reaction',
-  'movie',
-  'film'
-];
+const DEFAULT_SEARCH_COUNT = 3; // vidéos ajoutées à chaque clic "plus de vidéos"
+const MAX_SEARCH_COUNT = 5;
+const MAX_API_SEARCHES_PER_RUN = 4; // limite le quota YouTube (100 unités / recherche)
+const MAX_ATTEMPTS = 2; // essais maximum pour une vidéo en erreur
 
 // ============================================================
-// MARQUEURS IELTS
+// SAUVEGARDE (fichier JSON)
 // ============================================================
 
-const QUESTION_MARKERS = [
-  'question',
-  'questions',
-  'choose the correct answer',
-  'choose the correct',
-  'complete the form',
-  'complete the notes',
-  'complete the table',
-  'complete the sentence',
-  'complete the summary',
-  'write no more than',
-  'answer questions',
-  'questions 1',
-  'questions 2',
-  'questions 3',
-  'questions 4',
-  'questions 5',
-  'questions 6',
-  'questions 7',
-  'questions 8',
-  'questions 9',
-  'questions 10'
-];
+function defaultState() {
+  return {
+    videos: {}, // vidéos analysées (questions + réponses)
+    failed: {}, // vidéos sans questions exploitables ou en erreur
+    search: { queryIndex: 0, tokens: {} } // avancement de la recherche YouTube
+  };
+}
+
+let state = defaultState();
+
+function loadState() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      const base = defaultState();
+
+      state = {
+        ...base,
+        ...raw,
+        search: { ...base.search, ...(raw.search || {}) }
+      };
+    }
+
+    console.log(
+      `📚 Bibliothèque IELTS : ${Object.keys(state.videos).length} vidéo(s) ` +
+        `(fichier ${DATA_FILE})`
+    );
+
+    if (!process.env.IELTS_DATA_DIR && !fs.existsSync('/data')) {
+      console.warn(
+        '⚠️ Aucun volume /data : la bibliothèque sera perdue au prochain ' +
+          'redéploiement. Ajoute un Volume Railway monté sur /data.'
+      );
+    }
+  } catch (error) {
+    console.error('❌ Lecture de la bibliothèque impossible :', error.message);
+  }
+}
+
+let saving = Promise.resolve();
+
+function saveState() {
+  saving = saving
+    .then(async () => {
+      await fsp.mkdir(DATA_DIR, { recursive: true });
+
+      const tmp = `${DATA_FILE}.tmp`;
+
+      await fsp.writeFile(tmp, JSON.stringify(state));
+      await fsp.rename(tmp, DATA_FILE);
+    })
+    .catch(error => {
+      console.error('❌ Sauvegarde impossible :', error.message);
+    });
+
+  return saving;
+}
+
+loadState();
 
 // ============================================================
 // OUTILS
 // ============================================================
 
-function normalizeText(value) {
-  return String(value || '')
-    .replace(/\r/g, '')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function containsAny(text, terms) {
-  const value = String(text || '').toLowerCase();
-  return terms.some(term => value.includes(term.toLowerCase()));
-}
-
-function getVideoIdFromUrl(value) {
-  if (!value) return null;
-
-  const input = String(value).trim();
-
-  // ID YouTube direct
-  if (/^[a-zA-Z0-9_-]{11}$/.test(input)) {
-    return input;
+function isKnown(videoId) {
+  if (state.videos[videoId]) {
+    return true;
   }
 
-  try {
-    const url = new URL(input);
+  const failed = state.failed[videoId];
 
-    if (url.hostname.includes('youtube.com') || url.hostname.includes('youtu.be')) {
-      if (url.hostname.includes('youtu.be')) {
-        return url.pathname.replace('/', '').substring(0, 11);
-      }
+  return Boolean(
+    failed &&
+      (failed.kind === 'no_questions' || failed.attempts >= MAX_ATTEMPTS)
+  );
+}
 
-      const id = url.searchParams.get('v');
-      if (id) return id;
+function markFailed(video, kind, message) {
+  const previous = state.failed[video.videoId];
 
-      const parts = url.pathname.split('/');
-      const embedIndex = parts.indexOf('embed');
+  state.failed[video.videoId] = {
+    videoId: video.videoId,
+    title: video.title || '',
+    kind, // 'no_questions' | 'error'
+    message: message || '',
+    attempts: (previous ? previous.attempts : 0) + 1,
+    at: new Date().toISOString()
+  };
+}
 
-      if (embedIndex !== -1 && parts[embedIndex + 1]) {
-        return parts[embedIndex + 1].substring(0, 11);
-      }
+function summarize(record) {
+  return {
+    videoId: record.videoId,
+    url: record.url,
+    title: record.title,
+    channelTitle: record.channelTitle,
+    thumbnail: record.thumbnail,
+    durationSeconds: record.durationSeconds,
+    status: record.status, // 'ok' | 'to_review'
+    issues: record.issues,
+    questionCount: record.questionCount,
+    hasAnswers: Object.keys(record.answers || {}).length > 0,
+    addedAt: record.addedAt,
+    source: record.source
+  };
+}
+
+// Transforme le résultat OCR en fiche sauvegardée (réponses séparées des questions)
+function buildRecord(video, result, source) {
+  const answers = {};
+
+  const questions = result.questions.map(question => {
+    const { answer, ...rest } = question;
+
+    if (answer) {
+      answers[question.number] = answer;
     }
-  } catch (_) {
-    // ignore
-  }
 
-  return null;
-}
+    return rest;
+  });
 
-function parseDuration(duration) {
-  if (!duration) return 0;
+  const issues = [];
 
-  const match = String(duration).match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
-  if (!match) return 0;
-
-  const hours = Number(match[1] || 0);
-  const minutes = Number(match[2] || 0);
-  const seconds = Number(match[3] || 0);
-
-  return hours * 3600 + minutes * 60 + seconds;
-}
-
-function formatTime(seconds) {
-  const total = Math.max(0, Math.floor(Number(seconds) || 0));
-  const h = Math.floor(total / 3600);
-  const m = Math.floor((total % 3600) / 60);
-  const s = total % 60;
-
-  if (h > 0) {
-    return (
-      `${String(h).padStart(2, '0')}:` +
-      `${String(m).padStart(2, '0')}:` +
-      `${String(s).padStart(2, '0')}`
+  if (result.missingNumbers && result.missingNumbers.length > 0) {
+    issues.push(
+      `Questions non retrouvées : ${result.missingNumbers.join(', ')}`
     );
   }
 
-  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
-}
+  const withoutAnswer = questions
+    .filter(question => !answers[question.number])
+    .map(question => question.number);
 
-function safeNumber(value) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : 0;
+  if (withoutAnswer.length > 0) {
+    issues.push(`Réponses manquantes : ${withoutAnswer.join(', ')}`);
+  }
+
+  const inferred = questions
+    .filter(question => question.inferred)
+    .map(question => question.number);
+
+  if (inferred.length > 0) {
+    issues.push(`Questions déduites, à vérifier : ${inferred.join(', ')}`);
+  }
+
+  return {
+    videoId: video.videoId,
+    url: `https://www.youtube.com/watch?v=${video.videoId}`,
+    title: video.title,
+    channelTitle: video.channelTitle,
+    thumbnail: video.thumbnail,
+    durationSeconds: video.durationSeconds,
+    publishedAt: video.publishedAt,
+    status: issues.length === 0 ? 'ok' : 'to_review',
+    issues,
+    questionCount: questions.length,
+    missingNumbers: result.missingNumbers || [],
+    questions,
+    answers,
+    groups: result.groups || [],
+    source,
+    addedAt: new Date().toISOString()
+  };
 }
 
 // ============================================================
-// YOUTUBE API
+// FILE D'ANALYSE : une vidéo à la fois
 // ============================================================
 
-async function searchYouTube(query) {
+const queue = [];
+const queuedIds = new Set();
+
+let working = false;
+
+const status = {
+  mode: null, // 'search' | 'analyze'
+  message: '',
+  current: null,
+  search: null, // { target, analyzed }
+  lastMessage: '',
+  lastError: '',
+  lastFinishedAt: null
+};
+
+function statusSnapshot() {
+  return {
+    running: working || queue.length > 0,
+    mode: status.mode,
+    message: status.message,
+    current: status.current,
+    search: status.search,
+    queueLength: queue.length,
+    libraryCount: Object.keys(state.videos).length,
+    lastMessage: status.lastMessage,
+    lastError: status.lastError,
+    lastFinishedAt: status.lastFinishedAt
+  };
+}
+
+async function analyzeAndStore(video, source) {
+  status.current = { videoId: video.videoId, title: video.title };
+  status.message = `Analyse de « ${video.title} »… (quelques minutes)`;
+
+  try {
+    // Lecture de la vidéo par OCR (questions + corrigé)
+    const result = await helpers.analyzeVideoWithOCR(video, {});
+
+    if (!result || !result.questions || result.questions.length === 0) {
+      markFailed(video, 'no_questions', 'Aucune question détectée');
+      await saveState();
+
+      return false;
+    }
+
+    state.videos[video.videoId] = buildRecord(video, result, source);
+    delete state.failed[video.videoId];
+
+    await saveState();
+
+    console.log(
+      `💾 Vidéo enregistrée : ${video.videoId} ` +
+        `(${state.videos[video.videoId].questionCount} questions, ` +
+        `${state.videos[video.videoId].status})`
+    );
+
+    return true;
+  } catch (error) {
+    console.error(`❌ Analyse ${video.videoId} :`, error.message);
+
+    markFailed(video, 'error', error.message.slice(0, 300));
+    status.lastError = `Échec pour « ${video.title || video.videoId} »`;
+
+    await saveState();
+
+    return false;
+  } finally {
+    status.current = null;
+  }
+}
+
+// Une page de résultats YouTube (avec jeton pour la page suivante)
+async function searchYouTubePage(query, pageToken) {
   if (!process.env.YOUTUBE_API_KEY) {
     throw new Error('YOUTUBE_API_KEY manquante');
   }
 
-  const response = await axios.get(`${YOUTUBE_API_URL}/search`, {
+  const response = await axios.get(`${helpers.YOUTUBE_API_URL}/search`, {
     params: {
       key: process.env.YOUTUBE_API_KEY,
       part: 'snippet',
@@ -208,1829 +290,686 @@ async function searchYouTube(query) {
       videoEmbeddable: 'true',
       videoSyndicated: 'true',
       relevanceLanguage: 'en',
-      regionCode: 'US'
+      regionCode: 'US',
+      ...(pageToken ? { pageToken } : {})
     },
     timeout: 30000
   });
 
-  return response.data.items || [];
-}
-
-async function getVideoDetails(videoIds) {
-  if (!process.env.YOUTUBE_API_KEY) {
-    throw new Error('YOUTUBE_API_KEY manquante');
-  }
-
-  if (!Array.isArray(videoIds) || videoIds.length === 0) {
-    return [];
-  }
-
-  const uniqueIds = [...new Set(videoIds)].filter(Boolean);
-
-  const response = await axios.get(`${YOUTUBE_API_URL}/videos`, {
-    params: {
-      key: process.env.YOUTUBE_API_KEY,
-      part: 'snippet,contentDetails,status,statistics',
-      id: uniqueIds.join(',')
-    },
-    timeout: 30000
-  });
-
-  return response.data.items || [];
-}
-
-// ============================================================
-// CONSTRUCTION VIDEO
-// ============================================================
-
-function buildVideoObject(item) {
-  const snippet = item.snippet || {};
-  const contentDetails = item.contentDetails || {};
-  const status = item.status || {};
-  const statistics = item.statistics || {};
-
-  const durationSeconds = parseDuration(contentDetails.duration);
-
-  const language =
-    snippet.defaultLanguage ||
-    snippet.defaultAudioLanguage ||
-    '';
-
   return {
-    videoId: item.id,
-    title: snippet.title || '',
-    description: snippet.description || '',
-    channelTitle: snippet.channelTitle || '',
-    publishedAt: snippet.publishedAt || null,
-    duration: contentDetails.duration || null,
-    durationSeconds,
-    language: language || 'en',
-    thumbnail:
-      snippet.thumbnails?.high?.url ||
-      snippet.thumbnails?.medium?.url ||
-      snippet.thumbnails?.default?.url ||
-      null,
-    views: safeNumber(statistics.viewCount),
-    likes: safeNumber(statistics.likeCount),
-    privacyStatus: status.privacyStatus || null,
-    embeddable: status.embeddable !== false,
-    skill: 'listening'
+    items: response.data.items || [],
+    nextPageToken: response.data.nextPageToken || null
   };
 }
 
-function calculateQuality(video) {
-  let score = 0;
+// Prochaine recherche à lancer (on fait tourner les requêtes, page après page)
+function pickQuery() {
+  const queries = helpers.LISTENING_QUERIES;
 
-  const title = video.title.toLowerCase();
-  const description = video.description.toLowerCase();
+  for (let i = 0; i < queries.length; i++) {
+    const index = (state.search.queryIndex + i) % queries.length;
+    const query = queries[index];
 
-  if (title.includes('ielts listening')) {
-    score += 35;
-  } else if (title.includes('ielts')) {
-    score += 20;
+    if (state.search.tokens[query] !== 'done') {
+      return { query, index, token: state.search.tokens[query] || undefined };
+    }
   }
 
-  if (title.includes('test')) score += 20;
-  if (title.includes('question')) score += 15;
-  if (title.includes('answer')) score += 10;
-  if (description.includes('listening')) score += 10;
-  if (video.embeddable) score += 5;
-
-  return Math.min(100, score);
+  return null;
 }
 
-// ============================================================
-// FILTRAGE DES VIDEOS
-// ============================================================
-
-function processVideos(items) {
-  const candidates = [];
-
-  for (const item of items) {
-    const video = buildVideoObject(item);
-
-    const combined = `${video.title} ${video.description}`.toLowerCase();
-
-    if (!containsAny(combined, IELTS_TERMS)) continue;
-    if (containsAny(combined, EXCLUDED_TERMS)) continue;
-
-    if (video.privacyStatus && video.privacyStatus !== 'public') continue;
-    if (video.embeddable === false) continue;
-    if (video.title.length < 8) continue;
-    if (video.description.length < 20) continue;
-
-    if (video.durationSeconds < 120 || video.durationSeconds > 3600) continue;
-
-    video.quality = calculateQuality(video);
-    candidates.push(video);
-  }
-
-  return candidates;
-}
-
-// ============================================================
-// TRANSCRIPTION
-// ============================================================
-
-async function getTranscript(videoId) {
-  if (!process.env.YOUTUBE_TRANSCRIPT_API_KEY) {
-    return {
-      text: '',
-      segments: [],
-      status: 'missing_api_key',
-      language: 'en',
-      source: 'none',
-      videoId
-    };
-  }
-
-  try {
-    const response = await axios.post(
-      TRANSCRIPT_API_URL,
-      {
-        video: videoId,
-        language: 'en',
-        source: 'auto',
-        format: {
-          timestamp: true,
-          paragraphs: true,
-          words: false
-        }
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.YOUTUBE_TRANSCRIPT_API_KEY}`,
-          'Content-Type': 'application/json'
-        },
-        timeout: 60000
-      }
-    );
-
-    const data = response.data || {};
-
-    const rawSegments = Array.isArray(data.segments) ? data.segments : [];
-
-    let text = data.text || data.transcript || '';
-
-    if (!text && rawSegments.length > 0) {
-      text = rawSegments
-        .map(item => item.text || item.content || '')
-        .join(' ');
-    }
-
-    const segments = rawSegments
-      .map(item => {
-        const start = Number(item.start ?? item.startTime ?? item.offset ?? 0);
-        const end = Number(item.end ?? item.endTime ?? start);
-
-        return {
-          text: normalizeText(item.text || item.content || ''),
-          start,
-          end,
-          startFormatted: formatTime(start),
-          endFormatted: formatTime(end)
-        };
-      })
-      .filter(item => item.text);
-
-    return {
-      text: normalizeText(text),
-      segments,
-      status: data.status || 'completed',
-      language: data.language || 'en',
-      source: data.source || 'transcript',
-      videoId
-    };
-  } catch (error) {
-    console.error('⚠️ Transcript error:', error.response?.data || error.message);
-
-    return {
-      text: '',
-      segments: [],
-      status: 'error',
-      language: 'en',
-      source: 'error',
-      videoId,
-      error: error.message
-    };
-  }
-}
-
-// ============================================================
-// DETECTION QUESTIONS DANS TRANSCRIPT
-// ============================================================
-
-function hasQuestionMarkers(text) {
-  const value = String(text || '').toLowerCase();
-
-  const markers = QUESTION_MARKERS.filter(marker => value.includes(marker));
-
-  return {
-    found: markers.length > 0,
-    markers
-  };
-}
-
-function findQuestionSegments(segments) {
-  const zones = [];
-
-  for (let i = 0; i < segments.length; i++) {
-    const segment = segments[i];
-    const text = segment.text || '';
-
-    if (
-      /^\s*(question\s*)?\d{1,2}[\.\):\-]/i.test(text) ||
-      /questions?\s+\d{1,2}/i.test(text)
-    ) {
-      zones.push({
-        start: segment.start,
-        end: segment.end,
-        text
-      });
-    }
-  }
-
-  return zones;
-}
-
-// ============================================================
-// OCR : TELECHARGEMENT VIDEO
-// ============================================================
-
-async function createTempDir() {
-  return await fsp.mkdtemp(path.join(os.tmpdir(), 'ielts-'));
-}
-
-async function downloadYoutubeVideo(videoId, outputPath) {
-  const url = `https://www.youtube.com/watch?v=${videoId}`;
-
-  const options = {
-    noPlaylist: true,
-
-    // Format tolérant, limité à 720p (suffisant pour l'OCR)
-    format:
-      'best[height<=720][ext=mp4]/bv*[height<=720]+ba/best[height<=720]/best',
-
-    output: outputPath,
-    mergeOutputFormat: 'mp4',
-
-    // ffmpeg embarqué (ffmpeg-static) pour fusionner vidéo + audio si besoin
-    ffmpegLocation: ffmpegPath,
-
-    // Résolution des défis JavaScript de YouTube
-    // (nécessite Node 20+ : voir "engines" dans package.json)
-    jsRuntimes: 'node',
-    remoteComponents: 'ejs:github',
-
-    noWarnings: true,
-    noCheckCertificates: true,
-    preferFreeFormats: true,
-    quiet: true,
-    retries: 3
-  };
-
-  // ----------------------------------------------------------
-  // Cookies optionnelles
-  // ----------------------------------------------------------
-
-  if (process.env.YOUTUBE_COOKIES_BASE64) {
-    try {
-      const cookieFile = path.join(path.dirname(outputPath), 'cookies.txt');
-
-      await fsp.writeFile(
-        cookieFile,
-        Buffer.from(process.env.YOUTUBE_COOKIES_BASE64, 'base64')
-      );
-
-      options.cookies = cookieFile;
-
-      console.log('🍪 Cookies YouTube temporaires utilisés');
-    } catch (error) {
-      console.warn('⚠️ Impossible de créer cookies.txt:', error.message);
-    }
-  }
-
-  console.log(`⬇️ Téléchargement vidéo ${videoId}...`);
-
-  try {
-    await youtubedl(url, options);
-
-    if (!fs.existsSync(outputPath)) {
-      throw new Error('yt-dlp terminé mais le fichier vidéo est introuvable');
-    }
-
-    const stat = await fsp.stat(outputPath);
-
-    if (stat.size < 10000) {
-      throw new Error('Fichier vidéo téléchargé invalide ou vide');
-    }
-
-    console.log(`✅ Vidéo téléchargée: ${Math.round(stat.size / 1024 / 1024)} MB`);
-
-    return outputPath;
-  } catch (error) {
-    console.error('❌ Erreur téléchargement:', error.stderr || error.message);
-
-    throw new Error(
-      `Téléchargement YouTube impossible: ${error.stderr || error.message}`
-    );
-  }
-}
-
-// ============================================================
-// OCR : EXTRACTION DES FRAMES
-// ============================================================
-
-async function extractFrames(videoPath, framesDir) {
-  await fsp.mkdir(framesDir, { recursive: true });
-
-  const outputPattern = path.join(framesDir, 'frame-%05d.jpg');
-
-  console.log(`🎞️ Extraction des frames toutes les ${OCR_INTERVAL_SECONDS}s...`);
-
-  await execFileAsync(
-    ffmpegPath,
-    [
-      '-hide_banner',
-      '-loglevel',
-      'error',
-
-      '-i',
-      videoPath,
-
-      '-vf',
-      `fps=1/${OCR_INTERVAL_SECONDS},scale=1280:-2`,
-
-      '-q:v',
-      '3',
-
-      '-frames:v',
-      String(OCR_MAX_FRAMES),
-
-      outputPattern
-    ],
-    {
-      timeout: 10 * 60 * 1000,
-      maxBuffer: 10 * 1024 * 1024
-    }
-  );
-
-  const files = (await fsp.readdir(framesDir))
-    .filter(file => file.endsWith('.jpg'))
-    .sort();
-
-  console.log(`🖼️ ${files.length} frames extraites`);
-
-  return files.map((file, index) => ({
-    file: path.join(framesDir, file),
-    index,
-    timestamp: index * OCR_INTERVAL_SECONDS
-  }));
-}
-
-// ============================================================
-// OCR : ANALYSE D'UNE FRAME
-// ============================================================
-
-function looksLikeQuestionText(text) {
-  const value = String(text || '').toLowerCase();
-
-  if (!value || value.length < 15) {
-    return false;
-  }
-
-  const patterns = [
-    /\bquestion\s*\d+/i,
-    /\bquestions\s*\d+/i,
-    /\b\d{1,2}[\.\)]\s+\w+/i,
-    /\(\d{1,2}\)/, // questions à compléter : "(1)", "(2)"...
-    /choose the correct/i,
-    /complete the/i,
-    /write no more than/i,
-    /answer questions/i,
-    /\b[a-d][\.\)]\s+\w+/i
-  ];
-
-  return patterns.some(pattern => pattern.test(value));
-}
-
-function cleanOcrText(text) {
-  return String(text || '')
-    .replace(/\r/g, '')
-    // Filigrane / copyright des vidéos
-    .replace(/copyright\s*:?[^\n]*/gi, '')
-    .replace(/[ \t]+/g, ' ')
-    .replace(/\n[ \t]+/g, '\n')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-async function runOCR(frames) {
-  if (!frames || frames.length === 0) {
-    return [];
-  }
-
-  console.log(`🔎 OCR de ${frames.length} frames...`);
-
-  const worker = await createWorker('eng');
-
-  const results = [];
-
-  try {
-    for (let i = 0; i < frames.length; i++) {
-      const frame = frames[i];
-
-      try {
-        const result = await worker.recognize(frame.file);
-
-        const text = cleanOcrText(result?.data?.text || '');
-
-        if (text.length > 10) {
-          const isQuestion = looksLikeQuestionText(text);
-
-          if (isQuestion) {
-            console.log(`📝 Question détectée vers ${formatTime(frame.timestamp)}`);
-          }
-
-          results.push({
-            timestamp: frame.timestamp,
-            timestampFormatted: formatTime(frame.timestamp),
-            text,
-            questionLike: isQuestion
-          });
-        }
-      } catch (error) {
-        console.warn(`⚠️ OCR frame ${i} échoué:`, error.message);
-      }
-    }
-
-    return results;
-  } finally {
-    await worker.terminate();
-  }
-}
-
-// ============================================================
-// EXTRACTION DES QUESTIONS À PARTIR DE L'OCR
-// ============================================================
-
-// "Questions 18 - 20", "Questions 01 - 05"
-const GROUP_HEADER_RE = /questions?\s*\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}/i;
-const GROUP_RANGE_RE = /questions?\s*(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})/i;
-
-function isGroupHeader(line) {
-  return GROUP_HEADER_RE.test(line);
-}
-
-function isInstructionLine(line) {
-  return (
-    /^(choose|complete|answer\s+the\s+questions?|label|match|circle)\b/i.test(line) ||
-    /write\s+no\s+more\s+than/i.test(line)
-  );
-}
-
-// Ligne quasi vide ou faite de caractères parasites
-function isNoiseLine(line) {
-  // Un choix très court comme "A) 7.15" n'est pas du bruit
-  if (/^\(?[A-E]\s*[\.\)]/.test(line)) {
-    return false;
-  }
-
-  return (
-    line.replace(/[^A-Za-z]/g, '').length < 3 &&
-    !/\(\d{1,2}\)/.test(line)
-  );
-}
-
-function sectionFromNumber(number) {
-  return Math.min(4, Math.max(1, Math.ceil(number / 10)));
-}
-
-// Pointillés "........" des champs à remplir, mal lus par l'OCR
-// (ex. "....cccccoevecccnuruccsinrnnnnns", "cceeeeecncnnenen..")
-function isLeaderGarbage(token) {
-  const letters = token.replace(/[^A-Za-z]/g, '');
-
-  if (/\.{3,}/.test(token)) {
-    return true;
-  }
-
-  return (
-    letters.length >= 7 &&
-    /(.)\1{2,}/i.test(letters) &&
-    /^[cenimrsuvoa]+$/i.test(letters)
-  );
-}
-
-function cleanQuestionText(text) {
-  return String(text || '')
-    .replace(/copyright\s*:?[^\n]*/gi, '')
-    .replace(/@/g, 'a') // "@nd" -> "and"
-    .split(/\s+/)
-    .filter(token => token && !isLeaderGarbage(token))
-    .join(' ')
-    .replace(/[\s©+*¢ª&#~^]+$/, '') // symboles parasites en fin de texte
-    .trim();
-}
-
-function makeOcrQuestion(number, text, result, extras = {}) {
-  const question = {
-    number,
-    section: sectionFromNumber(number),
-    text: cleanQuestionText(text),
-    choices: [],
-    startTime: result.timestamp,
-    startTimeFormatted: result.timestampFormatted,
-    source: 'video_ocr'
-  };
-
-  if (extras.instructions) {
-    question.instructions = extras.instructions;
-  }
-
-  if (extras.options && extras.options.length > 0) {
-    question.options = extras.options;
-  }
-
-  if (extras.context) {
-    question.context = extras.context;
-  }
-
-  return question;
-}
-
-function isValidQuestionNumber(number) {
-  return Number.isInteger(number) && number >= 1 && number <= MAX_QUESTION_NUMBER;
-}
-
-// ----- Questions dont le numéro est illisible (cases numérotées en image) -----
-
-const COMMON_TAIL_WORDS = new Set([
-  'for', 'and', 'the', 'to', 'of', 'in', 'on', 'at', 'by', 'or',
-  'are', 'is', 'was', 'will', 'with', 'from', 'that', 'this'
-]);
-
-// Texte après "(n)" : utile seulement s'il contient un vrai mot
-// (évite "i TUR", "occa"... issus des pointillés mal lus)
-function isUsefulTail(tail) {
-  if (!/\b[a-z]{3,}\b/.test(tail)) {
-    return false;
-  }
-
-  const tokens = tail.split(/\s+/).filter(Boolean);
-
-  if (
-    tokens.length === 1 &&
-    /^[a-z]{3,6}[.,]?$/.test(tokens[0]) &&
-    !COMMON_TAIL_WORDS.has(tokens[0].replace(/[.,]$/, ''))
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-// "Occupation H = ) RE" -> "Occupation" ; "Phone number Hl |)" -> "Phone number"
-function labelFromLine(line) {
-  if (line.length > 80) {
-    return null;
-  }
-
-  const letters = line.replace(/[^A-Za-z]/g, '');
-  const upper = line.replace(/[^A-Z]/g, '');
-
-  if (letters.length < 4) {
-    return null;
-  }
-
-  // Titres en majuscules (ex. "COURSE DETAILS")
-  if (upper.length / letters.length > 0.5) {
-    return null;
-  }
-
-  if (/read carefully|subscribe|like\b|respect/i.test(line)) {
-    return null;
-  }
-
-  const words = [];
-
-  for (const token of line.split(/\s+/)) {
-    if (/^[A-Z]?[a-z]{3,}$/.test(token)) {
-      words.push(token);
-    } else {
-      break;
-    }
-  }
-
-  if (words.length === 0 || !/^[A-Z]/.test(words[0])) {
-    return null;
-  }
-
-  return words.join(' ');
-}
-
-// Une ligne "Occupation ..." sans numéro lisible, située entre (2) et (4),
-// est forcément la question 3 : on ne le fait que pour les numéros manquants.
-function inferMissingFromLabels(items, hint, result, found) {
-  let i = 0;
-  let prevNumber = null;
-  let prevQuestion = null;
-
-  while (i < items.length) {
-    const item = items[i];
-
-    if (item.number !== undefined) {
-      prevNumber = item.number;
-      prevQuestion = item.question;
-      i++;
-      continue;
-    }
-
-    const run = [];
-    let j = i;
-
-    while (j < items.length && items[j].label !== undefined) {
-      run.push(items[j]);
-      j++;
-    }
-
-    const next = j < items.length ? items[j] : null;
-    const nextNumber = next ? next.number : null;
-    const count = run.length;
-
-    let start = null;
-
-    if (prevNumber !== null && nextNumber !== null) {
-      if (nextNumber - prevNumber - 1 === count) {
-        start = prevNumber + 1;
-      }
-    } else if (nextNumber !== null) {
-      start = nextNumber - count;
-    } else if (prevNumber !== null) {
-      start = prevNumber + 1;
-    }
-
-    if (
-      start !== null &&
-      start >= 1 &&
-      start + count - 1 <= MAX_QUESTION_NUMBER
-    ) {
-      let allMissing = true;
-
-      for (let k = 0; k < count; k++) {
-        if (!hint.has(start + k)) {
-          allMissing = false;
-        }
-      }
-
-      if (allMissing) {
-        const neighbor = prevQuestion || (next && next.question) || {};
-
-        run.forEach((entry, k) => {
-          const number = start + k;
-
-          const question = makeOcrQuestion(
-            number,
-            `${entry.label} (${number})`,
-            result,
-            {
-              instructions: neighbor.instructions,
-              context: neighbor.context
-            }
-          );
-
-          question.inferred = true;
-
-          found.push(question);
-        });
-      }
-    }
-
-    i = j;
-  }
-}
-
-// Analyse le texte OCR d'UNE frame et renvoie les questions candidates
-function parseFrameQuestions(result, missingHint = null) {
-  const lines = result.text
-    .split('\n')
-    .map(line => line.replace(/\s+/g, ' ').trim())
-    .filter(Boolean);
-
-  const found = [];
-  const items = []; // questions et étiquettes, dans l'ordre de lecture
-
-  const recordLabel = line => {
-    const label = labelFromLine(line);
-
-    if (label) {
-      items.push({ label });
-    }
-  };
-
-  let instructions = '';
-  let lastWasInstruction = false;
-  let current = null; // question pouvant recevoir des choix A/B/C
-  let allowContinuation = true; // false pour les questions "(n)" : pas de suite de texte
-
-  let inGroup = false; // un en-tête "Questions X - Y" a été vu dans cette frame
-  let groupHasQuestion = false;
-  let groupOptions = []; // boîte de réponses : (A) Susan (B) Ahmed ...
-  let groupContext = []; // titre / phrase d'introduction du groupe
-
-  const extras = () => ({
-    instructions,
-    options: groupOptions,
-    context: groupContext.join(' ').slice(0, 300)
-  });
-
-  for (const line of lines) {
-    const wasInstruction = lastWasInstruction;
-    lastWasInstruction = false;
-
-    if (isNoiseLine(line)) {
-      continue;
-    }
-
-    // ----- En-tête de groupe : "Questions 18 - 20 Complete the..." -----
-    if (isGroupHeader(line)) {
-      const rest = line.replace(GROUP_HEADER_RE, '').trim();
-
-      instructions = isInstructionLine(rest) ? rest : '';
-      lastWasInstruction = Boolean(instructions);
-
-      current = null;
-      inGroup = true;
-      groupHasQuestion = false;
-      groupOptions = [];
-      groupContext = [];
-
-      continue;
-    }
-
-    // ----- Consigne : "Complete the form below." -----
-    if (isInstructionLine(line)) {
-      instructions =
-        wasInstruction && instructions ? `${instructions} ${line}` : line;
-
-      lastWasInstruction = true;
-      current = null;
-
-      continue;
-    }
-
-    // ----- Boîte de réponses : "(A) Susan (B) Ahmed (C) Gary" -----
-    const optionMatches = [
-      ...line.matchAll(/\(([A-E])\)\s*([^()]+?)(?=\s*\([A-E]\)|$)/g)
-    ];
-
-    if (optionMatches.length >= 2) {
-      groupOptions = optionMatches.map(match => ({
-        letter: match[1],
-        text: match[2].trim()
-      }));
-
-      current = null;
-
-      continue;
-    }
-
-    // ----- Questions à compléter : "Last name: (1)" -----
-    const markers = [...line.matchAll(/\((\d{1,2})\)/g)].filter(m =>
-      isValidQuestionNumber(Number(m[1]))
-    );
-
-    if (markers.length > 0) {
-      let cursor = 0;
-      let lastQuestion = null;
-
-      for (const marker of markers) {
-        const end = marker.index + marker[0].length;
-        const segment = line.slice(cursor, end).trim();
-
-        cursor = end;
-
-        lastQuestion = makeOcrQuestion(
-          Number(marker[1]),
-          segment,
-          result,
-          extras()
-        );
-
-        found.push(lastQuestion);
-        items.push({ number: lastQuestion.number, question: lastQuestion });
-      }
-
-      groupHasQuestion = true;
-
-      // Texte après le dernier "(n)" : gardé seulement s'il contient un vrai mot
-      // (évite les caractères parasites type "i TUR")
-      const tail = line.slice(cursor).trim();
-
-      if (tail && lastQuestion && isUsefulTail(tail)) {
-        lastQuestion.text = cleanQuestionText(`${lastQuestion.text} ${tail}`);
-      }
-
-      // Les questions "(11) What is ... ?" peuvent être suivies de choix A/B/C
-      current = lastQuestion;
-      allowContinuation = false;
-
-      continue;
-    }
-
-    // ----- Questions numérotées : "11. The next event..." -----
-    const numberMatch = line.match(
-      /^(?:question\s*)?(\d{1,2})\s*[\.\):\-]\s*(.+)$/i
-    );
-
-    if (
-      numberMatch &&
-      isValidQuestionNumber(Number(numberMatch[1])) &&
-      /[A-Za-z]{2,}/.test(numberMatch[2])
-    ) {
-      current = makeOcrQuestion(
-        Number(numberMatch[1]),
-        numberMatch[2],
-        result,
-        extras()
-      );
-
-      found.push(current);
-      items.push({ number: current.number, question: current });
-
-      groupHasQuestion = true;
-      allowContinuation = true;
-
-      continue;
-    }
-
-    // ----- Choix : "A) trade fair" -----
-    if (current) {
-      const choiceMatch = line.match(/^([A-D])\s*[\.\):\-]\s*(.+)$/i);
-
-      if (choiceMatch) {
-        current.choices.push({
-          letter: choiceMatch[1].toUpperCase(),
-          text: choiceMatch[2].trim()
-        });
-
-        continue;
-      }
-
-      // Choix sans ponctuation ("B wedding"), seulement si c'est la lettre attendue
-      const looseChoice = line.match(/^([A-D])\s+(.{2,})$/);
-
-      if (
-        looseChoice &&
-        looseChoice[1] === String.fromCharCode(65 + current.choices.length) &&
-        (current.choices.length > 0 || /\?\s*$/.test(current.text))
-      ) {
-        current.choices.push({
-          letter: looseChoice[1],
-          text: looseChoice[2].trim()
-        });
-
-        continue;
-      }
-
-      // Suite de la question (avant les choix)
-      if (
-        allowContinuation &&
-        current.choices.length === 0 &&
-        current.text.length < 500
-      ) {
-        current.text = cleanQuestionText(`${current.text} ${line}`);
-
-        continue;
-      }
-
-      recordLabel(line);
-
-      continue;
-    }
-
-    // ----- Titre / introduction du groupe (avant la première question) -----
-    if (
-      inGroup &&
-      !groupHasQuestion &&
-      line.replace(/[^A-Za-z]/g, '').length >= 4 &&
-      line.length < 200
-    ) {
-      groupContext.push(line);
-    }
-
-    recordLabel(line);
-  }
-
-  if (missingHint && missingHint.size > 0) {
-    inferMissingFromLabels(items, missingHint, result, found);
-  }
-
-  return found;
-}
-
-// ----- Frames de corrigé (liste des réponses affichée en fin de vidéo) -----
-
-// Compte les éléments "12." / "12)" (hors "(12)" et décimaux comme 7.15)
-function analyzeNumberedItems(text) {
-  const numbers = new Set();
-  const re = /(?<![\(\d])(\d{1,2})\s*[\.\)](?!\d)/g;
-
-  let totalLength = 0;
-  let count = 0;
-
-  for (const line of String(text || '').split('\n')) {
-    const matches = [...line.matchAll(re)];
-
-    matches.forEach((match, index) => {
-      const number = Number(match[1]);
-
-      if (!isValidQuestionNumber(number)) {
-        return;
-      }
-
-      const from = match.index + match[0].length;
-      const to =
-        index + 1 < matches.length ? matches[index + 1].index : line.length;
-
-      numbers.add(number);
-      totalLength += line.slice(from, to).trim().length;
-      count++;
-    });
-  }
-
-  return {
-    distinct: numbers.size,
-    averageLength: count > 0 ? totalLength / count : 0
-  };
-}
-
-// Beaucoup de numéros + textes très courts + fin de vidéo = liste de réponses
-function isAnswerKeyFrame(result, maxTimestamp) {
-  const { distinct, averageLength } = analyzeNumberedItems(result.text);
-
-  if (distinct < 8 || averageLength >= 25) {
-    return false;
-  }
-
-  return result.timestamp >= maxTimestamp * 0.6;
-}
-
-function collectAnswerFrames(ocrResults, maxTimestamp, limit = 3) {
-  const seen = new Set();
-  const frames = [];
-
-  for (const result of ocrResults) {
-    if (!isAnswerKeyFrame(result, maxTimestamp)) {
-      continue;
-    }
-
-    const key = result.text.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-
-    frames.push({
-      timestamp: result.timestamp,
-      timestampFormatted: result.timestampFormatted,
-      text: result.text
-    });
-
-    if (frames.length >= limit) {
-      break;
-    }
-  }
-
-  return frames;
-}
-
-// Lit la liste des réponses affichée en fin de vidéo (2 colonnes : 1-20 et 21-40)
-function parseAnswerKey(answerFrames) {
-  const votes = new Map();
-
-  const cleanAnswer = text =>
-    String(text || '')
-      .replace(/^[\s\W_]+|[\s\W_]+$/g, '')
-      .replace(/\s+/g, ' ')
-      .trim();
-
-  const vote = (number, answer) => {
-    const value = cleanAnswer(answer);
-
-    if (!value || value.length > 60) {
-      return;
-    }
-
-    if (!votes.has(number)) {
-      votes.set(number, new Map());
-    }
-
-    const counts = votes.get(number);
-
-    counts.set(value, (counts.get(value) || 0) + 1);
-  };
-
-  for (const frame of answerFrames) {
-    const lines = frame.text
-      .split('\n')
-      .map(line => line.replace(/\s+/g, ' ').trim())
-      .filter(Boolean);
-
-    for (const line of lines) {
-      for (let n = 1; n <= 20; n++) {
-        // Colonne de droite : "... 22. what though"
-        const rightMatch = line.match(
-          new RegExp(`(?:^|\\s)${n + 20}\\s*[\\.,]\\s*(.+)$`)
-        );
-
-        let leftPart = line;
-
-        if (rightMatch) {
-          vote(n + 20, rightMatch[1]);
-          leftPart = line.slice(0, rightMatch.index);
-        }
-
-        // Colonne de gauche : "2. 25" ou "3 accountant"
-        const leftMatch = leftPart.match(
-          new RegExp(`^\\W*${n}\\s*[\\.,]?\\s+(.+)$`)
-        );
-
-        if (leftMatch) {
-          vote(n, leftMatch[1]);
-        }
-      }
-    }
-  }
-
-  const answers = {};
-
-  for (const [number, counts] of votes) {
-    let best = null;
-    let bestScore = -1;
-
-    for (const [value, count] of counts) {
-      const score =
-        count * 10 +
-        (/^[A-E]$/.test(value) ? 5 : 0) +
-        Math.min(value.length, 20) / 100;
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = value;
-      }
-    }
-
-    if (best) {
-      answers[number] = best;
-    }
-  }
-
-  return answers;
-}
-
-// Garde UNE seule version par numéro de question (la plus fiable)
-function consolidateQuestions(found) {
-  const byNumber = new Map();
-
-  for (const question of found) {
-    if (!question.text || question.text.length < 4) {
-      continue;
-    }
-
-    if (!byNumber.has(question.number)) {
-      byNumber.set(question.number, []);
-    }
-
-    byNumber.get(question.number).push(question);
-  }
-
-  const questions = [];
-
-  for (const [, candidates] of byNumber) {
-    // Regrouper les versions identiques (même texte lu sur plusieurs frames)
-    const groups = new Map();
-
-    for (const candidate of candidates) {
-      const key = candidate.text.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-      if (!groups.has(key)) {
-        groups.set(key, []);
-      }
-
-      groups.get(key).push(candidate);
-    }
-
-    // Choisir le groupe le plus fréquent (puis le plus complet,
-    // puis la lecture la plus ancienne en cas d'égalité)
-    let bestGroup = null;
-    let bestScore = -Infinity;
-
-    for (const items of groups.values()) {
-      const maxChoices = Math.max(...items.map(item => item.choices.length));
-      const minTime = Math.min(...items.map(item => item.startTime));
-
-      const score = items.length * 1000 + maxChoices * 50 - minTime / 10000;
-
-      if (score > bestScore) {
-        bestScore = score;
-        bestGroup = items;
-      }
-    }
-
-    const chosen = {
-      ...bestGroup.reduce((a, b) =>
-        b.choices.length > a.choices.length ? b : a
-      )
-    };
-
-    chosen.startTime = Math.min(...bestGroup.map(item => item.startTime));
-    chosen.startTimeFormatted = formatTime(chosen.startTime);
-
-    // Choix manquants : les récupérer sur une autre lecture de la même question
-    if (chosen.choices.length === 0) {
-      const withChoices = candidates.reduce((a, b) =>
-        b.choices.length > a.choices.length ? b : a
-      );
-
-      if (withChoices.choices.length > 0) {
-        chosen.choices = withChoices.choices;
-      }
-    }
-
-    // Consigne, boîte de réponses, introduction : première valeur trouvée
-    for (const field of ['instructions', 'options', 'context']) {
-      if (!chosen[field]) {
-        const source = candidates.find(item => item[field]);
-
-        if (source) {
-          chosen[field] = source[field];
-        }
-      }
-    }
-
-    questions.push(chosen);
-  }
-
-  return questions.sort((a, b) => a.number - b.number);
-}
-
-function extractQuestionsFromOcr(ocrResults, maxTimestamp = 0) {
-  const found = [];
-
-  for (const result of ocrResults) {
-    if (!result.questionLike) {
-      continue;
-    }
-
-    // Les listes de réponses ne sont pas des questions
-    if (isAnswerKeyFrame(result, maxTimestamp)) {
-      continue;
-    }
-
-    found.push(...parseFrameQuestions(result));
-  }
-
-  const firstPass = consolidateQuestions(found);
-
-  // Numéros non retrouvés : 2e passe qui les déduit des lignes sans numéro lisible
-  const missing = new Set();
-
-  for (let n = 1; n <= MAX_QUESTION_NUMBER; n++) {
-    if (!firstPass.some(question => question.number === n)) {
-      missing.add(n);
-    }
-  }
-
-  if (missing.size === 0) {
-    return firstPass;
-  }
-
-  const inferred = [];
-
-  for (const result of ocrResults) {
-    if (!result.questionLike) {
-      continue;
-    }
-
-    if (isAnswerKeyFrame(result, maxTimestamp)) {
-      continue;
-    }
-
-    inferred.push(
-      ...parseFrameQuestions(result, missing).filter(question => question.inferred)
-    );
-  }
-
-  return consolidateQuestions(found.concat(inferred));
-}
-
-// ============================================================
-// GROUPES DE QUESTIONS (texte complet : schémas, tableaux, flow charts)
-// ============================================================
-
-// Découpe une frame en segments, un par en-tête "Questions X - Y"
-function splitFrameGroups(result) {
-  const lines = result.text
-    .split('\n')
-    .map(line => line.replace(/\s+/g, ' ').trim())
-    .filter(line => line && !isNoiseLine(line));
-
-  const segments = [];
-
-  let current = null;
-
-  for (const line of lines) {
-    const match = line.match(GROUP_RANGE_RE);
-
-    if (match) {
-      const from = Number(match[1]);
-      const to = Number(match[2]);
-
-      if (isValidQuestionNumber(from) && isValidQuestionNumber(to) && from <= to) {
-        current = {
-          from,
-          to,
-          lines: [line],
-          timestamp: result.timestamp
-        };
-
-        segments.push(current);
-
-        continue;
-      }
-    }
-
-    if (current) {
-      current.lines.push(line);
-    }
-  }
-
-  return segments.map(segment => ({
-    ...segment,
-    text: segment.lines.join('\n')
-  }));
-}
-
-// Pour chaque groupe (ex. "Questions 21 - 25"), garde la meilleure lecture OCR
-function buildQuestionGroups(ocrResults, maxTimestamp = 0) {
-  const best = new Map();
-  const firstTimes = new Map();
-
-  for (const result of ocrResults) {
-    if (!result.questionLike) {
-      continue;
-    }
-
-    if (isAnswerKeyFrame(result, maxTimestamp)) {
-      continue;
-    }
-
-    for (const segment of splitFrameGroups(result)) {
-      const key = `${segment.from}-${segment.to}`;
-
-      if (
-        !firstTimes.has(key) ||
-        segment.timestamp < firstTimes.get(key)
-      ) {
-        firstTimes.set(key, segment.timestamp);
-      }
-
-      // Nombre de numéros de questions du groupe retrouvés dans ce texte
-      const numbers = new Set();
-
-      for (const match of segment.text.matchAll(
-        /\((\d{1,2})\)|^\s*(\d{1,2})[\.\)]/gm
-      )) {
-        const n = Number(match[1] || match[2]);
-
-        if (n >= segment.from && n <= segment.to) {
-          numbers.add(n);
-        }
-      }
-
-      const candidate = { ...segment, score: numbers.size };
-      const previous = best.get(key);
-
-      if (!previous || candidate.score > previous.score) {
-        best.set(key, candidate);
-      }
-    }
-  }
-
-  return [...best.entries()]
-    .map(([key, group]) => ({
-      from: group.from,
-      to: group.to,
-      section: sectionFromNumber(group.from),
-      startTime: firstTimes.get(key),
-      startTimeFormatted: formatTime(firstTimes.get(key)),
-      text: group.text
-    }))
-    .sort((a, b) => a.from - b.from);
-}
-
-// ============================================================
-// REGROUPEMENT DES FRAMES OCR
-// ============================================================
-
-function buildOcrQuestionZones(ocrResults) {
-  const zones = [];
-
-  let current = null;
-
-  const addText = (zone, text) => {
-    const key = text.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-    if (!zone.seen.has(key)) {
-      zone.seen.add(key);
-      zone.texts.push(text);
-    }
-  };
-
-  const closeZone = zone => {
-    delete zone.seen;
-    zones.push(zone);
-  };
-
-  for (const result of ocrResults) {
-    if (!result.questionLike) {
-      if (current) {
-        current.endTime = result.timestamp;
-        current.endTimeFormatted = formatTime(result.timestamp);
-
-        closeZone(current);
-
-        current = null;
-      }
-
-      continue;
-    }
-
-    if (!current) {
-      current = {
-        startTime: result.timestamp,
-        startTimeFormatted: result.timestampFormatted,
-        endTime: result.timestamp,
-        endTimeFormatted: result.timestampFormatted,
-        texts: [],
-        seen: new Set()
-      };
-    }
-
-    current.endTime = result.timestamp;
-    current.endTimeFormatted = result.timestampFormatted;
-
-    // Un même texte lu sur plusieurs frames n'est gardé qu'une fois
-    addText(current, result.text);
-  }
-
-  if (current) {
-    closeZone(current);
-  }
-
-  return zones;
-}
-
-// Textes OCR "question" sans doublons (on garde la 1re apparition)
-function buildUniqueOcrMatches(ocrResults) {
-  const seen = new Set();
-  const matches = [];
-
-  for (const item of ocrResults) {
-    if (!item.questionLike) {
-      continue;
-    }
-
-    const key = item.text.toLowerCase().replace(/[^a-z0-9]/g, '');
-
-    if (seen.has(key)) {
-      continue;
-    }
-
-    seen.add(key);
-
-    matches.push({
-      timestamp: item.timestamp,
-      timestampFormatted: item.timestampFormatted,
-      text: item.text
-    });
-  }
-
-  return matches;
-}
-
-// ============================================================
-// ANALYSE OCR D'UNE VIDEO
-// ============================================================
-
-async function analyzeVideoWithOCR(video, options = {}) {
-  const debug = Boolean(options.debug);
-
-  const tempDir = await createTempDir();
-
-  const videoPath = path.join(tempDir, 'video.mp4');
-  const framesDir = path.join(tempDir, 'frames');
-
-  try {
-    console.log(`\n🔬 ANALYSE OCR IELTS: ${video.videoId}`);
-
-    await downloadYoutubeVideo(video.videoId, videoPath);
-
-    const frames = await extractFrames(videoPath, framesDir);
-
-    const ocrResults = await runOCR(frames);
-
-    const maxTimestamp =
-      frames.length > 0 ? frames[frames.length - 1].timestamp : 0;
-
-    const questions = extractQuestionsFromOcr(ocrResults, maxTimestamp);
-
-    const groups = buildQuestionGroups(ocrResults, maxTimestamp);
-
-    const answerFrames = collectAnswerFrames(ocrResults, maxTimestamp, 12);
-
-    const answers = parseAnswerKey(answerFrames);
-
-    const validQuestions = questions.filter(
-      question => question.text && question.text.length >= 4
-    );
-
-    // Réponse lue dans le corrigé de fin de vidéo (OCR : peut contenir des erreurs)
-    for (const question of validQuestions) {
-      if (answers[question.number]) {
-        question.answer = answers[question.number];
-      }
-    }
-
-    if (validQuestions.length === 0) {
-      console.log('❌ Aucune question IELTS détectée par OCR');
-
-      return null;
-    }
-
-    console.log(`✅ ${validQuestions.length} question(s) détectée(s) par OCR`);
-
-    // Numéros de 1 à 40 non retrouvés
-    const foundNumbers = new Set(validQuestions.map(question => question.number));
-
-    const missingNumbers = [];
-
-    for (let n = 1; n <= MAX_QUESTION_NUMBER; n++) {
-      if (!foundNumbers.has(n)) {
-        missingNumbers.push(n);
-      }
-    }
-
-    const response = {
-      ...video,
-
-      verified: true,
-      extractionMethod: 'video_ocr',
-      questionCount: validQuestions.length,
-      questions: validQuestions,
-      missingNumbers,
-      answers,
-      groups,
-      answerFrames: answerFrames.slice(0, 2)
-    };
-
-    // Données brutes volumineuses : seulement en mode debug (?debug=1)
-    if (debug) {
-      response.questionZones = buildOcrQuestionZones(ocrResults);
-      response.ocrMatches = buildUniqueOcrMatches(ocrResults);
-    }
-
-    return response;
-  } finally {
-    // Nettoyage systématique
-    try {
-      await fsp.rm(tempDir, { recursive: true, force: true });
-
-      console.log('🧹 Fichiers temporaires supprimés');
-    } catch (cleanupError) {
-      console.warn('⚠️ Nettoyage impossible:', cleanupError.message);
-    }
-  }
-}
-
-// ============================================================
-// ANALYSE TRANSCRIPT + OCR
-// ============================================================
-
-async function analyzeListeningVideo(video, options = {}) {
-  // ----------------------------------------------------------
-  // 1. Essai transcript
-  // ----------------------------------------------------------
-
-  const transcript = await getTranscript(video.videoId);
-
-  const transcriptText = normalizeText(transcript.text);
-
-  console.log(
-    `🎧 Transcript ${video.videoId}: ${transcriptText.length} caractères`
-  );
-
-  if (transcriptText.length >= 50 && transcript.segments.length > 0) {
-    const markerInfo = hasQuestionMarkers(transcriptText);
-
-    const questionZones = findQuestionSegments(transcript.segments);
-
-    if (markerInfo.found && questionZones.length > 0) {
-      console.log('✅ Questions détectées dans le transcript');
-
-      return {
-        ...video,
-
-        verified: true,
-        extractionMethod: 'transcript',
-        questionCount: questionZones.length,
-
-        questions: questionZones.map((zone, index) => ({
-          number: index + 1,
-          text: zone.text,
-          choices: [],
-          startTime: zone.start,
-          endTime: zone.end,
-          startTimeFormatted: formatTime(zone.start),
-          endTimeFormatted: formatTime(zone.end),
-          source: 'transcript'
-        })),
-
-        questionZones,
-        transcript: transcriptText
-      };
-    }
-  }
-
-  // ----------------------------------------------------------
-  // 2. Transcript inutilisable -> OCR
-  // ----------------------------------------------------------
-
-  console.log('📺 Transcript inutilisable ou sans questions.');
-  console.log('🔎 Passage à l’analyse OCR de la vidéo...');
-
-  return await analyzeVideoWithOCR(video, options);
-}
-
-// ============================================================
-// GET /api/youtube/ielts
-// ============================================================
-
-router.get('/ielts', async (req, res) => {
-  try {
-    const maxResults = Math.min(Number(req.query.limit || 5), 10);
-
-    console.log('\n========================================');
-    console.log('🔎 RECHERCHE IELTS LISTENING');
-    console.log('========================================');
-
-    const allItems = [];
-
-    for (const query of LISTENING_QUERIES) {
-      try {
-        console.log(`🔍 ${query}`);
-
-        const items = await searchYouTube(query);
-
-        allItems.push(...items);
-      } catch (error) {
-        console.warn(`⚠️ Recherche échouée "${query}":`, error.message);
-      }
-    }
-
-    // Déduplication
-    const uniqueMap = new Map();
-
-    for (const item of allItems) {
-      if (item.id?.videoId) {
-        uniqueMap.set(item.id.videoId, item);
-      }
-    }
-
-    const uniqueItems = [...uniqueMap.values()];
-
-    const details = await getVideoDetails(
-      uniqueItems.map(item => item.id.videoId)
-    );
-
-    let candidates = processVideos(details);
-
-    candidates = candidates.sort((a, b) => b.quality - a.quality);
-
-    // ------------------------------------------------------
-    // Vérification réelle
-    // ------------------------------------------------------
-
-    const verifiedVideos = [];
-
-    for (const video of candidates) {
-      if (verifiedVideos.length >= maxResults) {
+async function runSearch(count) {
+  let analyzed = 0;
+  let apiSearches = 0;
+  let resetDone = false;
+
+  status.search = { target: count, analyzed: 0 };
+
+  while (analyzed < count && apiSearches < MAX_API_SEARCHES_PER_RUN) {
+    let pick = pickQuery();
+
+    if (!pick) {
+      // Toutes les pages ont été parcourues : on recommence un tour
+      if (resetDone) {
         break;
       }
 
-      try {
-        const analyzed = await analyzeListeningVideo(video);
+      resetDone = true;
+      state.search = { queryIndex: 0, tokens: {} };
+      pick = pickQuery();
 
-        if (analyzed && analyzed.questions && analyzed.questions.length > 0) {
-          verifiedVideos.push(analyzed);
-        }
-      } catch (error) {
-        console.warn(`⚠️ Vidéo ${video.videoId} rejetée:`, error.message);
+      if (!pick) {
+        break;
       }
     }
 
+    status.message = `Recherche de nouvelles vidéos : « ${pick.query} »…`;
+
+    const { items, nextPageToken } = await searchYouTubePage(
+      pick.query,
+      pick.token
+    );
+
+    apiSearches++;
+
+    state.search.tokens[pick.query] = nextPageToken || 'done';
+    state.search.queryIndex = (pick.index + 1) % helpers.LISTENING_QUERIES.length;
+
+    await saveState();
+
+    const ids = items
+      .map(item => item.id && item.id.videoId)
+      .filter(Boolean)
+      .filter(id => !isKnown(id) && !queuedIds.has(id));
+
+    if (ids.length === 0) {
+      continue;
+    }
+
+    const details = await helpers.getVideoDetails(ids);
+
+    const candidates = helpers
+      .processVideos(details)
+      .sort((a, b) => b.quality - a.quality);
+
+    for (const video of candidates) {
+      if (analyzed >= count) {
+        break;
+      }
+
+      if (isKnown(video.videoId)) {
+        continue;
+      }
+
+      const ok = await analyzeAndStore(video, 'search');
+
+      if (ok) {
+        analyzed++;
+        status.search.analyzed = analyzed;
+      }
+    }
+  }
+
+  status.lastMessage =
+    analyzed > 0
+      ? `${analyzed} nouvelle(s) vidéo(s) ajoutée(s).`
+      : 'Aucune nouvelle vidéo exploitable trouvée pour le moment.';
+}
+
+async function runAnalyze(task) {
+  const videoId = task.videoId;
+
+  if (state.videos[videoId] && !task.force) {
+    return;
+  }
+
+  status.message = 'Récupération des informations de la vidéo…';
+
+  const details = await helpers.getVideoDetails([videoId]);
+
+  if (!details || details.length === 0) {
+    markFailed({ videoId, title: '' }, 'error', 'Vidéo YouTube introuvable');
+    status.lastError = 'Vidéo YouTube introuvable';
+
+    await saveState();
+
+    return;
+  }
+
+  const video = helpers.buildVideoObject(details[0]);
+
+  const ok = await analyzeAndStore(video, 'manual');
+
+  status.lastMessage = ok
+    ? `« ${video.title} » ajoutée.`
+    : `Aucune question exploitable dans « ${video.title} ».`;
+}
+
+async function runWorker() {
+  if (working) {
+    return;
+  }
+
+  working = true;
+
+  try {
+    while (queue.length > 0) {
+      const task = queue.shift();
+
+      status.mode = task.type;
+      status.lastError = '';
+
+      try {
+        if (task.type === 'search') {
+          await runSearch(task.count);
+        } else {
+          await runAnalyze(task);
+        }
+      } catch (error) {
+        console.error('❌ Tâche en échec :', error.message);
+
+        status.lastError = error.message;
+      } finally {
+        if (task.videoId) {
+          queuedIds.delete(task.videoId);
+        }
+      }
+    }
+  } finally {
+    working = false;
+    status.mode = null;
+    status.message = '';
+    status.current = null;
+    status.search = null;
+    status.lastFinishedAt = new Date().toISOString();
+  }
+}
+
+function enqueue(task) {
+  queue.push(task);
+
+  if (task.videoId) {
+    queuedIds.add(task.videoId);
+  }
+
+  runWorker();
+}
+
+function searchIsActive() {
+  return (
+    status.mode === 'search' || queue.some(task => task.type === 'search')
+  );
+}
+
+// ============================================================
+// PROTECTION (facultative) : variable IELTS_ADMIN_KEY
+// ============================================================
+
+function requireAdmin(req, res, next) {
+  const key = process.env.IELTS_ADMIN_KEY;
+
+  if (!key || req.get('x-admin-key') === key) {
+    return next();
+  }
+
+  return res.status(401).json({
+    ok: false,
+    error: 'Clé administrateur requise'
+  });
+}
+
+// ============================================================
+// ROUTES
+// ============================================================
+
+// Liste des vidéos sauvegardées
+router.get(API, (req, res) => {
+  const videos = Object.values(state.videos)
+    .sort((a, b) => String(b.addedAt).localeCompare(String(a.addedAt)))
+    .map(summarize);
+
+  res.json({
+    ok: true,
+    count: videos.length,
+    videos,
+    status: statusSnapshot()
+  });
+});
+
+// État de la file d'analyse
+router.get(`${API}/status`, (req, res) => {
+  res.json({ ok: true, ...statusSnapshot() });
+});
+
+// Ajouter une vidéo précise (lien ou identifiant)
+router.post(`${API}/analyze`, requireAdmin, (req, res) => {
+  const videoId = helpers.getVideoIdFromUrl(
+    (req.body && (req.body.videoId || req.body.url)) || ''
+  );
+
+  if (!videoId) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Lien ou identifiant YouTube invalide'
+    });
+  }
+
+  const force = Boolean(req.body && req.body.force);
+
+  if (state.videos[videoId] && !force) {
     return res.json({
       ok: true,
-      skill: 'listening',
-      count: verifiedVideos.length,
-      videos: verifiedVideos
-    });
-  } catch (error) {
-    console.error('❌ ERREUR /ielts:', error.response?.data || error.message);
-
-    return res.status(500).json({
-      ok: false,
-      error: error.message || 'Erreur serveur'
+      status: 'exists',
+      video: summarize(state.videos[videoId])
     });
   }
+
+  if (queuedIds.has(videoId)) {
+    return res.json({ ok: true, status: 'already_queued', videoId });
+  }
+
+  enqueue({ type: 'analyze', videoId, force });
+
+  return res.json({ ok: true, status: 'queued', videoId });
+});
+
+// "Afficher plus de vidéos" : nouvelle recherche, analyse une par une
+router.post(`${API}/search-more`, requireAdmin, (req, res) => {
+  if (searchIsActive()) {
+    return res.json({ ok: true, status: 'already_running' });
+  }
+
+  const requested = Number(req.body && req.body.count);
+
+  const count = Math.min(
+    MAX_SEARCH_COUNT,
+    Math.max(1, Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_SEARCH_COUNT)
+  );
+
+  enqueue({ type: 'search', count });
+
+  return res.json({ ok: true, status: 'started', count });
+});
+
+// Questions d'une vidéo (sans les réponses)
+router.get(`${API}/:videoId`, (req, res) => {
+  const record = state.videos[req.params.videoId];
+
+  if (!record) {
+    return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
+  }
+
+  return res.json({
+    ok: true,
+    video: {
+      ...summarize(record),
+      questions: record.questions,
+      groups: record.groups
+    }
+  });
+});
+
+// Réponses d'une vidéo (bouton "Afficher les réponses")
+router.get(`${API}/:videoId/answers`, (req, res) => {
+  const record = state.videos[req.params.videoId];
+
+  if (!record) {
+    return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
+  }
+
+  return res.json({ ok: true, answers: record.answers || {} });
+});
+
+// Supprimer une vidéo (pour pouvoir la refaire)
+router.delete(`${API}/:videoId`, requireAdmin, (req, res) => {
+  const id = req.params.videoId;
+
+  delete state.videos[id];
+  delete state.failed[id];
+
+  saveState();
+
+  res.json({ ok: true });
 });
 
 // ============================================================
-// TEST DIRECT D'UNE VIDEO
+// PAGE WEB : liste des vidéos, vidéo, test, réponses
 // ============================================================
 
-router.get('/ielts/test-video', async (req, res) => {
-  try {
-    const videoId = getVideoIdFromUrl(req.query.videoId);
+const PAGE = String.raw`<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IELTS Listening</title>
+<style>
+  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f26; --muted:#6a7080; --line:#dfe3ea; --accent:#2457d6; --ok:#1c8a4a; --warn:#b26a00; --bad:#c0392b; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#14161b; --card:#1d2027; --text:#eceef3; --muted:#9aa1b2; --line:#2c303a; --accent:#6c93ff; --ok:#4cc27f; --warn:#e2a03f; --bad:#ef6a5b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
+  header, main { max-width:720px; margin:0 auto; padding:16px; }
+  h1 { margin:8px 0 4px; font-size:1.5rem; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  button { font:inherit; border:0; border-radius:10px; padding:12px 16px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  button.wide { width:100%; margin-top:8px; }
+  input[type=text], select { font:inherit; width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  .add { display:flex; gap:8px; margin:12px 0; }
+  .add input { flex:1; }
+  .status { padding:10px 12px; border-radius:10px; background:var(--card); border:1px solid var(--line); margin:12px 0; font-size:.95rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; margin:14px 0; overflow:hidden; }
+  .thumb { width:100%; display:block; aspect-ratio:16/9; object-fit:cover; background:var(--line); }
+  .cardbody { padding:12px 14px 14px; }
+  .cardbody h3 { margin:0 0 6px; font-size:1.02rem; line-height:1.3; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:99px; font-size:.78rem; border:1px solid currentColor; }
+  .badge.ok { color:var(--ok); } .badge.review { color:var(--warn); }
+  .issues { color:var(--warn); font-size:.85rem; margin:6px 0 0; padding-left:18px; }
+  .player { position:relative; width:100%; aspect-ratio:16/9; margin-top:10px; border-radius:10px; overflow:hidden; background:#000; }
+  .player iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
+  .test { margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }
+  .head { margin:16px 0 6px; padding:8px 10px; border-left:4px solid var(--accent); background:var(--bg); border-radius:6px; font-size:.92rem; }
+  .head b { display:block; }
+  .opts { margin:6px 0 0; padding-left:18px; }
+  .q { padding:10px 0; border-bottom:1px solid var(--line); }
+  .qtext { margin:0 0 6px; line-height:1.4; }
+  .choice { display:flex; align-items:flex-start; gap:8px; padding:6px 0; }
+  .choice input { margin-top:4px; }
+  .answer { margin-top:6px; font-size:.92rem; font-weight:600; }
+  .answer.right { color:var(--ok); } .answer.wrong { color:var(--bad); } .answer.plain { color:var(--accent); }
+  .score { font-weight:700; margin:12px 0; }
+  .empty { text-align:center; color:var(--muted); padding:30px 10px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>IELTS Listening</h1>
+  <div class="muted" id="sub">Tests enregistrés</div>
+</header>
+<main>
+  <div class="add">
+    <input type="text" id="addInput" placeholder="Lien ou identifiant YouTube">
+    <button id="addBtn">Ajouter</button>
+  </div>
+  <div class="status" id="statusBar" hidden></div>
+  <div id="list"></div>
+  <button class="wide" id="moreBtn">Afficher plus de vidéos</button>
+</main>
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var KEY = params.get('key');
+  var BASE = '/api/youtube/ielts/library';
 
-    if (!videoId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'videoId ou URL YouTube invalide'
-      });
-    }
+  var listEl = document.getElementById('list');
+  var statusBar = document.getElementById('statusBar');
+  var moreBtn = document.getElementById('moreBtn');
+  var addBtn = document.getElementById('addBtn');
+  var addInput = document.getElementById('addInput');
+  var subEl = document.getElementById('sub');
 
-    console.log(`\n🎯 TEST DIRECT VIDEO: ${videoId}`);
+  var pollTimer = null;
+  var lastCount = -1;
 
-    const details = await getVideoDetails([videoId]);
-
-    if (!details || details.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        videoId,
-        error: 'Vidéo YouTube introuvable'
-      });
-    }
-
-    const video = buildVideoObject(details[0]);
-
-    video.quality = 100;
-
-    const result = await analyzeListeningVideo(video, {
-      debug: req.query.debug === '1'
+  function el(tag, props, kids) {
+    var node = document.createElement(tag);
+    Object.keys(props || {}).forEach(function (k) {
+      var v = props[k];
+      if (k === 'text') node.textContent = v;
+      else if (k === 'class') node.className = v;
+      else if (k.indexOf('on') === 0) node.addEventListener(k.slice(2), v);
+      else node.setAttribute(k, v);
     });
-
-    if (!result) {
-      return res.json({
-        ok: false,
-        videoId,
-        title: video.title,
-        error:
-          'La vidéo ne contient pas de questions IELTS Listening exploitables'
-      });
-    }
-
-    return res.json({
-      ok: true,
-      video: result
+    (kids || []).forEach(function (c) {
+      if (c) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
     });
-  } catch (error) {
-    console.error('\n❌ ERREUR TEST IELTS:', error.response?.data || error.message);
+    return node;
+  }
 
-    return res.status(500).json({
-      ok: false,
-      error: error.message || 'Erreur serveur'
+  function api(path, options) {
+    options = options || {};
+    options.headers = options.headers || {};
+    if (KEY) options.headers['x-admin-key'] = KEY;
+    if (options.body && typeof options.body !== 'string') {
+      options.body = JSON.stringify(options.body);
+      options.headers['Content-Type'] = 'application/json';
+    }
+    return fetch(BASE + path, options).then(function (r) { return r.json(); });
+  }
+
+  function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
+
+  // ---------- Statut de la recherche ----------
+  function showStatus(text) {
+    if (!text) { statusBar.hidden = true; return; }
+    statusBar.hidden = false;
+    statusBar.textContent = text;
+  }
+
+  function updateStatus(s) {
+    var running = s.running;
+    moreBtn.disabled = running;
+    addBtn.disabled = running;
+    if (running) {
+      var text = s.message || 'Traitement en cours…';
+      if (s.search) text += '  (' + s.search.analyzed + '/' + s.search.target + ' ajoutées)';
+      if (s.queueLength > 1) text += '  — ' + (s.queueLength - 1) + ' en attente';
+      showStatus(text);
+    } else if (s.lastError) {
+      showStatus('⚠️ ' + s.lastError + (s.lastMessage ? ' — ' + s.lastMessage : ''));
+    } else {
+      showStatus(s.lastMessage || '');
+    }
+  }
+
+  function refreshStatus() {
+    return api('/status').then(function (s) {
+      updateStatus(s);
+      if (s.libraryCount !== lastCount) {
+        lastCount = s.libraryCount;
+        loadList();
+      }
+      if (s.running) schedulePoll(); else stopPoll();
+    }).catch(function () { schedulePoll(); });
+  }
+
+  function schedulePoll() {
+    if (!pollTimer) pollTimer = setInterval(refreshStatus, 4000);
+  }
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  // ---------- Liste des vidéos ----------
+  function loadList() {
+    return api('').then(function (data) {
+      listEl.innerHTML = '';
+      subEl.textContent = data.count + ' test(s) enregistré(s)';
+      if (!data.videos.length) {
+        listEl.appendChild(el('div', { class: 'empty', text: 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.' }));
+        return;
+      }
+      data.videos.forEach(function (v) { listEl.appendChild(renderCard(v)); });
     });
   }
-});
 
-// ============================================================
-// TEST TRANSCRIPT UNIQUEMENT
-// ============================================================
+  function renderCard(v) {
+    var card = el('div', { class: 'card' });
+    if (v.thumbnail) card.appendChild(el('img', { class: 'thumb', src: v.thumbnail, alt: '', loading: 'lazy' }));
 
-router.get('/ielts/test-transcript', async (req, res) => {
-  try {
-    const videoId = getVideoIdFromUrl(req.query.videoId);
+    var body = el('div', { class: 'cardbody' });
+    body.appendChild(el('h3', { text: v.title }));
 
-    if (!videoId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'videoId ou URL YouTube invalide'
-      });
+    var meta = el('div', { class: 'muted' });
+    meta.appendChild(document.createTextNode(v.questionCount + ' questions  '));
+    meta.appendChild(el('span', {
+      class: 'badge ' + (v.status === 'ok' ? 'ok' : 'review'),
+      text: v.status === 'ok' ? 'vérifié' : 'à relire'
+    }));
+    body.appendChild(meta);
+
+    if (v.issues && v.issues.length) {
+      var ul = el('ul', { class: 'issues' });
+      v.issues.forEach(function (i) { ul.appendChild(el('li', { text: i })); });
+      body.appendChild(ul);
     }
 
-    const transcript = await getTranscript(videoId);
-
-    const markerInfo = hasQuestionMarkers(transcript.text);
-
-    const questionZones = findQuestionSegments(transcript.segments);
-
-    return res.json({
-      ok: true,
-      videoId,
-      status: transcript.status,
-      language: transcript.language,
-      textLength: transcript.text.length,
-      segmentCount: transcript.segments.length,
-      questionMarkers: markerInfo,
-      questionZones,
-      transcript: transcript.text,
-      segments: transcript.segments
+    var area = el('div');
+    var showBtn = el('button', { class: 'wide', text: 'Afficher la vidéo' });
+    showBtn.addEventListener('click', function () {
+      showBtn.remove();
+      area.appendChild(el('div', { class: 'player' }, [
+        el('iframe', {
+          src: 'https://www.youtube.com/embed/' + v.videoId,
+          allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture',
+          allowfullscreen: ''
+        })
+      ]));
+      var startBtn = el('button', { class: 'wide secondary', text: 'Commencer le test' });
+      startBtn.addEventListener('click', function () {
+        startBtn.remove();
+        loadTest(area, v);
+      });
+      area.appendChild(startBtn);
     });
-  } catch (error) {
-    console.error('❌ ERREUR TEST TRANSCRIPT:', error.message);
+    body.appendChild(showBtn);
+    body.appendChild(area);
+    card.appendChild(body);
+    return card;
+  }
 
-    return res.status(500).json({
-      ok: false,
-      error: error.message || 'Erreur serveur'
+  // ---------- Test ----------
+  function cleanText(q) {
+    var t = q.text || '';
+    if (/^\(\d{1,2}\)\s*/.test(t)) return t.replace(/^\(\d{1,2}\)\s*/, '');
+    return t.replace(/\(\d{1,2}\)/g, '________');
+  }
+
+  function loadTest(area, v) {
+    var box = el('div', { class: 'test' }, [el('div', { class: 'muted', text: 'Chargement des questions…' })]);
+    area.appendChild(box);
+
+    api('/' + encodeURIComponent(v.videoId)).then(function (data) {
+      box.innerHTML = '';
+      if (!data.ok) { box.textContent = data.error || 'Erreur'; return; }
+
+      var inputs = {};
+      var answerEls = {};
+      var lastHead = null;
+      var lastOptions = null;
+
+      data.video.questions.forEach(function (q) {
+        var headKey = (q.instructions || '') + '|' + (q.context || '');
+        if (headKey !== lastHead && (q.instructions || q.context)) {
+          var head = el('div', { class: 'head' });
+          if (q.instructions) head.appendChild(el('b', { text: q.instructions }));
+          if (q.context) head.appendChild(el('span', { text: q.context }));
+          box.appendChild(head);
+        }
+        lastHead = headKey;
+
+        var optKey = JSON.stringify(q.options || []);
+        if (q.options && q.options.length && optKey !== lastOptions) {
+          var ul = el('ul', { class: 'opts' });
+          q.options.forEach(function (o) { ul.appendChild(el('li', { text: o.letter + ' — ' + o.text })); });
+          box.appendChild(ul);
+        }
+        lastOptions = optKey;
+
+        var block = el('div', { class: 'q' });
+        block.appendChild(el('p', { class: 'qtext', text: q.number + '. ' + cleanText(q) }));
+
+        var name = 'q' + v.videoId + '_' + q.number;
+        if (q.choices && q.choices.length) {
+          q.choices.forEach(function (c) {
+            var radio = el('input', { type: 'radio', name: name, value: c.letter });
+            block.appendChild(el('label', { class: 'choice' }, [radio, el('span', { text: c.letter + '. ' + c.text })]));
+          });
+          inputs[q.number] = function () {
+            var checked = block.querySelector('input[name="' + name + '"]:checked');
+            return checked ? checked.value : '';
+          };
+        } else if (q.options && q.options.length) {
+          var select = el('select');
+          select.appendChild(el('option', { value: '', text: '— choisir —' }));
+          q.options.forEach(function (o) { select.appendChild(el('option', { value: o.letter, text: o.letter + ' — ' + o.text })); });
+          block.appendChild(select);
+          inputs[q.number] = function () { return select.value; };
+        } else {
+          var input = el('input', { type: 'text', placeholder: 'Ta réponse', autocomplete: 'off', autocapitalize: 'off' });
+          block.appendChild(input);
+          inputs[q.number] = function () { return input.value; };
+        }
+
+        var ans = el('div', { class: 'answer', hidden: '' });
+        block.appendChild(ans);
+        answerEls[q.number] = ans;
+        box.appendChild(block);
+      });
+
+      var scoreEl = el('div', { class: 'score', hidden: '' });
+      var shown = false;
+      var answers = null;
+
+      var btn = el('button', { class: 'wide', text: 'Afficher les réponses' });
+      btn.addEventListener('click', function () {
+        if (shown) {
+          Object.keys(answerEls).forEach(function (n) { answerEls[n].hidden = true; });
+          scoreEl.hidden = true;
+          btn.textContent = 'Afficher les réponses';
+          shown = false;
+          return;
+        }
+        var render = function () {
+          var good = 0, total = 0;
+          Object.keys(answerEls).forEach(function (n) {
+            var correct = answers[n];
+            var node = answerEls[n];
+            node.hidden = false;
+            if (!correct) { node.className = 'answer plain'; node.textContent = 'Réponse non disponible'; return; }
+            total++;
+            var mine = inputs[n]();
+            if (mine && norm(mine) === norm(correct)) {
+              good++;
+              node.className = 'answer right';
+              node.textContent = '✓ ' + correct;
+            } else if (mine) {
+              node.className = 'answer wrong';
+              node.textContent = '✗ Réponse : ' + correct;
+            } else {
+              node.className = 'answer plain';
+              node.textContent = 'Réponse : ' + correct;
+            }
+          });
+          scoreEl.hidden = false;
+          scoreEl.textContent = 'Score : ' + good + ' / ' + total;
+          btn.textContent = 'Masquer les réponses';
+          shown = true;
+        };
+        if (answers) { render(); return; }
+        api('/' + encodeURIComponent(v.videoId) + '/answers').then(function (r) {
+          answers = r.answers || {};
+          render();
+        });
+      });
+
+      box.appendChild(scoreEl);
+      box.appendChild(btn);
     });
   }
-});
 
-// ============================================================
-// TEST OCR UNIQUEMENT
-// ============================================================
-
-router.get('/ielts/test-ocr', async (req, res) => {
-  try {
-    const videoId = getVideoIdFromUrl(req.query.videoId);
-
-    if (!videoId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'videoId ou URL YouTube invalide'
-      });
-    }
-
-    const details = await getVideoDetails([videoId]);
-
-    if (!details || details.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'Vidéo YouTube introuvable'
-      });
-    }
-
-    const video = buildVideoObject(details[0]);
-
-    const result = await analyzeVideoWithOCR(video, {
-      debug: req.query.debug === '1'
+  // ---------- Boutons ----------
+  moreBtn.addEventListener('click', function () {
+    moreBtn.disabled = true;
+    api('/search-more', { method: 'POST', body: { count: 3 } }).then(function (r) {
+      if (r.ok === false) showStatus('⚠️ ' + (r.error || 'Erreur'));
+      refreshStatus();
+      schedulePoll();
     });
+  });
 
-    if (!result) {
-      return res.json({
-        ok: false,
-        videoId,
-        title: video.title,
-        error: 'Aucune question IELTS détectée par OCR'
-      });
-    }
-
-    const body = {
-      ok: true,
-      videoId,
-      title: video.title,
-      extractionMethod: result.extractionMethod,
-      questionCount: result.questionCount,
-      questions: result.questions,
-      missingNumbers: result.missingNumbers,
-      answers: result.answers,
-      groups: result.groups,
-      answerFrames: result.answerFrames
-    };
-
-    // ?debug=1 : ajoute les textes OCR bruts
-    if (req.query.debug === '1') {
-      body.questionZones = result.questionZones;
-      body.ocrMatches = result.ocrMatches;
-    }
-
-    return res.json(body);
-  } catch (error) {
-    console.error('❌ ERREUR TEST OCR:', error.message);
-
-    return res.status(500).json({
-      ok: false,
-      error: error.message || 'Erreur OCR'
+  addBtn.addEventListener('click', function () {
+    var value = addInput.value.trim();
+    if (!value) return;
+    api('/analyze', { method: 'POST', body: { videoId: value } }).then(function (r) {
+      if (r.ok === false) { showStatus('⚠️ ' + (r.error || 'Erreur')); return; }
+      if (r.status === 'exists') showStatus('Cette vidéo est déjà enregistrée.');
+      else addInput.value = '';
+      refreshStatus();
+      schedulePoll();
     });
-  }
-});
+  });
 
-// ============================================================
-// EXPORT
-// ============================================================
+  loadList().then(refreshStatus);
+})();
+</script>
+</body>
+</html>`;
+
+router.get('/ielts-app', (req, res) => {
+  res.type('html').send(PAGE);
+});
 
 module.exports = router;
