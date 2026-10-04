@@ -763,14 +763,170 @@ function isValidQuestionNumber(number) {
   return Number.isInteger(number) && number >= 1 && number <= MAX_QUESTION_NUMBER;
 }
 
+// ----- Questions dont le numéro est illisible (cases numérotées en image) -----
+
+const COMMON_TAIL_WORDS = new Set([
+  'for', 'and', 'the', 'to', 'of', 'in', 'on', 'at', 'by', 'or',
+  'are', 'is', 'was', 'will', 'with', 'from', 'that', 'this'
+]);
+
+// Texte après "(n)" : utile seulement s'il contient un vrai mot
+// (évite "i TUR", "occa"... issus des pointillés mal lus)
+function isUsefulTail(tail) {
+  if (!/\b[a-z]{3,}\b/.test(tail)) {
+    return false;
+  }
+
+  const tokens = tail.split(/\s+/).filter(Boolean);
+
+  if (
+    tokens.length === 1 &&
+    /^[a-z]{3,6}[.,]?$/.test(tokens[0]) &&
+    !COMMON_TAIL_WORDS.has(tokens[0].replace(/[.,]$/, ''))
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+// "Occupation H = ) RE" -> "Occupation" ; "Phone number Hl |)" -> "Phone number"
+function labelFromLine(line) {
+  if (line.length > 80) {
+    return null;
+  }
+
+  const letters = line.replace(/[^A-Za-z]/g, '');
+  const upper = line.replace(/[^A-Z]/g, '');
+
+  if (letters.length < 4) {
+    return null;
+  }
+
+  // Titres en majuscules (ex. "COURSE DETAILS")
+  if (upper.length / letters.length > 0.5) {
+    return null;
+  }
+
+  if (/read carefully|subscribe|like\b|respect/i.test(line)) {
+    return null;
+  }
+
+  const words = [];
+
+  for (const token of line.split(/\s+/)) {
+    if (/^[A-Z]?[a-z]{3,}$/.test(token)) {
+      words.push(token);
+    } else {
+      break;
+    }
+  }
+
+  if (words.length === 0 || !/^[A-Z]/.test(words[0])) {
+    return null;
+  }
+
+  return words.join(' ');
+}
+
+// Une ligne "Occupation ..." sans numéro lisible, située entre (2) et (4),
+// est forcément la question 3 : on ne le fait que pour les numéros manquants.
+function inferMissingFromLabels(items, hint, result, found) {
+  let i = 0;
+  let prevNumber = null;
+  let prevQuestion = null;
+
+  while (i < items.length) {
+    const item = items[i];
+
+    if (item.number !== undefined) {
+      prevNumber = item.number;
+      prevQuestion = item.question;
+      i++;
+      continue;
+    }
+
+    const run = [];
+    let j = i;
+
+    while (j < items.length && items[j].label !== undefined) {
+      run.push(items[j]);
+      j++;
+    }
+
+    const next = j < items.length ? items[j] : null;
+    const nextNumber = next ? next.number : null;
+    const count = run.length;
+
+    let start = null;
+
+    if (prevNumber !== null && nextNumber !== null) {
+      if (nextNumber - prevNumber - 1 === count) {
+        start = prevNumber + 1;
+      }
+    } else if (nextNumber !== null) {
+      start = nextNumber - count;
+    } else if (prevNumber !== null) {
+      start = prevNumber + 1;
+    }
+
+    if (
+      start !== null &&
+      start >= 1 &&
+      start + count - 1 <= MAX_QUESTION_NUMBER
+    ) {
+      let allMissing = true;
+
+      for (let k = 0; k < count; k++) {
+        if (!hint.has(start + k)) {
+          allMissing = false;
+        }
+      }
+
+      if (allMissing) {
+        const neighbor = prevQuestion || (next && next.question) || {};
+
+        run.forEach((entry, k) => {
+          const number = start + k;
+
+          const question = makeOcrQuestion(
+            number,
+            `${entry.label} (${number})`,
+            result,
+            {
+              instructions: neighbor.instructions,
+              context: neighbor.context
+            }
+          );
+
+          question.inferred = true;
+
+          found.push(question);
+        });
+      }
+    }
+
+    i = j;
+  }
+}
+
 // Analyse le texte OCR d'UNE frame et renvoie les questions candidates
-function parseFrameQuestions(result) {
+function parseFrameQuestions(result, missingHint = null) {
   const lines = result.text
     .split('\n')
     .map(line => line.replace(/\s+/g, ' ').trim())
     .filter(Boolean);
 
   const found = [];
+  const items = []; // questions et étiquettes, dans l'ordre de lecture
+
+  const recordLabel = line => {
+    const label = labelFromLine(line);
+
+    if (label) {
+      items.push({ label });
+    }
+  };
 
   let instructions = '';
   let lastWasInstruction = false;
@@ -862,6 +1018,7 @@ function parseFrameQuestions(result) {
         );
 
         found.push(lastQuestion);
+        items.push({ number: lastQuestion.number, question: lastQuestion });
       }
 
       groupHasQuestion = true;
@@ -870,7 +1027,7 @@ function parseFrameQuestions(result) {
       // (évite les caractères parasites type "i TUR")
       const tail = line.slice(cursor).trim();
 
-      if (tail && lastQuestion && /\b[a-z]{3,}\b/.test(tail)) {
+      if (tail && lastQuestion && isUsefulTail(tail)) {
         lastQuestion.text = cleanQuestionText(`${lastQuestion.text} ${tail}`);
       }
 
@@ -899,6 +1056,7 @@ function parseFrameQuestions(result) {
       );
 
       found.push(current);
+      items.push({ number: current.number, question: current });
 
       groupHasQuestion = true;
       allowContinuation = true;
@@ -942,7 +1100,11 @@ function parseFrameQuestions(result) {
         current.text.length < 500
       ) {
         current.text = cleanQuestionText(`${current.text} ${line}`);
+
+        continue;
       }
+
+      recordLabel(line);
 
       continue;
     }
@@ -956,6 +1118,12 @@ function parseFrameQuestions(result) {
     ) {
       groupContext.push(line);
     }
+
+    recordLabel(line);
+  }
+
+  if (missingHint && missingHint.size > 0) {
+    inferMissingFromLabels(items, missingHint, result, found);
   }
 
   return found;
@@ -1008,7 +1176,7 @@ function isAnswerKeyFrame(result, maxTimestamp) {
   return result.timestamp >= maxTimestamp * 0.6;
 }
 
-function collectAnswerFrames(ocrResults, maxTimestamp) {
+function collectAnswerFrames(ocrResults, maxTimestamp, limit = 3) {
   const seen = new Set();
   const frames = [];
 
@@ -1031,12 +1199,96 @@ function collectAnswerFrames(ocrResults, maxTimestamp) {
       text: result.text
     });
 
-    if (frames.length >= 3) {
+    if (frames.length >= limit) {
       break;
     }
   }
 
   return frames;
+}
+
+// Lit la liste des réponses affichée en fin de vidéo (2 colonnes : 1-20 et 21-40)
+function parseAnswerKey(answerFrames) {
+  const votes = new Map();
+
+  const cleanAnswer = text =>
+    String(text || '')
+      .replace(/^[\s\W_]+|[\s\W_]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const vote = (number, answer) => {
+    const value = cleanAnswer(answer);
+
+    if (!value || value.length > 60) {
+      return;
+    }
+
+    if (!votes.has(number)) {
+      votes.set(number, new Map());
+    }
+
+    const counts = votes.get(number);
+
+    counts.set(value, (counts.get(value) || 0) + 1);
+  };
+
+  for (const frame of answerFrames) {
+    const lines = frame.text
+      .split('\n')
+      .map(line => line.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    for (const line of lines) {
+      for (let n = 1; n <= 20; n++) {
+        // Colonne de droite : "... 22. what though"
+        const rightMatch = line.match(
+          new RegExp(`(?:^|\\s)${n + 20}\\s*[\\.,]\\s*(.+)$`)
+        );
+
+        let leftPart = line;
+
+        if (rightMatch) {
+          vote(n + 20, rightMatch[1]);
+          leftPart = line.slice(0, rightMatch.index);
+        }
+
+        // Colonne de gauche : "2. 25" ou "3 accountant"
+        const leftMatch = leftPart.match(
+          new RegExp(`^\\W*${n}\\s*[\\.,]?\\s+(.+)$`)
+        );
+
+        if (leftMatch) {
+          vote(n, leftMatch[1]);
+        }
+      }
+    }
+  }
+
+  const answers = {};
+
+  for (const [number, counts] of votes) {
+    let best = null;
+    let bestScore = -1;
+
+    for (const [value, count] of counts) {
+      const score =
+        count * 10 +
+        (/^[A-E]$/.test(value) ? 5 : 0) +
+        Math.min(value.length, 20) / 100;
+
+      if (score > bestScore) {
+        bestScore = score;
+        best = value;
+      }
+    }
+
+    if (best) {
+      answers[number] = best;
+    }
+  }
+
+  return answers;
 }
 
 // Garde UNE seule version par numéro de question (la plus fiable)
@@ -1141,7 +1393,38 @@ function extractQuestionsFromOcr(ocrResults, maxTimestamp = 0) {
     found.push(...parseFrameQuestions(result));
   }
 
-  return consolidateQuestions(found);
+  const firstPass = consolidateQuestions(found);
+
+  // Numéros non retrouvés : 2e passe qui les déduit des lignes sans numéro lisible
+  const missing = new Set();
+
+  for (let n = 1; n <= MAX_QUESTION_NUMBER; n++) {
+    if (!firstPass.some(question => question.number === n)) {
+      missing.add(n);
+    }
+  }
+
+  if (missing.size === 0) {
+    return firstPass;
+  }
+
+  const inferred = [];
+
+  for (const result of ocrResults) {
+    if (!result.questionLike) {
+      continue;
+    }
+
+    if (isAnswerKeyFrame(result, maxTimestamp)) {
+      continue;
+    }
+
+    inferred.push(
+      ...parseFrameQuestions(result, missing).filter(question => question.inferred)
+    );
+  }
+
+  return consolidateQuestions(found.concat(inferred));
 }
 
 // ============================================================
@@ -1367,11 +1650,20 @@ async function analyzeVideoWithOCR(video, options = {}) {
 
     const groups = buildQuestionGroups(ocrResults, maxTimestamp);
 
-    const answerFrames = collectAnswerFrames(ocrResults, maxTimestamp);
+    const answerFrames = collectAnswerFrames(ocrResults, maxTimestamp, 12);
+
+    const answers = parseAnswerKey(answerFrames);
 
     const validQuestions = questions.filter(
       question => question.text && question.text.length >= 4
     );
+
+    // Réponse lue dans le corrigé de fin de vidéo (OCR : peut contenir des erreurs)
+    for (const question of validQuestions) {
+      if (answers[question.number]) {
+        question.answer = answers[question.number];
+      }
+    }
 
     if (validQuestions.length === 0) {
       console.log('❌ Aucune question IELTS détectée par OCR');
@@ -1400,8 +1692,9 @@ async function analyzeVideoWithOCR(video, options = {}) {
       questionCount: validQuestions.length,
       questions: validQuestions,
       missingNumbers,
+      answers,
       groups,
-      answerFrames
+      answerFrames: answerFrames.slice(0, 2)
     };
 
     // Données brutes volumineuses : seulement en mode debug (?debug=1)
@@ -1714,6 +2007,7 @@ router.get('/ielts/test-ocr', async (req, res) => {
       questionCount: result.questionCount,
       questions: result.questions,
       missingNumbers: result.missingNumbers,
+      answers: result.answers,
       groups: result.groups,
       answerFrames: result.answerFrames
     };
