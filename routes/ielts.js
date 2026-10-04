@@ -7,7 +7,8 @@ const router = express.Router();
 // CONFIGURATION
 // ============================================================================
 
-const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3';
+const YOUTUBE_API_URL =
+  'https://www.googleapis.com/youtube/v3';
 
 const TRANSCRIPT_API_URL =
   'https://www.youtubetranscript.dev/api/v2/transcribe';
@@ -15,85 +16,27 @@ const TRANSCRIPT_API_URL =
 const ANTHROPIC_URL =
   'https://api.anthropic.com/v1/messages';
 
-const ANTHROPIC_MODEL = 'claude-sonnet-5';
+const CLAUDE_MODEL =
+  'claude-sonnet-5';
 
 // ============================================================================
-// REQUÊTES IELTS
+// RECHERCHES IELTS LISTENING
 // ============================================================================
 
-const SKILL_QUERIES = {
-  all: [
-    'IELTS practice',
-    'IELTS test',
-    'IELTS preparation',
-    'IELTS Academic',
-    'IELTS General Training'
-  ],
-
-  listening: [
-    'IELTS Listening test with questions',
-    'IELTS Listening practice test questions',
-    'IELTS Listening full test questions',
-    'IELTS Listening practice Cambridge questions',
-    'IELTS Listening test section 1 2 3 4'
-  ],
-
-  speaking: [
-    'IELTS Speaking practice',
-    'IELTS Speaking test',
-    'IELTS Speaking questions'
-  ],
-
-  reading: [
-    'IELTS Reading practice',
-    'IELTS Reading test',
-    'IELTS Reading questions'
-  ],
-
-  writing: [
-    'IELTS Writing practice',
-    'IELTS Writing task 1',
-    'IELTS Writing task 2'
-  ],
-
-  vocabulary: [
-    'IELTS vocabulary',
-    'IELTS vocabulary practice',
-    'IELTS vocabulary preparation'
-  ],
-
-  tips: [
-    'IELTS tips',
-    'IELTS preparation tips',
-    'IELTS strategies'
-  ]
-};
-
-// ============================================================================
-// FILTRES
-// ============================================================================
-
-const EXCLUDED_TERMS = [
-  'shorts',
-  'music video',
-  'lyrics',
-  'lyric',
-  'karaoke',
-  'remix',
-  'trailer',
-  'teaser',
-  'livestream',
-  'live stream',
-  'reaction',
-  'reacts',
-  'song',
-  'songs',
-  'movie',
-  'film',
-  'podcast',
-  'funny',
-  'meme'
+const LISTENING_QUERIES = [
+  'IELTS Listening test with questions',
+  'IELTS Listening practice test questions',
+  'IELTS Listening full test questions',
+  'IELTS Listening practice Cambridge questions',
+  'IELTS Listening test section 1 2 3 4',
+  'IELTS Listening test answers questions',
+  'IELTS Listening actual test questions',
+  'IELTS Listening mock test questions'
 ];
+
+// ============================================================================
+// TERMES IELTS
+// ============================================================================
 
 const IELTS_TERMS = [
   'ielts',
@@ -103,20 +46,151 @@ const IELTS_TERMS = [
   'ielts test',
   'ielts practice',
   'ielts listening',
-  'ielts speaking',
-  'ielts reading',
-  'ielts writing',
+  'ielts listening test',
+  'ielts listening practice',
+  'ielts mock test',
   'ielts exam',
-  'ielts section'
+  'cambridge ielts'
 ];
 
 // ============================================================================
-// UTILITAIRES
+// TERMES À EXCLURE
+// ============================================================================
+
+const EXCLUDED_TERMS = [
+  'shorts',
+  '#shorts',
+  'music video',
+  'lyrics',
+  'karaoke',
+  'remix',
+  'trailer',
+  'teaser',
+  'livestream',
+  'live stream',
+  'live',
+  'song',
+  'songs',
+  'movie',
+  'film',
+  'podcast',
+  'reaction',
+  'reacting'
+];
+
+// ============================================================================
+// MARQUEURS DE QUESTIONS IELTS LISTENING
+// ============================================================================
+
+const QUESTION_MARKERS = [
+  // Numérotation
+  'question 1',
+  'question 2',
+  'question 3',
+  'question 4',
+  'question 5',
+  'question 6',
+  'question 7',
+  'question 8',
+  'question 9',
+  'question 10',
+  'question 11',
+  'question 12',
+  'question 13',
+  'question 14',
+  'question 15',
+  'question 16',
+  'question 17',
+  'question 18',
+  'question 19',
+  'question 20',
+  'question 21',
+  'question 22',
+  'question 23',
+  'question 24',
+  'question 25',
+  'question 26',
+  'question 27',
+  'question 28',
+  'question 29',
+  'question 30',
+  'question 31',
+  'question 32',
+  'question 33',
+  'question 34',
+  'question 35',
+  'question 36',
+  'question 37',
+  'question 38',
+  'question 39',
+  'question 40',
+
+  // Plages
+  'questions 1-5',
+  'questions 1 to 5',
+  'questions 1–5',
+  'questions 6-10',
+  'questions 6 to 10',
+  'questions 6–10',
+  'questions 11-15',
+  'questions 11 to 15',
+  'questions 11–15',
+  'questions 16-20',
+  'questions 16 to 20',
+  'questions 16–20',
+  'questions 21-25',
+  'questions 21 to 25',
+  'questions 21–25',
+  'questions 26-30',
+  'questions 26 to 30',
+  'questions 26–30',
+  'questions 31-35',
+  'questions 31 to 35',
+  'questions 31–35',
+  'questions 36-40',
+  'questions 36 to 40',
+  'questions 36–40',
+
+  // Instructions IELTS
+  'choose the correct answer',
+  'choose two answers',
+  'choose the correct letter',
+  'choose the correct letters',
+
+  'complete the form',
+  'complete the notes',
+  'complete the table',
+  'complete the sentence',
+  'complete the summary',
+  'complete the flow-chart',
+  'complete the flow chart',
+
+  'write one word',
+  'write no more than one word',
+  'write no more than two words',
+  'write no more than three words',
+
+  'match',
+  'matching',
+
+  'which option',
+  'which of the following',
+
+  'section 1',
+  'section 2',
+  'section 3',
+  'section 4'
+];
+
+// ============================================================================
+// OUTILS
 // ============================================================================
 
 function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -131,99 +205,134 @@ function containsAny(text, terms) {
   );
 }
 
-function getVideoIdFromUrl(value) {
-  if (!value) {
+function getVideoIdFromUrl(input) {
+  if (!input) {
     return null;
   }
 
-  const input = String(value).trim();
+  const value = String(input).trim();
 
-  if (
-    /^[a-zA-Z0-9_-]{11}$/.test(input)
-  ) {
-    return input;
+  // ID direct
+  if (/^[a-zA-Z0-9_-]{11}$/.test(value)) {
+    return value;
   }
 
   try {
-    const url = new URL(input);
+    const url = new URL(value);
+
+    // youtube.com/watch?v=
+    const queryId =
+      url.searchParams.get('v');
 
     if (
-      url.hostname.includes('youtu.be')
+      queryId &&
+      /^[a-zA-Z0-9_-]{11}$/.test(queryId)
     ) {
-      return url.pathname
-        .replace('/', '')
-        .substring(0, 11);
+      return queryId;
     }
 
+    // youtu.be/VIDEO_ID
     if (
-      url.hostname.includes('youtube.com') ||
-      url.hostname.includes('m.youtube.com')
+      url.hostname === 'youtu.be' ||
+      url.hostname.endsWith('youtu.be')
     ) {
       const id =
-        url.searchParams.get('v');
+        url.pathname
+          .replace(/^\/+/, '')
+          .split('/')[0];
 
-      if (id) {
-        return id.substring(0, 11);
+      if (
+        /^[a-zA-Z0-9_-]{11}$/.test(id)
+      ) {
+        return id;
       }
     }
-  } catch (_) {
-    return null;
+
+    // /shorts/VIDEO_ID
+    const shortsMatch =
+      url.pathname.match(
+        /\/shorts\/([a-zA-Z0-9_-]{11})/
+      );
+
+    if (shortsMatch) {
+      return shortsMatch[1];
+    }
+
+    // /embed/VIDEO_ID
+    const embedMatch =
+      url.pathname.match(
+        /\/embed\/([a-zA-Z0-9_-]{11})/
+      );
+
+    if (embedMatch) {
+      return embedMatch[1];
+    }
+
+  } catch (error) {
+    // Rien
   }
 
   return null;
 }
 
 // ============================================================================
-// TIMESTAMP
+// DURÉE ISO 8601 YOUTUBE -> SECONDES
 // ============================================================================
 
-function formatTimestamp(value) {
-  const number = Number(value);
-
-  if (!Number.isFinite(number)) {
-    return '00:00';
+function parseDuration(duration) {
+  if (!duration) {
+    return 0;
   }
 
-  /*
-   * Selon la réponse reçue, la valeur peut être en secondes
-   * ou en millisecondes.
-   */
-  const seconds =
-    number > 100000
-      ? number / 1000
-      : number;
-
-  const totalSeconds =
-    Math.max(
-      0,
-      Math.floor(seconds)
+  const match =
+    String(duration).match(
+      /P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/
     );
 
+  if (!match) {
+    return 0;
+  }
+
+  const days =
+    Number(match[1] || 0);
+
   const hours =
-    Math.floor(
-      totalSeconds / 3600
+    Number(match[2] || 0);
+
+  const minutes =
+    Number(match[3] || 0);
+
+  const seconds =
+    Number(match[4] || 0);
+
+  return (
+    days * 86400 +
+    hours * 3600 +
+    minutes * 60 +
+    seconds
+  );
+}
+
+// ============================================================================
+// FORMATAGE TEMPS
+// ============================================================================
+
+function formatTime(seconds) {
+  const total =
+    Math.max(
+      0,
+      Math.floor(
+        Number(seconds) || 0
+      )
     );
 
   const minutes =
-    Math.floor(
-      (totalSeconds % 3600) / 60
-    );
+    Math.floor(total / 60);
 
   const secs =
-    totalSeconds % 60;
+    total % 60;
 
-  if (hours > 0) {
-    return [
-      String(hours).padStart(2, '0'),
-      String(minutes).padStart(2, '0'),
-      String(secs).padStart(2, '0')
-    ].join(':');
-  }
-
-  return [
-    String(minutes).padStart(2, '0'),
-    String(secs).padStart(2, '0')
-  ].join(':');
+  return `${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
 // ============================================================================
@@ -233,146 +342,268 @@ function formatTimestamp(value) {
 async function searchYouTube(query) {
   if (!process.env.YOUTUBE_API_KEY) {
     throw new Error(
-      'YOUTUBE_API_KEY est manquante'
+      'YOUTUBE_API_KEY manquante'
     );
   }
 
-  const response = await axios.get(
-    `${YOUTUBE_API_URL}/search`,
-    {
-      params: {
-        part: 'snippet',
+  const response =
+    await axios.get(
+      `${YOUTUBE_API_URL}/search`,
+      {
+        params: {
+          part: 'snippet',
+          q: query,
+          type: 'video',
 
-        q: query,
+          maxResults: 50,
 
-        key:
-          process.env.YOUTUBE_API_KEY,
+          // IMPORTANT :
+          // on accepte toutes les durées
+          // car certains tests IELTS peuvent
+          // dépasser les anciennes limites.
+          videoDuration: 'any',
 
-        type: 'video',
+          videoEmbeddable: 'true',
+          videoSyndicated: 'true',
 
-        maxResults: 50,
+          relevanceLanguage: 'en',
 
-        /*
-         * IMPORTANT :
-         * Pour le Listening, on ne veut pas
-         * exclure les vidéos courtes ou longues
-         * avant de les analyser.
-         */
-        videoDuration: 'any',
+          regionCode: 'US',
 
-        videoEmbeddable: 'true',
+          key: process.env.YOUTUBE_API_KEY
+        },
 
-        videoSyndicated: 'true',
-
-        relevanceLanguage: 'en',
-
-        regionCode: 'US'
-      },
-
-      timeout: 30000
-    }
-  );
+        timeout: 20000
+      }
+    );
 
   return response.data.items || [];
 }
 
 // ============================================================================
-// DÉTAILS VIDÉOS
+// YOUTUBE DETAILS
 // ============================================================================
 
 async function getVideoDetails(videoIds) {
-  if (
-    !videoIds ||
-    videoIds.length === 0
-  ) {
+  if (!process.env.YOUTUBE_API_KEY) {
+    throw new Error(
+      'YOUTUBE_API_KEY manquante'
+    );
+  }
+
+  const ids =
+    Array.isArray(videoIds)
+      ? videoIds
+      : [videoIds];
+
+  const cleanIds =
+    ids
+      .filter(Boolean)
+      .map(String)
+      .filter(id =>
+        /^[a-zA-Z0-9_-]{11}$/.test(id)
+      );
+
+  if (cleanIds.length === 0) {
     return [];
   }
 
-  const uniqueIds = [
-    ...new Set(videoIds)
-  ];
+  const response =
+    await axios.get(
+      `${YOUTUBE_API_URL}/videos`,
+      {
+        params: {
+          part:
+            'snippet,contentDetails,status,statistics',
 
-  const response = await axios.get(
-    `${YOUTUBE_API_URL}/videos`,
-    {
-      params: {
-        part:
-          'snippet,contentDetails,status,statistics',
+          id: cleanIds.join(','),
 
-        id:
-          uniqueIds.join(','),
+          key:
+            process.env.YOUTUBE_API_KEY
+        },
 
-        key:
-          process.env.YOUTUBE_API_KEY
-      },
-
-      timeout: 30000
-    }
-  );
+        timeout: 20000
+      }
+    );
 
   return response.data.items || [];
 }
 
 // ============================================================================
-// DURÉE
+// CONSTRUIRE UN OBJET VIDÉO
 // ============================================================================
 
-function parseDuration(isoDuration) {
-  if (!isoDuration) {
-    return 0;
-  }
+function buildVideoObject(item) {
+  const snippet =
+    item.snippet || {};
 
-  const match =
-    isoDuration.match(
-      /PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/
+  const contentDetails =
+    item.contentDetails || {};
+
+  const statistics =
+    item.statistics || {};
+
+  const status =
+    item.status || {};
+
+  const videoId =
+    item.id || '';
+
+  const title =
+    snippet.title || '';
+
+  const description =
+    snippet.description || '';
+
+  const durationSeconds =
+    parseDuration(
+      contentDetails.duration
     );
 
-  if (!match) {
-    return 0;
+  const language =
+    snippet.defaultLanguage ||
+    snippet.defaultAudioLanguage ||
+    '';
+
+  const views =
+    Number(
+      statistics.viewCount || 0
+    );
+
+  const likes =
+    Number(
+      statistics.likeCount || 0
+    );
+
+  return {
+    videoId,
+
+    title,
+
+    description,
+
+    channelTitle:
+      snippet.channelTitle || '',
+
+    publishedAt:
+      snippet.publishedAt || null,
+
+    duration:
+      contentDetails.duration || null,
+
+    durationSeconds,
+
+    language:
+      language || 'en',
+
+    thumbnail:
+      snippet.thumbnails?.high?.url ||
+      snippet.thumbnails?.medium?.url ||
+      snippet.thumbnails?.default?.url ||
+      null,
+
+    views,
+
+    likes,
+
+    quality: calculateQuality({
+      views,
+      likes,
+      title,
+      description,
+      durationSeconds
+    }),
+
+    skill: 'listening',
+
+    privacyStatus:
+      status.privacyStatus || null,
+
+    embeddable:
+      status.embeddable !== false
+  };
+}
+
+// ============================================================================
+// SCORE QUALITÉ
+// ============================================================================
+
+function calculateQuality({
+  views,
+  likes,
+  title,
+  description,
+  durationSeconds
+}) {
+  let score = 0;
+
+  if (containsAny(title, IELTS_TERMS)) {
+    score += 40;
   }
 
-  const hours =
-    Number(match[1] || 0);
+  if (
+    containsAny(
+      title,
+      [
+        'listening',
+        'questions',
+        'test',
+        'practice'
+      ]
+    )
+  ) {
+    score += 20;
+  }
 
-  const minutes =
-    Number(match[2] || 0);
+  if (description.length >= 20) {
+    score += 10;
+  }
 
-  const seconds =
-    Number(match[3] || 0);
+  if (durationSeconds >= 300) {
+    score += 10;
+  }
 
-  return (
-    hours * 3600 +
-    minutes * 60 +
-    seconds
+  if (views > 1000) {
+    score += 5;
+  }
+
+  if (views > 10000) {
+    score += 5;
+  }
+
+  if (likes > 100) {
+    score += 5;
+  }
+
+  if (likes > 1000) {
+    score += 5;
+  }
+
+  return Math.min(
+    100,
+    score
   );
 }
 
 // ============================================================================
-// FILTRAGE DES VIDÉOS
+// FILTRE DES VIDÉOS DE RECHERCHE
+//
+// IMPORTANT : ce filtre sert uniquement aux résultats de recherche.
+// Le test direct /ielts/test-video NE PASSE PAS par cette fonction.
 // ============================================================================
 
-function processVideos(items, skill) {
-  const processed = [];
+function processVideos(items) {
+  const result = [];
 
-  for (const video of items) {
+  for (const item of items) {
     const snippet =
-      video.snippet || {};
+      item.snippet || {};
 
     const status =
-      video.status || {};
-
-    const statistics =
-      video.statistics || {};
+      item.status || {};
 
     const contentDetails =
-      video.contentDetails || {};
-
-    const videoId =
-      video.id;
-
-    if (!videoId) {
-      continue;
-    }
+      item.contentDetails || {};
 
     const title =
       snippet.title || '';
@@ -383,15 +614,9 @@ function processVideos(items, skill) {
     const combinedText =
       `${title} ${description}`;
 
-    const normalizedTitle =
-      normalizeText(title);
-
-    const normalizedDescription =
-      normalizeText(description);
-
-    // ================================================================
-    // IELTS obligatoire
-    // ================================================================
+    // ----------------------------------------------------------
+    // IELTS obligatoire pour les résultats de recherche
+    // ----------------------------------------------------------
 
     if (
       !containsAny(
@@ -399,304 +624,114 @@ function processVideos(items, skill) {
         IELTS_TERMS
       )
     ) {
-      console.log(
-        `⏭️ ${videoId}: pas de terme IELTS`
-      );
-
       continue;
     }
 
-    // ================================================================
+    // ----------------------------------------------------------
     // Exclusions
-    // ================================================================
+    // ----------------------------------------------------------
 
     if (
       containsAny(
-        `${normalizedTitle} ${normalizedDescription}`,
+        combinedText,
         EXCLUDED_TERMS
       )
     ) {
-      console.log(
-        `⏭️ ${videoId}: terme exclu`
-      );
-
       continue;
     }
 
-    // ================================================================
-    // Confidentialité
-    // ================================================================
+    // ----------------------------------------------------------
+    // Public
+    // ----------------------------------------------------------
 
     if (
       status.privacyStatus &&
       status.privacyStatus !== 'public'
     ) {
-      console.log(
-        `⏭️ ${videoId}: vidéo non publique`
-      );
-
       continue;
     }
 
-    // ================================================================
+    // ----------------------------------------------------------
     // Embeddable
-    // ================================================================
+    // ----------------------------------------------------------
 
     if (
       status.embeddable === false
     ) {
-      console.log(
-        `⏭️ ${videoId}: non embeddable`
-      );
-
       continue;
     }
 
-    // ================================================================
-    // LANGUE
-    // ================================================================
+    // ----------------------------------------------------------
+    // Langue
+    //
+    // On rejette uniquement une langue explicitement
+    // non anglaise.
+    // ----------------------------------------------------------
 
     const language =
       snippet.defaultLanguage ||
       snippet.defaultAudioLanguage ||
       '';
 
-    /*
-     * Pour IELTS Listening :
-     *
-     * on ne rejette PAS une vidéo simplement
-     * parce que YouTube n'a pas renseigné
-     * la langue.
-     *
-     * Si une langue est explicitement déclarée
-     * et n'est pas anglaise, on la rejette.
-     */
-
     if (
       language &&
-      !language
-        .toLowerCase()
-        .startsWith('en')
-    ) {
-      console.log(
-        `⏭️ ${videoId}: langue déclarée non anglaise (${language})`
-      );
-
-      continue;
-    }
-
-    // ================================================================
-    // TITRE
-    // ================================================================
-
-    if (
-      title.trim().length < 8
+      !normalizeText(language).startsWith('en')
     ) {
       continue;
     }
 
-    // ================================================================
-    // DESCRIPTION
-    // ================================================================
-
-    /*
-     * IMPORTANT :
-     * Pour Listening, une description courte
-     * ne doit PAS éliminer la vidéo.
-     *
-     * Une vidéo IELTS peut avoir une description
-     * très courte tout en contenant réellement
-     * les questions.
-     */
-
-    if (
-      skill !== 'listening' &&
-      description.trim().length < 20
-    ) {
-      continue;
-    }
-
-    // ================================================================
-    // DURÉE
-    // ================================================================
+    // ----------------------------------------------------------
+    // Durée
+    // ----------------------------------------------------------
 
     const durationSeconds =
       parseDuration(
         contentDetails.duration
       );
 
-    /*
-     * Pour Listening :
-     *
-     * on accepte une plage beaucoup plus large.
-     * La vraie validation se fera avec le transcript.
-     *
-     * Cela permet de ne pas perdre une vidéo
-     * simplement parce que sa durée est différente.
-     */
+    // ----------------------------------------------------------
+    // Objet
+    // ----------------------------------------------------------
 
+    const video =
+      buildVideoObject(item);
+
+    // Pour la recherche IELTS :
+    // une vidéo extrêmement courte n'est généralement
+    // pas un vrai test Listening.
     if (
-      skill !== 'listening'
+      durationSeconds > 0 &&
+      durationSeconds < 60
     ) {
-      if (
-        durationSeconds < 120 ||
-        durationSeconds > 3600
-      ) {
-        continue;
-      }
-    } else {
-      /*
-       * Sécurité minimale :
-       * on élimine seulement les vidéos
-       * totalement aberrantes.
-       */
-      if (
-        durationSeconds > 0 &&
-        durationSeconds > 7200
-      ) {
-        console.log(
-          `⏭️ ${videoId}: vidéo de plus de 2 heures`
-        );
-
-        continue;
-      }
+      continue;
     }
 
-    // ================================================================
-    // SCORE
-    // ================================================================
-
-    const views =
-      Number(
-        statistics.viewCount || 0
-      );
-
-    const likes =
-      Number(
-        statistics.likeCount || 0
-      );
-
-    let quality = 30;
-
-    quality += Math.min(
-      25,
-      Math.log10(
-        views + 1
-      ) * 5
-    );
-
-    quality += Math.min(
-      15,
-      Math.log10(
-        likes + 1
-      ) * 5
-    );
-
-    if (
-      normalizedTitle.includes(
-        'listening'
-      )
-    ) {
-      quality += 15;
-    }
-
-    if (
-      normalizedTitle.includes(
-        'test'
-      )
-    ) {
-      quality += 10;
-    }
-
-    if (
-      normalizedTitle.includes(
-        'practice'
-      )
-    ) {
-      quality += 5;
-    }
-
-    if (
-      normalizedTitle.includes(
-        'questions'
-      )
-    ) {
-      quality += 10;
-    }
-
-    if (
-      normalizedTitle.includes(
-        'section'
-      )
-    ) {
-      quality += 5;
-    }
-
-    processed.push({
-      videoId,
-
-      title,
-
-      description,
-
-      channelTitle:
-        snippet.channelTitle || '',
-
-      publishedAt:
-        snippet.publishedAt || null,
-
-      duration:
-        contentDetails.duration ||
-        null,
-
-      durationSeconds,
-
-      language:
-        language || 'en',
-
-      thumbnail:
-        snippet.thumbnails?.high?.url ||
-        snippet.thumbnails?.medium?.url ||
-        snippet.thumbnails?.default?.url ||
-        null,
-
-      views,
-
-      likes,
-
-      quality:
-        Math.round(quality),
-
-      skill
-    });
+    result.push(video);
   }
 
-  processed.sort(
-    (a, b) =>
-      b.quality - a.quality
-  );
-
-  return processed;
+  return result;
 }
 
 // ============================================================================
-// TRANSCRIPT COMPLET + TIMESTAMPS
+// TRANSCRIPT
 // ============================================================================
 
 async function getTranscript(videoId) {
+  if (!videoId) {
+    return null;
+  }
+
+  if (
+    !process.env.YOUTUBE_TRANSCRIPT_API_KEY
+  ) {
+    throw new Error(
+      'YOUTUBE_TRANSCRIPT_API_KEY manquante'
+    );
+  }
+
   try {
-    if (
-      !process.env.YOUTUBE_TRANSCRIPT_API_KEY
-    ) {
-      console.error(
-        '❌ YOUTUBE_TRANSCRIPT_API_KEY est manquante'
-      );
-
-      return null;
-    }
-
     console.log(
-      `📝 Demande transcript: ${videoId}`
+      `\n📝 Transcript demandé pour ${videoId}`
     );
 
     const response =
@@ -709,6 +744,9 @@ async function getTranscript(videoId) {
 
           source: 'auto',
 
+          // IMPORTANT :
+          // on demande les timestamps afin de savoir
+          // à quel moment les questions apparaissent.
           format: {
             timestamp: true,
             paragraphs: true,
@@ -728,137 +766,187 @@ async function getTranscript(videoId) {
         }
       );
 
-    const result =
-      response.data;
+    const data =
+      response.data || {};
 
-    if (!result) {
-      console.log(
-        `⚠️ Réponse transcript vide: ${videoId}`
-      );
+    console.log(
+      `📥 Réponse transcript reçue`
+    );
 
-      return null;
+    console.log(
+      `📊 Status: ${
+        data.status || 'inconnu'
+      }`
+    );
+
+    // ----------------------------------------------------------
+    // Recherche du texte
+    // ----------------------------------------------------------
+
+    let text = '';
+
+    if (
+      typeof data.text === 'string'
+    ) {
+      text = data.text;
     }
 
     if (
-      result.status !== 'completed'
+      !text &&
+      typeof data.transcript === 'string'
     ) {
-      console.log(
-        `⚠️ Transcript non terminé: ${videoId}`,
-        result.status
-      );
-
-      return null;
+      text =
+        data.transcript;
     }
 
-    const transcript =
-      result.data?.transcript;
-
-    if (!transcript) {
-      console.log(
-        `⚠️ Aucun transcript: ${videoId}`
-      );
-
-      return null;
+    if (
+      !text &&
+      Array.isArray(data.segments)
+    ) {
+      text =
+        data.segments
+          .map(segment =>
+            segment.text || ''
+          )
+          .join(' ');
     }
 
-    const text =
-      transcript.text || '';
+    if (
+      !text &&
+      Array.isArray(data.transcript)
+    ) {
+      text =
+        data.transcript
+          .map(segment =>
+            segment.text || ''
+          )
+          .join(' ');
+    }
 
-    const rawSegments =
-      Array.isArray(
-        transcript.segments
-      )
-        ? transcript.segments
-        : [];
+    // ----------------------------------------------------------
+    // Segments
+    // ----------------------------------------------------------
 
-    console.log(
-      `📝 Transcript ${videoId}: ` +
-      `${text.length} caractères`
-    );
+    let rawSegments = [];
 
-    console.log(
-      `⏱️ ${rawSegments.length} segments reçus`
-    );
+    if (
+      Array.isArray(data.segments)
+    ) {
+      rawSegments =
+        data.segments;
+    } else if (
+      Array.isArray(data.transcript)
+    ) {
+      rawSegments =
+        data.transcript;
+    } else if (
+      Array.isArray(data.items)
+    ) {
+      rawSegments =
+        data.items;
+    }
 
     const segments =
       rawSegments
-        .map(
-          (segment, index) => {
-            const start =
-              Number(
-                segment.start
-              );
+        .map(segment => {
+          const segmentText =
+            String(
+              segment.text ||
+              segment.content ||
+              ''
+            ).trim();
 
-            const end =
-              Number(
-                segment.end
-              );
+          const start =
+            Number(
+              segment.start ??
+              segment.startTime ??
+              segment.offset ??
+              0
+            );
 
-            return {
-              index,
+          const end =
+            Number(
+              segment.end ??
+              segment.endTime ??
+              (
+                start +
+                Number(
+                  segment.duration || 0
+                )
+              )
+            );
 
-              text:
-                String(
-                  segment.text || ''
-                ).trim(),
+          return {
+            text: segmentText,
 
-              start:
-                Number.isFinite(start)
-                  ? start
-                  : null,
+            start,
 
-              end:
-                Number.isFinite(end)
-                  ? end
-                  : null,
+            end,
 
-              startFormatted:
-                formatTimestamp(start),
+            startFormatted:
+              formatTime(start),
 
-              endFormatted:
-                formatTimestamp(end)
-            };
-          }
-        )
+            endFormatted:
+              formatTime(end)
+          };
+        })
         .filter(
           segment =>
             segment.text.length > 0
         );
 
+    console.log(
+      `🧩 Segments: ${segments.length}`
+    );
+
+    console.log(
+      `📝 Longueur texte: ${text.length}`
+    );
+
+    // ----------------------------------------------------------
+    // Transcript non terminé
+    // ----------------------------------------------------------
+
     if (
-      segments.length > 0
+      data.status &&
+      data.status !== 'completed'
     ) {
       console.log(
-        '⏱️ Premier segment:',
-        segments[0]
+        `⚠️ Transcript non terminé: ${data.status}`
       );
 
-      console.log(
-        '⏱️ Dernier segment:',
-        segments[
-          segments.length - 1
-        ]
-      );
-    } else {
-      console.log(
-        `⚠️ Aucun segment horodaté pour ${videoId}`
-      );
+      return {
+        text,
+        segments,
+
+        status:
+          data.status,
+
+        language:
+          data.language || 'en',
+
+        source:
+          data.source || 'youtube',
+
+        videoId
+      };
     }
 
     return {
-      videoId,
-
       text,
 
       segments,
 
+      status:
+        data.status || 'completed',
+
       language:
-        transcript.language ||
-        'en',
+        data.language || 'en',
 
       source:
-        transcript.source ||
-        'auto'
+        data.source || 'youtube',
+
+      videoId
     };
 
   } catch (error) {
@@ -873,281 +961,377 @@ async function getTranscript(videoId) {
 }
 
 // ============================================================================
-// MARQUEURS IELTS
+// DÉTECTION DES MARQUEURS IELTS
 // ============================================================================
 
-function hasQuestionMarkers(
-  transcriptText
-) {
-  const text =
-    normalizeText(
-      transcriptText
+function hasQuestionMarkers(text) {
+  const normalized =
+    normalizeText(text);
+
+  const found =
+    QUESTION_MARKERS.filter(
+      marker =>
+        normalized.includes(
+          normalizeText(marker)
+        )
     );
 
-  const markers = [
-    /questions?\s+\d+/i,
+  return {
+    found:
+      found.length > 0,
 
-    /questions?\s+\d+\s*[-–]\s*\d+/i,
-
-    /questions?\s+\d+\s+to\s+\d+/i,
-
-    /choose the correct answer/i,
-
-    /choose the correct letter/i,
-
-    /choose two answers/i,
-
-    /choose two letters/i,
-
-    /complete the form/i,
-
-    /complete the notes/i,
-
-    /complete the table/i,
-
-    /complete the sentence/i,
-
-    /complete the summary/i,
-
-    /write one word/i,
-
-    /write no more than one word/i,
-
-    /write no more than two words/i,
-
-    /write no more than three words/i,
-
-    /match/i
-  ];
-
-  return markers.some(
-    pattern =>
-      pattern.test(text)
-  );
+    markers:
+      found
+  };
 }
 
 // ============================================================================
-// LOCALISATION DES SEGMENTS DE QUESTIONS
+// TROUVER LES SEGMENTS DE QUESTIONS
 // ============================================================================
 
-function findQuestionSegments(
-  segments
-) {
+function findQuestionSegments(segments) {
   if (
-    !Array.isArray(segments) ||
-    segments.length === 0
+    !Array.isArray(segments)
   ) {
     return [];
   }
 
-  const markers = [
-    /questions?\s+\d+/i,
+  const results = [];
 
-    /questions?\s+\d+\s*[-–]\s*\d+/i,
+  for (
+    let i = 0;
+    i < segments.length;
+    i++
+  ) {
+    const segment =
+      segments[i];
 
-    /questions?\s+\d+\s+to\s+\d+/i,
+    const normalized =
+      normalizeText(
+        segment.text
+      );
 
-    /choose the correct answer/i,
+    const hasMarker =
+      QUESTION_MARKERS.some(
+        marker =>
+          normalized.includes(
+            normalizeText(marker)
+          )
+      );
 
-    /choose the correct letter/i,
+    if (!hasMarker) {
+      continue;
+    }
 
-    /choose two answers/i,
+    // ----------------------------------------------------------
+    // On prend également plusieurs segments autour.
+    // Une question IELTS peut être répartie sur plusieurs
+    // phrases dans le transcript.
+    // ----------------------------------------------------------
 
-    /choose two letters/i,
+    const startIndex =
+      Math.max(
+        0,
+        i - 2
+      );
 
-    /complete the form/i,
+    const endIndex =
+      Math.min(
+        segments.length - 1,
+        i + 8
+      );
 
-    /complete the notes/i,
+    const context =
+      segments
+        .slice(
+          startIndex,
+          endIndex + 1
+        )
+        .map(item => ({
+          text: item.text,
+          start: item.start,
+          end: item.end,
+          startFormatted:
+            item.startFormatted,
+          endFormatted:
+            item.endFormatted
+        }));
 
-    /complete the table/i,
+    results.push({
+      markerSegmentIndex: i,
 
-    /complete the sentence/i,
+      markerText:
+        segment.text,
 
-    /complete the summary/i,
+      start:
+        segment.start,
 
-    /write one word/i,
+      end:
+        segments[endIndex].end,
 
-    /write no more than one word/i,
+      startFormatted:
+        segment.startFormatted,
 
-    /write no more than two words/i,
+      endFormatted:
+        segments[endIndex]
+          .endFormatted,
 
-    /write no more than three words/i,
+      context
+    });
+  }
 
-    /match/i
-  ];
+  // ----------------------------------------------------------
+  // Éliminer les doublons / zones qui se chevauchent
+  // ----------------------------------------------------------
 
-  return segments.filter(
-    segment => {
-      const text =
-        normalizeText(
-          segment.text
+  const merged = [];
+
+  for (const zone of results) {
+    const previous =
+      merged[merged.length - 1];
+
+    if (
+      previous &&
+      zone.start <= previous.end
+    ) {
+      previous.end =
+        Math.max(
+          previous.end,
+          zone.end
         );
 
-      return markers.some(
-        pattern =>
-          pattern.test(text)
-      );
+      previous.endFormatted =
+        formatTime(
+          previous.end
+        );
+
+      previous.context =
+        [
+          ...previous.context,
+          ...zone.context
+        ];
+    } else {
+      merged.push({
+        ...zone
+      });
     }
-  );
+  }
+
+  return merged;
 }
 
 // ============================================================================
-// EXTRACTION DES QUESTIONS AVEC CLAUDE
+// CLAUDE
+//
+// IMPORTANT :
+// Claude NE GÉNÈRE PAS de nouvelles questions.
+// Il extrait uniquement celles qui existent réellement
+// dans le transcript.
 // ============================================================================
 
 async function extractIeltsQuestions(
   video,
-  transcript
+  transcript,
+  questionZones
 ) {
   if (
     !process.env.ANTHROPIC_API_KEY
   ) {
     throw new Error(
-      'ANTHROPIC_API_KEY est manquante'
+      'ANTHROPIC_API_KEY manquante'
     );
   }
 
-  const transcriptText =
+  const fullTranscript =
     transcript.text || '';
 
   if (
-    transcriptText
-      .trim()
-      .length < 100
+    !fullTranscript ||
+    fullTranscript.length < 50
   ) {
     return [];
   }
 
+  const zonesText =
+    questionZones
+      .map(
+        (zone, index) => {
+          const context =
+            zone.context
+              .map(
+                segment =>
+                  `[${segment.startFormatted}] ${segment.text}`
+              )
+              .join('\n');
+
+          return `
+--- ZONE ${index + 1} ---
+Début: ${zone.startFormatted}
+Fin: ${zone.endFormatted}
+
+${context}
+`;
+        }
+      )
+      .join('\n');
+
   const prompt = `
 You are an IELTS Listening question extraction system.
 
-Your task is EXTRACTION ONLY.
+IMPORTANT:
+You MUST NOT create new questions.
 
-Do NOT generate new questions.
+Your task is ONLY to extract IELTS Listening questions
+that are actually present in the supplied transcript.
 
-Do NOT invent questions.
+VIDEO:
+Title: ${video.title}
+Video ID: ${video.videoId}
 
-Do NOT transform normal conversation into questions.
+TRANSCRIPT:
+${fullTranscript}
 
-Use ONLY the transcript supplied below.
+POSSIBLE QUESTION ZONES:
+${zonesText}
 
-The goal is to identify IELTS Listening questions that are
-actually present in the video transcript.
+RULES:
 
-If the transcript does not contain identifiable IELTS Listening
-questions, return an empty array.
+1. Extract ONLY questions that actually appear in the transcript.
 
-Preserve the wording as closely as possible.
+2. Do NOT invent questions.
 
-Do not invent answer choices.
+3. Do NOT transform a normal sentence into a question.
 
-If answer choices are explicitly present in the transcript,
-extract them.
+4. Preserve the original wording as closely as possible.
 
-If answer choices are not present, return an empty choices array.
+5. Detect IELTS Listening sections and question numbers
+   whenever they are explicitly identifiable.
 
-Return ONLY valid JSON.
+6. If a question number is spoken, use it.
 
-Expected format:
+7. If the question number is not known, use null.
+
+8. Extract answer choices ONLY if they are actually present
+   in the transcript.
+
+9. Never invent answer choices.
+
+10. If the question is a form/table/note completion task,
+    preserve the task wording.
+
+11. If the transcript only contains the instructions
+    but not the actual question, do not fabricate the question.
+
+12. If there are no identifiable IELTS Listening questions,
+    return an empty array.
+
+13. Return valid JSON only.
+
+JSON format:
 
 {
   "questions": [
     {
       "number": 1,
-      "question": "Question text",
+      "section": 1,
+      "type": "multiple_choice",
+      "question": "exact question text",
       "choices": [
-        {
-          "label": "A",
-          "text": "..."
-        },
-        {
-          "label": "B",
-          "text": "..."
-        },
-        {
-          "label": "C",
-          "text": "..."
-        }
+        "A. ...",
+        "B. ...",
+        "C. ..."
       ],
-      "answer": null,
-      "sourceText": "Exact relevant source text"
+      "startTime": 123,
+      "endTime": 145
     }
   ]
 }
 
-IMPORTANT:
+Allowed type values:
 
-- Extraction only.
-- No invention.
-- No generated questions.
-- No guessed answers.
-- Keep original wording.
-- If there are no real IELTS Listening questions, return:
-  {"questions":[]}
+- multiple_choice
+- matching
+- form_completion
+- note_completion
+- table_completion
+- sentence_completion
+- summary_completion
+- short_answer
+- unknown
 
-VIDEO TITLE:
-${video.title}
+If choices are not spoken or visible in the transcript,
+use:
 
-TRANSCRIPT:
-${transcriptText}
+"choices": []
+
+Do not invent the correct answer.
+
+Return JSON only.
 `;
 
-  const response =
-    await axios.post(
-      ANTHROPIC_URL,
-      {
-        model:
-          ANTHROPIC_MODEL,
-
-        max_tokens: 5000,
-
-        system:
-          'You extract existing IELTS Listening questions only. Never invent questions.',
-
-        messages: [
-          {
-            role: 'user',
-            content: prompt
-          }
-        ]
-      },
-      {
-        headers: {
-          'x-api-key':
-            process.env.ANTHROPIC_API_KEY,
-
-          'anthropic-version':
-            '2023-06-01',
-
-          'content-type':
-            'application/json'
-        },
-
-        timeout: 120000
-      }
+  try {
+    console.log(
+      `\n🤖 Extraction des questions avec Claude...`
     );
 
-  const content =
-    response.data?.content
-      ?.map(
-        item =>
+    const response =
+      await axios.post(
+        ANTHROPIC_URL,
+        {
+          model:
+            CLAUDE_MODEL,
+
+          max_tokens:
+            8000,
+
+          temperature:
+            0,
+
+          messages: [
+            {
+              role: 'user',
+              content: prompt
+            }
+          ]
+        },
+        {
+          headers: {
+            'x-api-key':
+              process.env.ANTHROPIC_API_KEY,
+
+            'anthropic-version':
+              '2023-06-01',
+
+            'Content-Type':
+              'application/json'
+          },
+
+          timeout: 120000
+        }
+      );
+
+    const content =
+      response.data?.content
+        ?.map(item =>
           item.text || ''
-      )
-      .join('')
-      .trim() || '';
+        )
+        .join('') || '';
 
-  if (!content) {
-    return [];
-  }
+    console.log(
+      `🤖 Réponse Claude longueur: ${content.length}`
+    );
 
-  let jsonText =
-    content;
+    if (!content) {
+      return [];
+    }
 
-  if (
-    jsonText.startsWith(
-      '```'
-    )
-  ) {
+    let jsonText =
+      content.trim();
+
+    // ----------------------------------------------------------
+    // Nettoyage éventuel des ```json
+    // ----------------------------------------------------------
+
     jsonText =
       jsonText
         .replace(
@@ -1163,124 +1347,198 @@ ${transcriptText}
           ''
         )
         .trim();
-  }
 
-  let parsed;
+    let parsed;
 
-  try {
-    parsed =
-      JSON.parse(
-        jsonText
+    try {
+      parsed =
+        JSON.parse(
+          jsonText
+        );
+    } catch (parseError) {
+      console.error(
+        '❌ JSON Claude invalide:',
+        parseError.message
       );
+
+      // Tentative de récupération
+      const firstBrace =
+        jsonText.indexOf('{');
+
+      const lastBrace =
+        jsonText.lastIndexOf('}');
+
+      if (
+        firstBrace !== -1 &&
+        lastBrace !== -1 &&
+        lastBrace > firstBrace
+      ) {
+        try {
+          parsed =
+            JSON.parse(
+              jsonText.slice(
+                firstBrace,
+                lastBrace + 1
+              )
+            );
+        } catch (secondError) {
+          console.error(
+            '❌ Impossible de récupérer le JSON Claude'
+          );
+
+          return [];
+        }
+      } else {
+        return [];
+      }
+    }
+
+    if (
+      !parsed ||
+      !Array.isArray(
+        parsed.questions
+      )
+    ) {
+      return [];
+    }
+
+    return parsed.questions;
+
   } catch (error) {
     console.error(
-      '❌ JSON Claude invalide:',
-      content
+      '❌ Erreur Claude extraction:',
+      error.response?.data ||
+      error.message
     );
 
     return [];
   }
+}
 
+// ============================================================================
+// VALIDATION DES QUESTIONS EXTRAITES
+// ============================================================================
+
+function validateExtractedQuestions(
+  questions
+) {
   if (
-    !parsed ||
-    !Array.isArray(
-      parsed.questions
-    )
+    !Array.isArray(questions)
   ) {
     return [];
   }
 
-  const questions =
-    parsed.questions
-      .filter(
-        question => {
-          if (!question) {
-            return false;
-          }
+  return questions
+    .map(question => {
+      if (!question) {
+        return null;
+      }
 
-          if (
-            !question.question ||
-            String(
-              question.question
-            ).trim().length < 3
-          ) {
-            return false;
-          }
+      const text =
+        String(
+          question.question || ''
+        ).trim();
 
-          return true;
-        }
-      )
-      .map(
-        (question, index) => {
-          const choices =
-            Array.isArray(
-              question.choices
-            )
-              ? question.choices
-                  .filter(
-                    choice =>
-                      choice &&
-                      choice.text
-                  )
-                  .map(
-                    choice => ({
-                      label:
-                        choice.label ||
-                        null,
+      if (
+        text.length < 5
+      ) {
+        return null;
+      }
 
-                      text:
-                        String(
-                          choice.text
-                        ).trim()
-                    })
-                  )
-              : [];
-
-          return {
-            number:
-              Number.isFinite(
-                Number(
-                  question.number
-                )
+      const choices =
+        Array.isArray(
+          question.choices
+        )
+          ? question.choices
+              .map(choice =>
+                String(
+                  choice || ''
+                ).trim()
               )
-                ? Number(
-                    question.number
-                  )
-                : index + 1,
+              .filter(Boolean)
+          : [];
 
-            question:
-              String(
-                question.question
-              ).trim(),
+      const startTime =
+        Number(
+          question.startTime
+        );
 
-            choices,
+      const endTime =
+        Number(
+          question.endTime
+        );
 
-            answer:
-              question.answer ??
-              null,
+      return {
+        number:
+          question.number ??
+          null,
 
-            sourceText:
-              question.sourceText
-                ? String(
-                    question.sourceText
-                  ).trim()
-                : ''
-          };
-        }
-      );
+        section:
+          question.section ??
+          null,
 
-  return questions;
+        type:
+          question.type ||
+          'unknown',
+
+        question:
+          text,
+
+        choices,
+
+        startTime:
+          Number.isFinite(
+            startTime
+          )
+            ? startTime
+            : null,
+
+        endTime:
+          Number.isFinite(
+            endTime
+          )
+            ? endTime
+            : null,
+
+        startTimeFormatted:
+          Number.isFinite(
+            startTime
+          )
+            ? formatTime(
+                startTime
+              )
+            : null,
+
+        endTimeFormatted:
+          Number.isFinite(
+            endTime
+          )
+            ? formatTime(
+                endTime
+              )
+            : null
+      };
+    })
+    .filter(Boolean);
 }
 
 // ============================================================================
-// ANALYSE D'UNE VIDÉO LISTENING
+// ANALYSE RÉELLE D'UNE VIDÉO IELTS LISTENING
 // ============================================================================
 
 async function analyzeListeningVideo(
   video
 ) {
   console.log(
-    `\n🎧 Analyse IELTS Listening: ${video.videoId}`
+    `\n==================================================`
+  );
+
+  console.log(
+    `🎧 ANALYSE IELTS LISTENING`
+  );
+
+  console.log(
+    `🎬 ${video.videoId}`
   );
 
   console.log(
@@ -1288,12 +1546,12 @@ async function analyzeListeningVideo(
   );
 
   console.log(
-    `⏱️ Durée: ${video.durationSeconds}s`
+    `==================================================`
   );
 
-  // --------------------------------------------------------------------------
-  // 1. Transcript COMPLET
-  // --------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // 1. Transcript
+  // ----------------------------------------------------------
 
   const transcript =
     await getTranscript(
@@ -1302,7 +1560,18 @@ async function analyzeListeningVideo(
 
   if (!transcript) {
     console.log(
-      `❌ ${video.videoId}: transcript indisponible`
+      `🚫 Aucun transcript`
+    );
+
+    return null;
+  }
+
+  if (
+    transcript.status &&
+    transcript.status !== 'completed'
+  ) {
+    console.log(
+      `🚫 Transcript non terminé: ${transcript.status}`
     );
 
     return null;
@@ -1310,87 +1579,132 @@ async function analyzeListeningVideo(
 
   if (
     !transcript.text ||
-    transcript.text.length < 500
+    transcript.text.length < 50
   ) {
     console.log(
-      `❌ ${video.videoId}: transcript trop court`
+      `🚫 Transcript trop court`
     );
 
     return null;
   }
 
-  // --------------------------------------------------------------------------
-  // 2. Analyse de TOUT le transcript
-  // --------------------------------------------------------------------------
+  console.log(
+    `✅ Transcript disponible`
+  );
+
+  // ----------------------------------------------------------
+  // 2. Détection des marqueurs
+  // ----------------------------------------------------------
+
+  const markerResult =
+    hasQuestionMarkers(
+      transcript.text
+    );
 
   console.log(
-    `🔎 Analyse complète du transcript...`
+    `🔎 Marqueurs trouvés: ${
+      markerResult.found
+    }`
+  );
+
+  console.log(
+    `📌 Marqueurs: ${
+      markerResult.markers.join(', ')
+    }`
   );
 
   if (
-    !hasQuestionMarkers(
-      transcript.text
-    )
+    !markerResult.found
   ) {
     console.log(
-      `❌ ${video.videoId}: aucun marqueur IELTS Listening`
+      `🚫 Aucun marqueur IELTS Listening`
     );
 
     return null;
   }
 
-  // --------------------------------------------------------------------------
-  // 3. Localisation temporelle
-  // --------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // 3. Zones de questions
+  // ----------------------------------------------------------
 
-  const questionSegments =
+  const questionZones =
     findQuestionSegments(
       transcript.segments
     );
 
   console.log(
-    `🔎 ${questionSegments.length} segment(s) potentiellement liés aux questions`
+    `🎯 Zones de questions: ${
+      questionZones.length
+    }`
   );
 
   for (
-    const segment of questionSegments.slice(
-      0,
-      50
-    )
+    const zone of questionZones
   ) {
     console.log(
-      `   ⏱️ ${segment.startFormatted} → ${segment.endFormatted} | ${segment.text}`
+      `   ⏱️ ${zone.startFormatted} → ${zone.endFormatted}`
+    );
+
+    console.log(
+      `   📝 ${zone.markerText}`
     );
   }
 
-  // --------------------------------------------------------------------------
-  // 4. Extraction
-  // --------------------------------------------------------------------------
-
-  const questions =
-    await extractIeltsQuestions(
-      video,
-      transcript
-    );
-
   if (
-    !questions ||
-    questions.length === 0
+    questionZones.length === 0
   ) {
     console.log(
-      `❌ ${video.videoId}: aucune question IELTS exploitable`
+      `🚫 Impossible de localiser les questions`
     );
 
     return null;
   }
 
+  // ----------------------------------------------------------
+  // 4. Extraction
+  // ----------------------------------------------------------
+
+  const extracted =
+    await extractIeltsQuestions(
+      video,
+      transcript,
+      questionZones
+    );
+
   console.log(
-    `✅ ${video.videoId}: ${questions.length} question(s) trouvée(s)`
+    `📚 Questions extraites: ${
+      extracted.length
+    }`
   );
 
-  // --------------------------------------------------------------------------
-  // 5. VIDÉO VALIDÉE
-  // --------------------------------------------------------------------------
+  // ----------------------------------------------------------
+  // 5. Validation
+  // ----------------------------------------------------------
+
+  const questions =
+    validateExtractedQuestions(
+      extracted
+    );
+
+  console.log(
+    `✅ Questions valides: ${
+      questions.length
+    }`
+  );
+
+  if (
+    questions.length === 0
+  ) {
+    console.log(
+      `🚫 Aucune question IELTS exploitable`
+    );
+
+    return null;
+  }
+
+  // ----------------------------------------------------------
+  // Résultat
+  // ----------------------------------------------------------
 
   return {
     ...video,
@@ -1398,31 +1712,47 @@ async function analyzeListeningVideo(
     ieltsVerified:
       true,
 
-    questionCount:
-      questions.length,
+    transcriptAvailable:
+      true,
+
+    transcriptLanguage:
+      transcript.language || 'en',
+
+    questionMarkers:
+      markerResult.markers,
+
+    questionZones:
+      questionZones.map(
+        zone => ({
+          start:
+            zone.start,
+
+          end:
+            zone.end,
+
+          startFormatted:
+            zone.startFormatted,
+
+          endFormatted:
+            zone.endFormatted,
+
+          marker:
+            zone.markerText
+        })
+      ),
 
     questions,
 
-    transcript: {
-      text:
-        transcript.text,
-
-      language:
-        transcript.language,
-
-      source:
-        transcript.source,
-
-      segments:
-        transcript.segments,
-
-      questionSegments
-    }
+    questionCount:
+      questions.length
   };
 }
 
 // ============================================================================
-// GET /ielts
+// ROUTE PRINCIPALE IELTS
+//
+// Recherche plusieurs vidéos puis vérifie réellement leur transcript.
+// Une vidéo sans questions IELTS est rejetée.
 // ============================================================================
 
 router.get(
@@ -1432,228 +1762,226 @@ router.get(
       const skill =
         String(
           req.query.skill ||
-          'all'
-        ).toLowerCase();
+          'listening'
+        )
+          .toLowerCase()
+          .trim();
 
-      const validSkills =
-        Object.keys(
-          SKILL_QUERIES
-        );
+      // --------------------------------------------------------
+      // Pour l'instant notre logique d'extraction réelle
+      // concerne IELTS Listening.
+      // --------------------------------------------------------
 
       if (
-        !validSkills.includes(
-          skill
-        )
+        skill !== 'listening'
       ) {
-        return res.status(400).json({
-          ok: false,
+        return res.json({
+          ok: true,
 
-          error:
-            `Skill invalide. Valeurs: ${validSkills.join(', ')}`
+          skill,
+
+          message:
+            'La vérification réelle des questions est actuellement disponible pour IELTS Listening.',
+
+          videos: []
         });
       }
 
       console.log(
-        `\n🔎 Recherche IELTS: ${skill}`
+        `\n==================================================`
       );
 
-      const queries =
-        SKILL_QUERIES[skill];
+      console.log(
+        `🎧 RECHERCHE IELTS LISTENING`
+      );
 
-      // ----------------------------------------------------------------------
+      console.log(
+        `==================================================`
+      );
+
+      // --------------------------------------------------------
       // Recherche
-      // ----------------------------------------------------------------------
+      // --------------------------------------------------------
 
-      let searchResults = [];
+      const allItems = [];
 
       for (
-        const query of queries
+        const query of LISTENING_QUERIES
       ) {
         try {
           console.log(
-            `🔍 YouTube: ${query}`
+            `🔎 Recherche: ${query}`
           );
 
-          const results =
+          const items =
             await searchYouTube(
               query
             );
 
-          searchResults.push(
-            ...results
+          allItems.push(
+            ...items
           );
+
         } catch (error) {
           console.error(
-            `❌ Erreur recherche "${query}":`,
+            `❌ Recherche "${query}" échouée:`,
             error.response?.data ||
             error.message
           );
         }
       }
 
-      // ----------------------------------------------------------------------
+      // --------------------------------------------------------
       // Déduplication
-      // ----------------------------------------------------------------------
+      // --------------------------------------------------------
 
-      const uniqueVideos =
-        new Map();
+      const uniqueIds =
+        [
+          ...new Set(
+            allItems
+              .map(
+                item =>
+                  item.id?.videoId
+              )
+              .filter(Boolean)
+          )
+        ];
+
+      console.log(
+        `📊 Vidéos uniques trouvées: ${
+          uniqueIds.length
+        }`
+      );
+
+      if (
+        uniqueIds.length === 0
+      ) {
+        return res.json({
+          ok: true,
+
+          skill: 'listening',
+
+          videos: [],
+
+          count: 0
+        });
+      }
+
+      // --------------------------------------------------------
+      // Détails YouTube
+      // --------------------------------------------------------
+
+      const details =
+        await getVideoDetails(
+          uniqueIds.slice(
+            0,
+            50
+          )
+        );
+
+      const candidates =
+        processVideos(
+          details
+        );
+
+      console.log(
+        `📋 Candidates après filtres: ${
+          candidates.length
+        }`
+      );
+
+      // --------------------------------------------------------
+      // Analyse réelle
+      //
+      // On ne garde QUE les vidéos qui possèdent réellement
+      // des questions IELTS Listening exploitables.
+      // --------------------------------------------------------
+
+      const verifiedVideos = [];
+
+      // Limite volontaire pour éviter trop d'appels
+      // transcript + Claude sur une seule requête.
+      const candidatesToAnalyze =
+        candidates.slice(
+          0,
+          15
+        );
 
       for (
-        const item of searchResults
+        const video of candidatesToAnalyze
       ) {
-        const videoId =
-          item.id?.videoId;
+        try {
+          const verified =
+            await analyzeListeningVideo(
+              video
+            );
 
-        if (
-          videoId &&
-          !uniqueVideos.has(
-            videoId
-          )
-        ) {
-          uniqueVideos.set(
-            videoId,
-            videoId
+          if (verified) {
+            verifiedVideos.push(
+              verified
+            );
+
+            console.log(
+              `✅ VIDÉO CONSERVÉE: ${video.videoId}`
+            );
+
+            // On peut arrêter lorsqu'on a assez
+            // de vraies vidéos IELTS.
+            if (
+              verifiedVideos.length >= 5
+            ) {
+              break;
+            }
+
+          } else {
+            console.log(
+              `🚫 VIDÉO REJETÉE: ${video.videoId}`
+            );
+          }
+
+        } catch (error) {
+          console.error(
+            `❌ Analyse ${video.videoId}:`,
+            error.message
           );
         }
       }
 
-      const videoIds =
-        [
-          ...uniqueVideos.values()
-        ];
+      // --------------------------------------------------------
+      // Tri
+      // --------------------------------------------------------
 
-      console.log(
-        `📹 ${videoIds.length} vidéos candidates après recherche`
+      verifiedVideos.sort(
+        (a, b) =>
+          (
+            b.quality || 0
+          ) -
+          (
+            a.quality || 0
+          )
       );
 
-      if (
-        videoIds.length === 0
-      ) {
-        return res.json({
-          ok: true,
-          skill,
-          count: 0,
-          videos: []
-        });
-      }
-
-      // ----------------------------------------------------------------------
-      // Détails
-      // ----------------------------------------------------------------------
-
-      const details =
-        await getVideoDetails(
-          videoIds
-        );
-
-      // ----------------------------------------------------------------------
-      // Filtrage
-      // ----------------------------------------------------------------------
-
-      const candidates =
-        processVideos(
-          details,
-          skill
-        );
-
       console.log(
-        `📋 ${candidates.length} vidéos après filtrage`
+        `\n🎯 VIDÉOS IELTS VALIDÉES: ${
+          verifiedVideos.length
+        }`
       );
-
-      // ----------------------------------------------------------------------
-      // IELTS LISTENING
-      // ----------------------------------------------------------------------
-
-      if (
-        skill === 'listening'
-      ) {
-        const acceptedVideos =
-          [];
-
-        /*
-         * On analyse les candidates une par une.
-         *
-         * Une vidéo n'est conservée que si son contenu
-         * permet réellement d'identifier des questions IELTS.
-         */
-
-        for (
-          const video of candidates
-        ) {
-          if (
-            acceptedVideos.length >= 20
-          ) {
-            break;
-          }
-
-          try {
-            const analyzed =
-              await analyzeListeningVideo(
-                video
-              );
-
-            if (analyzed) {
-              acceptedVideos.push(
-                analyzed
-              );
-
-              console.log(
-                `🎯 VIDÉO ACCEPTÉE: ${video.videoId}`
-              );
-            } else {
-              console.log(
-                `🚫 VIDÉO REJETÉE: ${video.videoId}`
-              );
-            }
-
-          } catch (error) {
-            console.error(
-              `❌ Erreur analyse ${video.videoId}:`,
-              error.response?.data ||
-              error.message
-            );
-          }
-        }
-
-        console.log(
-          `\n🎯 IELTS Listening validé: ${acceptedVideos.length} vidéo(s)`
-        );
-
-        return res.json({
-          ok: true,
-
-          skill,
-
-          count:
-            acceptedVideos.length,
-
-          videos:
-            acceptedVideos
-        });
-      }
-
-      // ----------------------------------------------------------------------
-      // AUTRES SKILLS
-      // ----------------------------------------------------------------------
 
       return res.json({
         ok: true,
 
-        skill,
-
-        count:
-          candidates.length,
+        skill: 'listening',
 
         videos:
-          candidates.slice(
-            0,
-            20
-          )
+          verifiedVideos,
+
+        count:
+          verifiedVideos.length
       });
 
     } catch (error) {
       console.error(
-        '❌ Erreur /ielts:',
+        '\n❌ ERREUR IELTS:',
         error.response?.data ||
         error.message
       );
@@ -1663,7 +1991,7 @@ router.get(
 
         error:
           error.message ||
-          'Erreur serveur'
+          'Erreur serveur IELTS'
       });
     }
   }
@@ -1671,6 +1999,14 @@ router.get(
 
 // ============================================================================
 // TEST DIRECT D'UNE VIDÉO
+//
+// IMPORTANT
+// ---------
+// Cette route NE DOIT PAS utiliser processVideos().
+//
+// Elle prend directement une vidéo connue,
+// récupère ses métadonnées,
+// puis analyse son transcript.
 // ============================================================================
 
 router.get(
@@ -1692,8 +2028,32 @@ router.get(
       }
 
       console.log(
-        `\n🧪 TEST DIRECT IELTS: ${videoId}`
+        `\n==================================================`
       );
+
+      console.log(
+        `🧪 TEST DIRECT IELTS`
+      );
+
+      console.log(
+        `==================================================`
+      );
+
+      console.log(
+        `🎬 Video ID: ${videoId}`
+      );
+
+      // --------------------------------------------------------
+      // IMPORTANT :
+      // On récupère directement les détails YouTube.
+      //
+      // On NE FAIT PAS :
+      //
+      // processVideos()
+      //
+      // car cette fonction est réservée aux vidéos provenant
+      // de la recherche.
+      // --------------------------------------------------------
 
       const details =
         await getVideoDetails([
@@ -1707,55 +2067,185 @@ router.get(
         return res.status(404).json({
           ok: false,
 
+          videoId,
+
           error:
             'Vidéo YouTube introuvable'
         });
       }
 
-      /*
-       * IMPORTANT :
-       *
-       * On utilise maintenant le filtre assoupli
-       * du mode listening.
-       */
-      const candidates =
-        processVideos(
-          details,
-          'listening'
+      const youtubeVideo =
+        details[0];
+
+      const snippet =
+        youtubeVideo.snippet || {};
+
+      const contentDetails =
+        youtubeVideo.contentDetails ||
+        {};
+
+      const status =
+        youtubeVideo.status || {};
+
+      const statistics =
+        youtubeVideo.statistics ||
+        {};
+
+      const title =
+        snippet.title || '';
+
+      const description =
+        snippet.description || '';
+
+      const durationSeconds =
+        parseDuration(
+          contentDetails.duration
         );
 
-      if (
-        candidates.length === 0
-      ) {
-        return res.json({
-          ok: false,
-
-          videoId,
-
-          error:
-            'La vidéo ne passe toujours pas les filtres minimaux IELTS Listening'
-        });
-      }
+      const language =
+        snippet.defaultLanguage ||
+        snippet.defaultAudioLanguage ||
+        '';
 
       console.log(
-        `✅ ${videoId} passe les filtres minimaux`
+        `📌 Titre: ${title}`
+      );
+
+      console.log(
+        `⏱️ Durée: ${durationSeconds}s`
+      );
+
+      console.log(
+        `🌐 Langue déclarée: ${
+          language || 'non renseignée'
+        }`
+      );
+
+      console.log(
+        `🔓 Privacy: ${
+          status.privacyStatus ||
+          'inconnue'
+        }`
+      );
+
+      console.log(
+        `📺 Embeddable: ${
+          status.embeddable
+        }`
+      );
+
+      // --------------------------------------------------------
+      // Construction directe de l'objet vidéo
+      // --------------------------------------------------------
+
+      const video = {
+        videoId,
+
+        title,
+
+        description,
+
+        channelTitle:
+          snippet.channelTitle || '',
+
+        publishedAt:
+          snippet.publishedAt || null,
+
+        duration:
+          contentDetails.duration ||
+          null,
+
+        durationSeconds,
+
+        language:
+          language || 'en',
+
+        thumbnail:
+          snippet.thumbnails?.high?.url ||
+          snippet.thumbnails?.medium?.url ||
+          snippet.thumbnails?.default?.url ||
+          null,
+
+        views:
+          Number(
+            statistics.viewCount || 0
+          ),
+
+        likes:
+          Number(
+            statistics.likeCount || 0
+          ),
+
+        // Pour un test direct, on ne fait pas dépendre
+        // l'analyse du score de recherche.
+        quality: 100,
+
+        skill:
+          'listening',
+
+        privacyStatus:
+          status.privacyStatus ||
+          null,
+
+        embeddable:
+          status.embeddable !== false
+      };
+
+      // --------------------------------------------------------
+      // Analyse réelle
+      // --------------------------------------------------------
+
+      console.log(
+        `\n🎧 Début analyse réelle de la vidéo...`
       );
 
       const result =
         await analyzeListeningVideo(
-          candidates[0]
+          video
         );
 
+      // --------------------------------------------------------
+      // Vidéo rejetée
+      // --------------------------------------------------------
+
       if (!result) {
+        console.log(
+          `\n🚫 VIDÉO REJETÉE`
+        );
+
         return res.json({
           ok: false,
 
           videoId,
 
+          title,
+
           error:
-            'La vidéo passe les filtres mais ne contient pas de questions IELTS Listening exploitables'
+            'La vidéo ne contient pas de questions IELTS Listening exploitables'
         });
       }
+
+      // --------------------------------------------------------
+      // Vidéo validée
+      // --------------------------------------------------------
+
+      console.log(
+        `\n==================================================`
+      );
+
+      console.log(
+        `✅ VIDÉO IELTS VALIDÉE`
+      );
+
+      console.log(
+        `🎯 Questions: ${
+          result.questionCount
+        }`
+      );
+
+      console.log(
+        `==================================================`
+      );
 
       return res.json({
         ok: true,
@@ -1766,7 +2256,7 @@ router.get(
 
     } catch (error) {
       console.error(
-        '❌ Erreur test IELTS:',
+        '\n❌ ERREUR TEST IELTS:',
         error.response?.data ||
         error.message
       );
@@ -1777,6 +2267,112 @@ router.get(
         error:
           error.message ||
           'Erreur serveur'
+      });
+    }
+  }
+);
+
+// ============================================================================
+// ROUTE SIMPLE DE DIAGNOSTIC DU TRANSCRIPT
+//
+// Utile pour voir directement ce que renvoie l'API transcript.
+// ============================================================================
+
+router.get(
+  '/ielts/test-transcript',
+  async (req, res) => {
+    try {
+      const videoId =
+        getVideoIdFromUrl(
+          req.query.videoId
+        );
+
+      if (!videoId) {
+        return res.status(400).json({
+          ok: false,
+
+          error:
+            'videoId ou URL YouTube invalide'
+        });
+      }
+
+      const transcript =
+        await getTranscript(
+          videoId
+        );
+
+      if (!transcript) {
+        return res.json({
+          ok: false,
+
+          videoId,
+
+          error:
+            'Transcript indisponible'
+        });
+      }
+
+      const markers =
+        hasQuestionMarkers(
+          transcript.text
+        );
+
+      const zones =
+        findQuestionSegments(
+          transcript.segments
+        );
+
+      return res.json({
+        ok: true,
+
+        videoId,
+
+        status:
+          transcript.status,
+
+        language:
+          transcript.language,
+
+        textLength:
+          transcript.text.length,
+
+        segmentCount:
+          transcript.segments.length,
+
+        questionMarkers:
+          markers,
+
+        questionZones:
+          zones,
+
+        // On limite le texte retourné afin de ne pas
+        // envoyer une réponse gigantesque.
+        transcript:
+          transcript.text.slice(
+            0,
+            20000
+          ),
+
+        segments:
+          transcript.segments.slice(
+            0,
+            300
+          )
+      });
+
+    } catch (error) {
+      console.error(
+        '❌ TEST TRANSCRIPT:',
+        error.response?.data ||
+        error.message
+      );
+
+      return res.status(500).json({
+        ok: false,
+
+        error:
+          error.message ||
+          'Erreur transcript'
       });
     }
   }
