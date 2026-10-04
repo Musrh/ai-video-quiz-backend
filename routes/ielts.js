@@ -676,6 +676,7 @@ async function runOCR(frames) {
 
 // "Questions 18 - 20", "Questions 01 - 05"
 const GROUP_HEADER_RE = /questions?\s*\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}/i;
+const GROUP_RANGE_RE = /questions?\s*(\d{1,2})\s*(?:-|–|—|to)\s*(\d{1,2})/i;
 
 function isGroupHeader(line) {
   return GROUP_HEADER_RE.test(line);
@@ -690,7 +691,15 @@ function isInstructionLine(line) {
 
 // Ligne quasi vide ou faite de caractères parasites
 function isNoiseLine(line) {
-  return line.replace(/[^A-Za-z]/g, '').length < 3 && !/\(\d{1,2}\)/.test(line);
+  // Un choix très court comme "A) 7.15" n'est pas du bruit
+  if (/^\(?[A-E]\s*[\.\)]/.test(line)) {
+    return false;
+  }
+
+  return (
+    line.replace(/[^A-Za-z]/g, '').length < 3 &&
+    !/\(\d{1,2}\)/.test(line)
+  );
 }
 
 function sectionFromNumber(number) {
@@ -704,7 +713,7 @@ function cleanQuestionText(text) {
     .trim();
 }
 
-function makeOcrQuestion(number, text, result, instructions) {
+function makeOcrQuestion(number, text, result, extras = {}) {
   const question = {
     number,
     section: sectionFromNumber(number),
@@ -715,8 +724,16 @@ function makeOcrQuestion(number, text, result, instructions) {
     source: 'video_ocr'
   };
 
-  if (instructions) {
-    question.instructions = instructions;
+  if (extras.instructions) {
+    question.instructions = extras.instructions;
+  }
+
+  if (extras.options && extras.options.length > 0) {
+    question.options = extras.options;
+  }
+
+  if (extras.context) {
+    question.context = extras.context;
   }
 
   return question;
@@ -739,6 +756,17 @@ function parseFrameQuestions(result) {
   let lastWasInstruction = false;
   let current = null; // question numérotée pouvant recevoir des choix A/B/C
 
+  let inGroup = false; // un en-tête "Questions X - Y" a été vu dans cette frame
+  let groupHasQuestion = false;
+  let groupOptions = []; // boîte de réponses : (A) Susan (B) Ahmed ...
+  let groupContext = []; // titre / phrase d'introduction du groupe
+
+  const extras = () => ({
+    instructions,
+    options: groupOptions,
+    context: groupContext.join(' ').slice(0, 300)
+  });
+
   for (const line of lines) {
     const wasInstruction = lastWasInstruction;
     lastWasInstruction = false;
@@ -753,7 +781,12 @@ function parseFrameQuestions(result) {
 
       instructions = isInstructionLine(rest) ? rest : '';
       lastWasInstruction = Boolean(instructions);
+
       current = null;
+      inGroup = true;
+      groupHasQuestion = false;
+      groupOptions = [];
+      groupContext = [];
 
       continue;
     }
@@ -764,6 +797,22 @@ function parseFrameQuestions(result) {
         wasInstruction && instructions ? `${instructions} ${line}` : line;
 
       lastWasInstruction = true;
+      current = null;
+
+      continue;
+    }
+
+    // ----- Boîte de réponses : "(A) Susan (B) Ahmed (C) Gary" -----
+    const optionMatches = [
+      ...line.matchAll(/\(([A-E])\)\s*([^()]+?)(?=\s*\([A-E]\)|$)/g)
+    ];
+
+    if (optionMatches.length >= 2) {
+      groupOptions = optionMatches.map(match => ({
+        letter: match[1],
+        text: match[2].trim()
+      }));
+
       current = null;
 
       continue;
@@ -788,19 +837,19 @@ function parseFrameQuestions(result) {
           Number(marker[1]),
           segment,
           result,
-          instructions
+          extras()
         );
 
         found.push(lastQuestion);
       }
 
+      groupHasQuestion = true;
+
+      // Texte après le dernier "(n)" : gardé seulement s'il contient un vrai mot
+      // (évite les caractères parasites type "i TUR")
       const tail = line.slice(cursor).trim();
 
-      if (
-        tail &&
-        lastQuestion &&
-        tail.replace(/[^A-Za-z0-9]/g, '').length >= 2
-      ) {
+      if (tail && lastQuestion && /\b[a-z]{3,}\b/.test(tail)) {
         lastQuestion.text = cleanQuestionText(`${lastQuestion.text} ${tail}`);
       }
 
@@ -823,15 +872,17 @@ function parseFrameQuestions(result) {
         Number(numberMatch[1]),
         numberMatch[2],
         result,
-        instructions
+        extras()
       );
 
       found.push(current);
 
+      groupHasQuestion = true;
+
       continue;
     }
 
-    // ----- Choix : "A. trade fair" -----
+    // ----- Choix : "A) trade fair" -----
     if (current) {
       const choiceMatch = line.match(/^([A-D])\s*[\.\):\-]\s*(.+)$/i);
 
@@ -864,6 +915,18 @@ function parseFrameQuestions(result) {
       if (current.choices.length === 0 && current.text.length < 500) {
         current.text = cleanQuestionText(`${current.text} ${line}`);
       }
+
+      continue;
+    }
+
+    // ----- Titre / introduction du groupe (avant la première question) -----
+    if (
+      inGroup &&
+      !groupHasQuestion &&
+      line.replace(/[^A-Za-z]/g, '').length >= 4 &&
+      line.length < 200
+    ) {
+      groupContext.push(line);
     }
   }
 
@@ -902,17 +965,16 @@ function consolidateQuestions(found) {
       groups.get(key).push(candidate);
     }
 
-    // Choisir le groupe le plus fréquent (puis le plus complet)
+    // Choisir le groupe le plus fréquent (puis le plus complet,
+    // puis la lecture la plus ancienne en cas d'égalité)
     let bestGroup = null;
-    let bestScore = -1;
+    let bestScore = -Infinity;
 
     for (const items of groups.values()) {
       const maxChoices = Math.max(...items.map(item => item.choices.length));
+      const minTime = Math.min(...items.map(item => item.startTime));
 
-      const score =
-        items.length * 1000 +
-        maxChoices * 50 +
-        Math.min(items[0].text.length, 200);
+      const score = items.length * 1000 + maxChoices * 50 - minTime / 10000;
 
       if (score > bestScore) {
         bestScore = score;
@@ -940,12 +1002,14 @@ function consolidateQuestions(found) {
       }
     }
 
-    // Consigne manquante : prendre la première trouvée
-    if (!chosen.instructions) {
-      const withInstructions = candidates.find(item => item.instructions);
+    // Consigne, boîte de réponses, introduction : première valeur trouvée
+    for (const field of ['instructions', 'options', 'context']) {
+      if (!chosen[field]) {
+        const source = candidates.find(item => item[field]);
 
-      if (withInstructions) {
-        chosen.instructions = withInstructions.instructions;
+        if (source) {
+          chosen[field] = source[field];
+        }
       }
     }
 
@@ -967,6 +1031,107 @@ function extractQuestionsFromOcr(ocrResults) {
   }
 
   return consolidateQuestions(found);
+}
+
+// ============================================================
+// GROUPES DE QUESTIONS (texte complet : schémas, tableaux, flow charts)
+// ============================================================
+
+// Découpe une frame en segments, un par en-tête "Questions X - Y"
+function splitFrameGroups(result) {
+  const lines = result.text
+    .split('\n')
+    .map(line => line.replace(/\s+/g, ' ').trim())
+    .filter(line => line && !isNoiseLine(line));
+
+  const segments = [];
+
+  let current = null;
+
+  for (const line of lines) {
+    const match = line.match(GROUP_RANGE_RE);
+
+    if (match) {
+      const from = Number(match[1]);
+      const to = Number(match[2]);
+
+      if (isValidQuestionNumber(from) && isValidQuestionNumber(to) && from <= to) {
+        current = {
+          from,
+          to,
+          lines: [line],
+          timestamp: result.timestamp
+        };
+
+        segments.push(current);
+
+        continue;
+      }
+    }
+
+    if (current) {
+      current.lines.push(line);
+    }
+  }
+
+  return segments.map(segment => ({
+    ...segment,
+    text: segment.lines.join('\n')
+  }));
+}
+
+// Pour chaque groupe (ex. "Questions 21 - 25"), garde la meilleure lecture OCR
+function buildQuestionGroups(ocrResults) {
+  const best = new Map();
+  const firstTimes = new Map();
+
+  for (const result of ocrResults) {
+    if (!result.questionLike) {
+      continue;
+    }
+
+    for (const segment of splitFrameGroups(result)) {
+      const key = `${segment.from}-${segment.to}`;
+
+      if (
+        !firstTimes.has(key) ||
+        segment.timestamp < firstTimes.get(key)
+      ) {
+        firstTimes.set(key, segment.timestamp);
+      }
+
+      // Nombre de numéros de questions du groupe retrouvés dans ce texte
+      const numbers = new Set();
+
+      for (const match of segment.text.matchAll(
+        /\((\d{1,2})\)|^\s*(\d{1,2})[\.\)]/gm
+      )) {
+        const n = Number(match[1] || match[2]);
+
+        if (n >= segment.from && n <= segment.to) {
+          numbers.add(n);
+        }
+      }
+
+      const candidate = { ...segment, score: numbers.size };
+      const previous = best.get(key);
+
+      if (!previous || candidate.score > previous.score) {
+        best.set(key, candidate);
+      }
+    }
+  }
+
+  return [...best.entries()]
+    .map(([key, group]) => ({
+      from: group.from,
+      to: group.to,
+      section: sectionFromNumber(group.from),
+      startTime: firstTimes.get(key),
+      startTimeFormatted: formatTime(firstTimes.get(key)),
+      text: group.text
+    }))
+    .sort((a, b) => a.from - b.from);
 }
 
 // ============================================================
@@ -1063,7 +1228,9 @@ function buildUniqueOcrMatches(ocrResults) {
 // ANALYSE OCR D'UNE VIDEO
 // ============================================================
 
-async function analyzeVideoWithOCR(video) {
+async function analyzeVideoWithOCR(video, options = {}) {
+  const debug = Boolean(options.debug);
+
   const tempDir = await createTempDir();
 
   const videoPath = path.join(tempDir, 'video.mp4');
@@ -1078,9 +1245,9 @@ async function analyzeVideoWithOCR(video) {
 
     const ocrResults = await runOCR(frames);
 
-    const questionZones = buildOcrQuestionZones(ocrResults);
-
     const questions = extractQuestionsFromOcr(ocrResults);
+
+    const groups = buildQuestionGroups(ocrResults);
 
     const validQuestions = questions.filter(
       question => question.text && question.text.length >= 4
@@ -1094,16 +1261,23 @@ async function analyzeVideoWithOCR(video) {
 
     console.log(`✅ ${validQuestions.length} question(s) détectée(s) par OCR`);
 
-    return {
+    const response = {
       ...video,
 
       verified: true,
       extractionMethod: 'video_ocr',
       questionCount: validQuestions.length,
       questions: validQuestions,
-      questionZones,
-      ocrMatches: buildUniqueOcrMatches(ocrResults)
+      groups
     };
+
+    // Données brutes volumineuses : seulement en mode debug (?debug=1)
+    if (debug) {
+      response.questionZones = buildOcrQuestionZones(ocrResults);
+      response.ocrMatches = buildUniqueOcrMatches(ocrResults);
+    }
+
+    return response;
   } finally {
     // Nettoyage systématique
     try {
@@ -1120,7 +1294,7 @@ async function analyzeVideoWithOCR(video) {
 // ANALYSE TRANSCRIPT + OCR
 // ============================================================
 
-async function analyzeListeningVideo(video) {
+async function analyzeListeningVideo(video, options = {}) {
   // ----------------------------------------------------------
   // 1. Essai transcript
   // ----------------------------------------------------------
@@ -1172,7 +1346,7 @@ async function analyzeListeningVideo(video) {
   console.log('📺 Transcript inutilisable ou sans questions.');
   console.log('🔎 Passage à l’analyse OCR de la vidéo...');
 
-  return await analyzeVideoWithOCR(video);
+  return await analyzeVideoWithOCR(video, options);
 }
 
 // ============================================================
@@ -1289,7 +1463,9 @@ router.get('/ielts/test-video', async (req, res) => {
 
     video.quality = 100;
 
-    const result = await analyzeListeningVideo(video);
+    const result = await analyzeListeningVideo(video, {
+      debug: req.query.debug === '1'
+    });
 
     if (!result) {
       return res.json({
@@ -1384,7 +1560,9 @@ router.get('/ielts/test-ocr', async (req, res) => {
 
     const video = buildVideoObject(details[0]);
 
-    const result = await analyzeVideoWithOCR(video);
+    const result = await analyzeVideoWithOCR(video, {
+      debug: req.query.debug === '1'
+    });
 
     if (!result) {
       return res.json({
@@ -1395,16 +1573,23 @@ router.get('/ielts/test-ocr', async (req, res) => {
       });
     }
 
-    return res.json({
+    const body = {
       ok: true,
       videoId,
       title: video.title,
       extractionMethod: result.extractionMethod,
       questionCount: result.questionCount,
       questions: result.questions,
-      questionZones: result.questionZones,
-      ocrMatches: result.ocrMatches
-    });
+      groups: result.groups
+    };
+
+    // ?debug=1 : ajoute les textes OCR bruts
+    if (req.query.debug === '1') {
+      body.questionZones = result.questionZones;
+      body.ocrMatches = result.ocrMatches;
+    }
+
+    return res.json(body);
   } catch (error) {
     console.error('❌ ERREUR TEST OCR:', error.message);
 
