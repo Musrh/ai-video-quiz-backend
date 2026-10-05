@@ -617,8 +617,10 @@ function looksLikeQuestionText(text) {
 function cleanOcrText(text) {
   return String(text || '')
     .replace(/\r/g, '')
-    // Filigrane / copyright des vidéos
+    // Filigrane / copyright et bandeaux des vidéos
     .replace(/copyright\s*:?[^\n]*/gi, '')
+    .replace(/read\s+carefully/gi, '')
+    .replace(/subscribe\s+for\s+more\s+videos/gi, '')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n[ \t]+/g, '\n')
     .replace(/\n{3,}/g, '\n\n')
@@ -725,11 +727,12 @@ function isLeaderGarbage(token) {
 function cleanQuestionText(text) {
   return String(text || '')
     .replace(/copyright\s*:?[^\n]*/gi, '')
+    .replace(/read\s+carefully/gi, '')
     .replace(/@/g, 'a') // "@nd" -> "and"
     .split(/\s+/)
     .filter(token => token && !isLeaderGarbage(token))
     .join(' ')
-    .replace(/[\s©+*¢ª&#~^]+$/, '') // symboles parasites en fin de texte
+    .replace(/[\s©+*¢ª&#~^_—–-]+$/, '') // symboles parasites en fin de texte
     .trim();
 }
 
@@ -770,24 +773,73 @@ const COMMON_TAIL_WORDS = new Set([
   'are', 'is', 'was', 'will', 'with', 'from', 'that', 'this'
 ]);
 
-// Texte après "(n)" : utile seulement s'il contient un vrai mot
-// (évite "i TUR", "occa"... issus des pointillés mal lus)
-function isUsefulTail(tail) {
-  if (!/\b[a-z]{3,}\b/.test(tail)) {
+const SHORT_WORDS = new Set([
+  'a', 'an', 'of', 'to', 'in', 'on', 'at', 'by', 'or', 'is', 'it', 'as',
+  'no', 'be', 'we', 'he', 'so', 'if', 'my', 'up', 'do', 'i', 'us', 'me', 'am'
+]);
+
+// Un "mot" plausible (et non un symbole, des pointillés ou du bruit OCR)
+function isWordToken(token) {
+  if (isLeaderGarbage(token)) {
     return false;
   }
 
-  const tokens = tail.split(/\s+/).filter(Boolean);
+  if (/^[?.,;:!]+$/.test(token)) {
+    return true;
+  }
 
-  if (
-    tokens.length === 1 &&
-    /^[a-z]{3,6}[.,]?$/.test(tokens[0]) &&
-    !COMMON_TAIL_WORDS.has(tokens[0].replace(/[.,]$/, ''))
-  ) {
+  // Nombres, heures, montants : 1695, £450, 7.30, 17th
+  if (/^[£$€]?\d[\d.,:/-]*[%a-z]{0,3}$/i.test(token)) {
+    return true;
+  }
+
+  const bare = token.replace(/^[("'“‘]+|[)"'”’.,;:!?]+$/g, '');
+  const letters = bare.replace(/[^A-Za-z]/g, '');
+
+  if (!letters || letters.length !== bare.replace(/['’-]/g, '').length) {
     return false;
   }
 
-  return true;
+  if (letters.length <= 2) {
+    return SHORT_WORDS.has(bare.toLowerCase());
+  }
+
+  const lower = letters.replace(/[^a-z]/g, '').length;
+
+  return lower / letters.length >= 0.5;
+}
+
+// Texte après "(n)" : ne garde que les vrais mots
+// ("Anthropology pr —" -> "Anthropology", "i TUR" -> "")
+function cleanTail(rawTail) {
+  const tokens = String(rawTail || '')
+    .replace(/@/g, 'a') // "@nd" -> "and"
+    .split(/\s+/)
+    .filter(Boolean)
+    .filter(isWordToken);
+
+  if (!tokens.some(token => /[A-Za-z0-9]/.test(token))) {
+    return '';
+  }
+
+  if (tokens.length === 1) {
+    const only = tokens[0];
+
+    // Un seul mot minuscule court et rare : presque toujours du bruit ("occa")
+    if (
+      /^[a-z]{3,6}[.,]?$/.test(only) &&
+      !COMMON_TAIL_WORDS.has(only.replace(/[.,]$/, ''))
+    ) {
+      return '';
+    }
+
+    // Une ou deux lettres seules
+    if (/^[A-Za-z]{1,2}[.,]?$/.test(only)) {
+      return '';
+    }
+  }
+
+  return tokens.join(' ');
 }
 
 // "Occupation H = ) RE" -> "Occupation" ; "Phone number Hl |)" -> "Phone number"
@@ -812,9 +864,10 @@ function labelFromLine(line) {
     return null;
   }
 
+  const tokens = line.split(/\s+/);
   const words = [];
 
-  for (const token of line.split(/\s+/)) {
+  for (const token of tokens) {
     if (/^[A-Z]?[a-z]{3,}$/.test(token)) {
       words.push(token);
     } else {
@@ -823,6 +876,14 @@ function labelFromLine(line) {
   }
 
   if (words.length === 0 || !/^[A-Z]/.test(words[0])) {
+    return null;
+  }
+
+  // Une vraie étiquette de formulaire est suivie du reste illisible de la case
+  // numérotée ("Occupation H = ) RE") ; une phrase normale ne l'est pas.
+  const rest = tokens.slice(words.length);
+
+  if (rest.length === 0 || !rest.some(token => !isWordToken(token))) {
     return null;
   }
 
@@ -995,6 +1056,20 @@ function parseFrameQuestions(result, missingHint = null) {
       continue;
     }
 
+    // ----- Une option par ligne : "(A) This will focus on how..." -----
+    const singleOption = line.match(/^\(([A-H])\)\s*(.{3,})$/);
+
+    if (singleOption) {
+      const letter = singleOption[1];
+
+      groupOptions = groupOptions
+        .filter(option => option.letter !== letter)
+        .concat({ letter, text: cleanQuestionText(singleOption[2]) })
+        .sort((a, b) => a.letter.localeCompare(b.letter));
+
+      continue;
+    }
+
     // ----- Questions à compléter : "Last name: (1)" -----
     const markers = [...line.matchAll(/\((\d{1,2})\)/g)].filter(m =>
       isValidQuestionNumber(Number(m[1]))
@@ -1023,12 +1098,14 @@ function parseFrameQuestions(result, missingHint = null) {
 
       groupHasQuestion = true;
 
-      // Texte après le dernier "(n)" : gardé seulement s'il contient un vrai mot
-      // (évite les caractères parasites type "i TUR")
-      const tail = line.slice(cursor).trim();
+      // Texte après le dernier "(n)" : seuls les vrais mots sont gardés
+      // (évite les pointillés et caractères parasites type "i TUR")
+      const cleanedTail = cleanTail(line.slice(cursor));
 
-      if (tail && lastQuestion && isUsefulTail(tail)) {
-        lastQuestion.text = cleanQuestionText(`${lastQuestion.text} ${tail}`);
+      if (cleanedTail && lastQuestion) {
+        lastQuestion.text = cleanQuestionText(
+          `${lastQuestion.text} ${cleanedTail}`
+        );
       }
 
       // Les questions "(11) What is ... ?" peuvent être suivies de choix A/B/C
@@ -1221,6 +1298,17 @@ function parseAnswerKey(answerFrames) {
     const value = cleanAnswer(answer);
 
     if (!value || value.length > 60) {
+      return;
+    }
+
+    // Écarte le bruit OCR : "2", "n 3"... (on garde "A", "25", "sis", etc.)
+    const alnum = value.replace(/[^A-Za-z0-9]/g, '');
+
+    if (
+      alnum.length < 3 &&
+      !/^[A-E]$/.test(value) &&
+      !/^\d{2}$/.test(value)
+    ) {
       return;
     }
 
@@ -1474,6 +1562,64 @@ function splitFrameGroups(result) {
   }));
 }
 
+// Vidéos sans en-têtes "Questions X - Y" : une "page" par ensemble de numéros
+function buildFallbackGroups(ocrResults, maxTimestamp) {
+  const candidates = [];
+
+  for (const result of ocrResults) {
+    if (!result.questionLike || isAnswerKeyFrame(result, maxTimestamp)) {
+      continue;
+    }
+
+    const numbers = new Set();
+
+    for (const match of result.text.matchAll(/\((\d{1,2})\)/g)) {
+      const n = Number(match[1]);
+
+      if (isValidQuestionNumber(n)) {
+        numbers.add(n);
+      }
+    }
+
+    if (numbers.size > 0) {
+      candidates.push({ numbers, result });
+    }
+  }
+
+  // Les frames les plus complètes d'abord ; on ignore celles qui n'apportent rien
+  candidates.sort(
+    (a, b) =>
+      b.numbers.size - a.numbers.size ||
+      a.result.timestamp - b.result.timestamp
+  );
+
+  const covered = new Set();
+  const groups = [];
+
+  for (const candidate of candidates) {
+    const fresh = [...candidate.numbers].filter(n => !covered.has(n));
+
+    if (fresh.length === 0) {
+      continue;
+    }
+
+    candidate.numbers.forEach(n => covered.add(n));
+
+    const list = [...candidate.numbers].sort((a, b) => a - b);
+
+    groups.push({
+      from: list[0],
+      to: list[list.length - 1],
+      section: sectionFromNumber(list[0]),
+      startTime: candidate.result.timestamp,
+      startTimeFormatted: candidate.result.timestampFormatted,
+      text: candidate.result.text
+    });
+  }
+
+  return groups.sort((a, b) => a.from - b.from);
+}
+
 // Pour chaque groupe (ex. "Questions 21 - 25"), garde la meilleure lecture OCR
 function buildQuestionGroups(ocrResults, maxTimestamp = 0) {
   const best = new Map();
@@ -1518,6 +1664,10 @@ function buildQuestionGroups(ocrResults, maxTimestamp = 0) {
         best.set(key, candidate);
       }
     }
+  }
+
+  if (best.size === 0) {
+    return buildFallbackGroups(ocrResults, maxTimestamp);
   }
 
   return [...best.entries()]
@@ -2034,3 +2184,14 @@ router.get('/ielts/test-ocr', async (req, res) => {
 // ============================================================
 
 module.exports = router;
+
+// Fonctions réutilisées par la bibliothèque (routes/ieltsLibrary.js)
+module.exports.helpers = {
+  YOUTUBE_API_URL,
+  LISTENING_QUERIES,
+  getVideoDetails,
+  buildVideoObject,
+  processVideos,
+  getVideoIdFromUrl,
+  analyzeVideoWithOCR
+};
