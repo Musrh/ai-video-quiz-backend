@@ -9,6 +9,7 @@ const contentRouter = require('./routes/content');
 const questionsRouter = require('./routes/questions');
 
 const ieltsRouter = require('./routes/ielts');
+const ieltsLibraryRouter = require('./routes/ieltsLibrary');
 
 const app = express();
 
@@ -28,6 +29,9 @@ app.use('/api/youtube', contentRouter);
 app.use('/api/youtube', questionsRouter);
 
 app.use('/api/youtube', ieltsRouter);
+
+// Bibliothèque IELTS (vidéos sauvegardées) + page web /ielts-app
+app.use('/', ieltsLibraryRouter);
 
 
 const PORT = process.env.PORT || 8080;
