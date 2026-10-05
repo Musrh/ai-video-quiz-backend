@@ -1,928 +1,128 @@
-const express = require('express');
-const axios = require('axios');
-const fs = require('fs');
-const fsp = fs.promises;
-const path = require('path');
-const crypto = require('crypto');
-
-const ielts = require('./ielts');
-
-const helpers = ielts.helpers;
-
-const router = express.Router();
-
-const API = '/api/youtube/ielts/library';
-
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-// Dossier de sauvegarde. Sur Railway, il faut un "Volume" monté sur /data,
-// sinon les données sont perdues à chaque redéploiement.
-const DATA_DIR =
-  process.env.IELTS_DATA_DIR ||
-  (fs.existsSync('/data') ? '/data' : path.join(process.cwd(), 'data'));
-
-const DATA_FILE = path.join(DATA_DIR, 'ielts-library.json');
-
-const DEFAULT_SEARCH_COUNT = 3; // vidéos ajoutées à chaque clic "plus de vidéos"
-const MAX_SEARCH_COUNT = 5;
-const MAX_API_SEARCHES_PER_RUN = 4; // limite le quota YouTube (100 unités / recherche)
-const MAX_ATTEMPTS = 2; // essais maximum pour une vidéo en erreur
-
-// ============================================================
-// SAUVEGARDE (fichier JSON)
-// ============================================================
-
-function defaultState() {
-  return {
-    videos: {}, // vidéos analysées (questions + réponses)
-    failed: {}, // vidéos sans questions exploitables ou en erreur
-    search: { queryIndex: 0, tokens: {} } // avancement de la recherche YouTube
-  };
-}
-
-let state = defaultState();
-
-function loadState() {
-  try {
-    if (fs.existsSync(DATA_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-      const base = defaultState();
-
-      state = {
-        ...base,
-        ...raw,
-        search: { ...base.search, ...(raw.search || {}) }
-      };
-    }
-
-    console.log(
-      `📚 Bibliothèque IELTS : ${Object.keys(state.videos).length} vidéo(s) ` +
-        `(fichier ${DATA_FILE})`
-    );
-
-    if (!process.env.IELTS_DATA_DIR && !fs.existsSync('/data')) {
-      console.warn(
-        '⚠️ Aucun volume /data : la bibliothèque sera perdue au prochain ' +
-          'redéploiement. Ajoute un Volume Railway monté sur /data.'
-      );
-    }
-  } catch (error) {
-    console.error('❌ Lecture de la bibliothèque impossible :', error.message);
-  }
-}
-
-let saving = Promise.resolve();
-
-function saveState() {
-  saving = saving
-    .then(async () => {
-      await fsp.mkdir(DATA_DIR, { recursive: true });
-
-      const tmp = `${DATA_FILE}.tmp`;
-
-      await fsp.writeFile(tmp, JSON.stringify(state));
-      await fsp.rename(tmp, DATA_FILE);
-    })
-    .catch(error => {
-      console.error('❌ Sauvegarde impossible :', error.message);
-    });
-
-  return saving;
-}
-
-loadState();
-
-// ============================================================
-// OUTILS
-// ============================================================
-
-function isKnown(videoId) {
-  if (state.videos[videoId]) {
-    return true;
-  }
-
-  const failed = state.failed[videoId];
-
-  return Boolean(
-    failed &&
-      (failed.kind === 'no_questions' || failed.attempts >= MAX_ATTEMPTS)
-  );
-}
-
-function markFailed(video, kind, message) {
-  const previous = state.failed[video.videoId];
-
-  state.failed[video.videoId] = {
-    videoId: video.videoId,
-    title: video.title || '',
-    kind, // 'no_questions' | 'error'
-    message: message || '',
-    attempts: (previous ? previous.attempts : 0) + 1,
-    at: new Date().toISOString()
-  };
-}
-
-function summarize(record) {
-  return {
-    videoId: record.videoId,
-    url: record.url,
-    title: record.title,
-    channelTitle: record.channelTitle,
-    thumbnail: record.thumbnail,
-    durationSeconds: record.durationSeconds,
-    status: record.status, // 'ok' | 'to_review'
-    issues: record.issues,
-    questionCount: record.questionCount,
-    hasAnswers: Object.keys(record.answers || {}).length > 0,
-    addedAt: record.addedAt,
-    source: record.source
-  };
-}
-
-// Transforme le résultat OCR en fiche sauvegardée (réponses séparées des questions)
-function buildRecord(video, result, source) {
-  const answers = {};
-
-  const questions = result.questions.map(question => {
-    const { answer, ...rest } = question;
-
-    if (answer) {
-      answers[question.number] = answer;
-    }
-
-    return rest;
-  });
-
-  const issues = [];
-
-  if (result.missingNumbers && result.missingNumbers.length > 0) {
-    issues.push(
-      `Questions non retrouvées : ${result.missingNumbers.join(', ')}`
-    );
-  }
-
-  const withoutAnswer = questions
-    .filter(question => !answers[question.number])
-    .map(question => question.number);
-
-  if (withoutAnswer.length > 0) {
-    issues.push(`Réponses manquantes : ${withoutAnswer.join(', ')}`);
-  }
-
-  const inferred = questions
-    .filter(question => question.inferred)
-    .map(question => question.number);
-
-  if (inferred.length > 0) {
-    issues.push(`Questions déduites, à vérifier : ${inferred.join(', ')}`);
-  }
-
-  return {
-    videoId: video.videoId,
-    url: `https://www.youtube.com/watch?v=${video.videoId}`,
-    title: video.title,
-    channelTitle: video.channelTitle,
-    thumbnail: video.thumbnail,
-    durationSeconds: video.durationSeconds,
-    publishedAt: video.publishedAt,
-    status: issues.length === 0 ? 'ok' : 'to_review',
-    issues,
-    questionCount: questions.length,
-    missingNumbers: result.missingNumbers || [],
-    questions,
-    answers,
-    groups: result.groups || [],
-    source,
-    addedAt: new Date().toISOString()
-  };
-}
-
-// ============================================================
-// FILE D'ANALYSE : une vidéo à la fois
-// ============================================================
-
-const queue = [];
-const queuedIds = new Set();
-
-// Vidéos en cours d'analyse (non sauvegardées) : elles apparaissent tout de suite
-// dans la liste, et la personne peut déjà les regarder en attendant le test.
-const pending = new Map();
-
-function setPending(video, pendingStatus, source, extra) {
-  const previous = pending.get(video.videoId);
-
-  pending.set(video.videoId, {
-    videoId: video.videoId,
-    url: `https://www.youtube.com/watch?v=${video.videoId}`,
-    title: video.title || video.videoId,
-    channelTitle: video.channelTitle || '',
-    thumbnail: video.thumbnail || null,
-    durationSeconds: video.durationSeconds || 0,
-    status: pendingStatus, // 'queued' | 'analyzing' | 'failed'
-    issues: [],
-    questionCount: 0,
-    hasAnswers: false,
-    addedAt: previous ? previous.addedAt : new Date().toISOString(),
-    source,
-    ...(extra || {})
-  });
-}
-
-function friendlyError(message) {
-  const text = String(message || '');
-
-  if (/sign in to confirm|not a bot/i.test(text)) {
-    return 'YouTube bloque le téléchargement (cookies à renouveler).';
-  }
-
-  if (/YOUTUBE_API_KEY/i.test(text)) {
-    return 'Clé YouTube manquante sur le serveur.';
-  }
-
-  return 'Analyse impossible pour cette vidéo.';
-}
-
-let working = false;
-
-const status = {
-  mode: null, // 'search' | 'analyze'
-  message: '',
-  current: null,
-  search: null, // { target, analyzed }
-  lastMessage: '',
-  lastError: '',
-  lastFinishedAt: null
-};
-
-function statusSnapshot() {
-  return {
-    running: working || queue.length > 0,
-    searchActive: searchIsActive(),
-    mode: status.mode,
-    message: status.message,
-    current: status.current,
-    search: status.search,
-    queueLength: queue.length,
-    libraryCount: Object.keys(state.videos).length,
-    lastMessage: status.lastMessage,
-    lastError: status.lastError,
-    lastFinishedAt: status.lastFinishedAt
-  };
-}
-
-async function analyzeAndStore(video, source) {
-  status.current = { videoId: video.videoId, title: video.title };
-  status.message = `Analyse de « ${video.title} »… (quelques minutes)`;
-
-  setPending(video, 'analyzing', source);
-
-  try {
-    // Lecture de la vidéo par OCR (questions + corrigé)
-    const result = await helpers.analyzeVideoWithOCR(video, {});
-
-    if (!result || !result.questions || result.questions.length === 0) {
-      markFailed(video, 'no_questions', 'Aucune question détectée');
-
-      if (source === 'manual') {
-        setPending(video, 'failed', source, {
-          error: 'Aucune question exploitable dans cette vidéo.'
-        });
-      } else {
-        pending.delete(video.videoId);
-      }
-
-      await saveState();
-
-      return false;
-    }
-
-    state.videos[video.videoId] = buildRecord(video, result, source);
-    delete state.failed[video.videoId];
-    pending.delete(video.videoId);
-
-    await saveState();
-
-    console.log(
-      `💾 Vidéo enregistrée : ${video.videoId} ` +
-        `(${state.videos[video.videoId].questionCount} questions, ` +
-        `${state.videos[video.videoId].status})`
-    );
-
-    return true;
-  } catch (error) {
-    console.error(`❌ Analyse ${video.videoId} :`, error.message);
-
-    markFailed(video, 'error', error.message.slice(0, 300));
-    status.lastError = `Échec pour « ${video.title || video.videoId} »`;
-
-    if (source === 'manual') {
-      setPending(video, 'failed', source, { error: friendlyError(error.message) });
-    } else {
-      pending.delete(video.videoId);
-    }
-
-    await saveState();
-
-    return false;
-  } finally {
-    status.current = null;
-  }
-}
-
-// Une page de résultats YouTube (avec jeton pour la page suivante)
-async function searchYouTubePage(query, pageToken) {
-  if (!process.env.YOUTUBE_API_KEY) {
-    throw new Error('YOUTUBE_API_KEY manquante');
-  }
-
-  const response = await axios.get(`${helpers.YOUTUBE_API_URL}/search`, {
-    params: {
-      key: process.env.YOUTUBE_API_KEY,
-      part: 'snippet',
-      q: query,
-      type: 'video',
-      maxResults: 50,
-      videoDuration: 'medium',
-      videoEmbeddable: 'true',
-      videoSyndicated: 'true',
-      relevanceLanguage: 'en',
-      regionCode: 'US',
-      ...(pageToken ? { pageToken } : {})
-    },
-    timeout: 30000
-  });
-
-  return {
-    items: response.data.items || [],
-    nextPageToken: response.data.nextPageToken || null
-  };
-}
-
-// Prochaine recherche à lancer (on fait tourner les requêtes, page après page)
-function pickQuery() {
-  const queries = helpers.LISTENING_QUERIES;
-
-  for (let i = 0; i < queries.length; i++) {
-    const index = (state.search.queryIndex + i) % queries.length;
-    const query = queries[index];
-
-    if (state.search.tokens[query] !== 'done') {
-      return { query, index, token: state.search.tokens[query] || undefined };
-    }
-  }
-
-  return null;
-}
-
-async function runSearch(count) {
-  let analyzed = 0;
-  let apiSearches = 0;
-  let resetDone = false;
-
-  status.search = { target: count, analyzed: 0 };
-
-  while (analyzed < count && apiSearches < MAX_API_SEARCHES_PER_RUN) {
-    let pick = pickQuery();
-
-    if (!pick) {
-      // Toutes les pages ont été parcourues : on recommence un tour
-      if (resetDone) {
-        break;
-      }
-
-      resetDone = true;
-      state.search = { queryIndex: 0, tokens: {} };
-      pick = pickQuery();
-
-      if (!pick) {
-        break;
-      }
-    }
-
-    status.message = `Recherche de nouvelles vidéos : « ${pick.query} »…`;
-
-    const { items, nextPageToken } = await searchYouTubePage(
-      pick.query,
-      pick.token
-    );
-
-    apiSearches++;
-
-    state.search.tokens[pick.query] = nextPageToken || 'done';
-    state.search.queryIndex = (pick.index + 1) % helpers.LISTENING_QUERIES.length;
-
-    await saveState();
-
-    const ids = items
-      .map(item => item.id && item.id.videoId)
-      .filter(Boolean)
-      .filter(id => !isKnown(id) && !queuedIds.has(id));
-
-    if (ids.length === 0) {
-      continue;
-    }
-
-    const details = await helpers.getVideoDetails(ids);
-
-    const candidates = helpers
-      .processVideos(details)
-      .sort((a, b) => b.quality - a.quality);
-
-    for (const video of candidates) {
-      if (analyzed >= count) {
-        break;
-      }
-
-      if (isKnown(video.videoId)) {
-        continue;
-      }
-
-      const ok = await analyzeAndStore(video, 'search');
-
-      if (ok) {
-        analyzed++;
-        status.search.analyzed = analyzed;
-      }
-    }
-  }
-
-  status.lastMessage =
-    analyzed > 0
-      ? `${analyzed} nouvelle(s) vidéo(s) ajoutée(s).`
-      : 'Aucune nouvelle vidéo exploitable trouvée pour le moment.';
-}
-
-async function runAnalyze(task) {
-  const videoId = task.videoId;
-
-  if (state.videos[videoId] && !task.force) {
-    return;
-  }
-
-  let video = task.video;
-
-  if (!video) {
-    status.message = 'Récupération des informations de la vidéo…';
-
-    const details = await helpers.getVideoDetails([videoId]);
-
-    if (!details || details.length === 0) {
-      setPending({ videoId, title: '' }, 'failed', 'manual', {
-        error: 'Vidéo YouTube introuvable.'
-      });
-      status.lastError = 'Vidéo YouTube introuvable';
-
-      return;
-    }
-
-    video = helpers.buildVideoObject(details[0]);
-  }
-
-  const ok = await analyzeAndStore(video, 'manual');
-
-  status.lastMessage = ok
-    ? `« ${video.title} » ajoutée.`
-    : `Aucune question exploitable dans « ${video.title} ».`;
-}
-
-async function runWorker() {
-  if (working) {
-    return;
-  }
-
-  working = true;
-
-  try {
-    while (queue.length > 0) {
-      const task = queue.shift();
-
-      status.mode = task.type;
-      status.lastError = '';
-
-      try {
-        if (task.type === 'search') {
-          await runSearch(task.count);
-        } else {
-          await runAnalyze(task);
-        }
-      } catch (error) {
-        console.error('❌ Tâche en échec :', error.message);
-
-        status.lastError = error.message;
-      } finally {
-        if (task.videoId) {
-          queuedIds.delete(task.videoId);
-        }
-      }
-    }
-  } finally {
-    working = false;
-    status.mode = null;
-    status.message = '';
-    status.current = null;
-    status.search = null;
-    status.lastFinishedAt = new Date().toISOString();
-  }
-}
-
-function enqueue(task) {
-  queue.push(task);
-
-  if (task.videoId) {
-    queuedIds.add(task.videoId);
-  }
-
-  runWorker();
-}
-
-function searchIsActive() {
-  return (
-    status.mode === 'search' || queue.some(task => task.type === 'search')
-  );
-}
-
-// ============================================================
-// ACCÈS ADMINISTRATEUR (variable IELTS_ADMIN_KEY)
-// ============================================================
-// Seul l'administrateur peut lancer des recherches, ajouter ou supprimer une
-// vidéo (ce sont ces actions qui consomment du crédit). Les autres personnes
-// voient uniquement les vidéos déjà enregistrées.
-// Tant que IELTS_ADMIN_KEY n'est pas définie, ces actions sont bloquées pour tous.
-
-const failedAdminAttempts = new Map();
-const MAX_ADMIN_ATTEMPTS = 10;
-const ADMIN_LOCK_MS = 15 * 60 * 1000;
-
-function clientIp(req) {
-  return String(req.get('x-forwarded-for') || req.ip || '')
-    .split(',')[0]
-    .trim();
-}
-
-function keyMatches(given) {
-  const secret = process.env.IELTS_ADMIN_KEY || '';
-
-  if (!secret || !given) {
-    return false;
-  }
-
-  const a = Buffer.from(String(given));
-  const b = Buffer.from(secret);
-
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
-}
-
-// La clé est envoyée dans l'en-tête "x-admin-key" (ou "?key=" pour les
-// anciennes adresses de test, utilisables depuis un navigateur).
-function providedKey(req, allowQuery) {
-  return req.get('x-admin-key') || (allowQuery ? req.query.key : '') || '';
-}
-
-function isAdminRequest(req, allowQuery = false) {
-  return keyMatches(providedKey(req, allowQuery));
-}
-
-function adminGuard(allowQuery = false) {
-  return (req, res, next) => {
-    if (!process.env.IELTS_ADMIN_KEY) {
-      return res.status(403).json({
-        ok: false,
-        error:
-          'Action réservée à l’administrateur : la variable IELTS_ADMIN_KEY ' +
-          'n’est pas définie sur le serveur.'
-      });
-    }
-
-    const ip = clientIp(req);
-    const now = Date.now();
-    const record = failedAdminAttempts.get(ip);
-
-    if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
-      return res.status(429).json({
-        ok: false,
-        error: 'Trop de tentatives. Réessaie dans quelques minutes.'
-      });
-    }
-
-    if (isAdminRequest(req, allowQuery)) {
-      failedAdminAttempts.delete(ip);
-
-      return next();
-    }
-
-    if (providedKey(req, allowQuery)) {
-      const current =
-        record && now < record.resetAt
-          ? record
-          : { count: 0, resetAt: now + ADMIN_LOCK_MS };
-
-      current.count++;
-      failedAdminAttempts.set(ip, current);
-    }
-
-    return res.status(401).json({
-      ok: false,
-      error: 'Accès réservé à l’administrateur'
-    });
-  };
-}
-
-const requireAdmin = adminGuard(false);
-
-// ============================================================
-// ROUTES
-// ============================================================
-
-// Liste des vidéos sauvegardées.
-// L'administrateur voit aussi les vidéos en cours d'analyse et l'état de la file.
-router.get(API, (req, res) => {
-  const admin = isAdminRequest(req);
-
-  const saved = Object.values(state.videos)
-    .filter(record => !(admin && pending.has(record.videoId)))
-    .sort((a, b) => String(b.addedAt).localeCompare(String(a.addedAt)))
-    .map(summarize);
-
-  const inProgress = admin
-    ? [...pending.values()].sort((a, b) =>
-        String(b.addedAt).localeCompare(String(a.addedAt))
-      )
-    : [];
-
-  res.json({
-    ok: true,
-    admin,
-    count: Object.keys(state.videos).length,
-    videos: [...inProgress, ...saved],
-    status: admin
-      ? statusSnapshot()
-      : { running: false, libraryCount: Object.keys(state.videos).length }
-  });
-});
-
-// Vérifie le mot de passe administrateur (utilisé par la page)
-router.get(`${API}/admin-check`, requireAdmin, (req, res) => {
-  res.json({ ok: true, admin: true });
-});
-
-// État de la file d'analyse (administrateur uniquement pour les détails)
-router.get(`${API}/status`, (req, res) => {
-  if (!isAdminRequest(req)) {
-    return res.json({
-      ok: true,
-      running: false,
-      libraryCount: Object.keys(state.videos).length
-    });
-  }
-
-  return res.json({ ok: true, ...statusSnapshot() });
-});
-
-// Ajouter une vidéo précise (lien ou identifiant) :
-// elle apparaît tout de suite dans la liste, l'analyse se fait en arrière-plan.
-router.post(`${API}/analyze`, requireAdmin, async (req, res) => {
-  const videoId = helpers.getVideoIdFromUrl(
-    (req.body && (req.body.videoId || req.body.url)) || ''
-  );
-
-  if (!videoId) {
-    return res.status(400).json({
-      ok: false,
-      error: 'Lien ou identifiant YouTube invalide'
-    });
-  }
-
-  const force = Boolean(req.body && req.body.force);
-
-  if (state.videos[videoId] && !force) {
-    return res.json({
-      ok: true,
-      status: 'exists',
-      video: summarize(state.videos[videoId])
-    });
-  }
-
-  if (queuedIds.has(videoId) || (status.current && status.current.videoId === videoId)) {
-    return res.json({
-      ok: true,
-      status: 'already_queued',
-      video: pending.get(videoId) || null
-    });
-  }
-
-  try {
-    const details = await helpers.getVideoDetails([videoId]);
-
-    if (!details || details.length === 0) {
-      return res.status(404).json({
-        ok: false,
-        error: 'Vidéo YouTube introuvable'
-      });
-    }
-
-    const video = helpers.buildVideoObject(details[0]);
-
-    setPending(video, 'queued', 'manual');
-
-    enqueue({ type: 'analyze', videoId, force, video });
-
-    return res.json({
-      ok: true,
-      status: 'queued',
-      video: pending.get(videoId)
-    });
-  } catch (error) {
-    return res.status(502).json({
-      ok: false,
-      error: friendlyError(error.message)
-    });
-  }
-});
-
-// "Afficher plus de vidéos" : nouvelle recherche, analyse une par une
-router.post(`${API}/search-more`, requireAdmin, (req, res) => {
-  if (searchIsActive()) {
-    return res.json({ ok: true, status: 'already_running' });
-  }
-
-  const requested = Number(req.body && req.body.count);
-
-  const count = Math.min(
-    MAX_SEARCH_COUNT,
-    Math.max(1, Number.isFinite(requested) && requested > 0 ? requested : DEFAULT_SEARCH_COUNT)
-  );
-
-  enqueue({ type: 'search', count });
-
-  return res.json({ ok: true, status: 'started', count });
-});
-
-// Questions d'une vidéo (sans les réponses)
-router.get(`${API}/:videoId`, (req, res) => {
-  const record = state.videos[req.params.videoId];
-
-  if (!record) {
-    return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
-  }
-
-  return res.json({
-    ok: true,
-    video: {
-      ...summarize(record),
-      questions: record.questions,
-      groups: record.groups
-    }
-  });
-});
-
-// Réponses d'une vidéo (bouton "Afficher les réponses")
-router.get(`${API}/:videoId/answers`, (req, res) => {
-  const record = state.videos[req.params.videoId];
-
-  if (!record) {
-    return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
-  }
-
-  return res.json({ ok: true, answers: record.answers || {} });
-});
-
-// Supprimer une vidéo (pour pouvoir la refaire)
-router.delete(`${API}/:videoId`, requireAdmin, (req, res) => {
-  const id = req.params.videoId;
-
-  // Une carte "échec" ou "en cours" se ferme sans supprimer la vidéo déjà enregistrée
-  if (pending.has(id)) {
-    pending.delete(id);
-
-    return res.json({ ok: true });
-  }
-
-  delete state.videos[id];
-  delete state.failed[id];
-
-  saveState();
-
-  res.json({ ok: true });
-});
-
-// ============================================================
-// PAGE WEB : liste des vidéos, vidéo, test, réponses
-// ============================================================
-
-const PAGE = String.raw`<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>IELTS Listening</title>
-<style>
-  :root { --bg:#f5f6f8; --card:#fff; --text:#1c1f26; --muted:#6a7080; --line:#dfe3ea; --accent:#2457d6; --ok:#1c8a4a; --warn:#b26a00; --bad:#c0392b; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#14161b; --card:#1d2027; --text:#eceef3; --muted:#9aa1b2; --line:#2c303a; --accent:#6c93ff; --ok:#4cc27f; --warn:#e2a03f; --bad:#ef6a5b; }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; font-family:-apple-system,system-ui,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--text); }
-  header, main { max-width:720px; margin:0 auto; padding:16px; }
-  h1 { margin:8px 0 4px; font-size:1.5rem; }
-  .muted { color:var(--muted); font-size:.9rem; }
-  button { font:inherit; border:0; border-radius:10px; padding:12px 16px; background:var(--accent); color:#fff; cursor:pointer; }
-  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
-  button:disabled { opacity:.5; cursor:default; }
-  button.wide { width:100%; margin-top:8px; }
-  input[type=text], input[type=password], select { font:inherit; width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
-  .add { display:flex; gap:8px; margin:12px 0; }
-  .add input { flex:1; }
-  .status { padding:10px 12px; border-radius:10px; background:var(--card); border:1px solid var(--line); margin:12px 0; font-size:.95rem; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; margin:14px 0; overflow:hidden; }
-  .thumb { width:100%; display:block; aspect-ratio:16/9; object-fit:cover; background:var(--line); }
-  .cardbody { padding:12px 14px 14px; }
-  .cardbody h3 { margin:0 0 6px; font-size:1.02rem; line-height:1.3; }
-  .badge { display:inline-block; padding:2px 8px; border-radius:99px; font-size:.78rem; border:1px solid currentColor; }
-  .badge.ok { color:var(--ok); } .badge.review { color:var(--warn); }
-  .issues { color:var(--warn); font-size:.85rem; margin:6px 0 0; padding-left:18px; }
-  .player { position:relative; width:100%; aspect-ratio:16/9; margin-top:10px; border-radius:10px; overflow:hidden; background:#000; }
-  .player iframe { position:absolute; inset:0; width:100%; height:100%; border:0; }
-  .test { margin-top:14px; border-top:1px solid var(--line); padding-top:12px; }
-  .head { margin:16px 0 6px; padding:8px 10px; border-left:4px solid var(--accent); background:var(--bg); border-radius:6px; font-size:.92rem; }
-  .head b { display:block; }
-  .opts { margin:6px 0 0; padding-left:18px; }
-  .q { padding:10px 0; border-bottom:1px solid var(--line); }
-  .qtext { margin:0 0 6px; line-height:1.4; }
-  .choice { display:flex; align-items:flex-start; gap:8px; padding:6px 0; }
-  .choice input { margin-top:4px; }
-  .answer { margin-top:6px; font-size:.92rem; font-weight:600; }
-  .answer.right { color:var(--ok); } .answer.wrong { color:var(--bad); } .answer.plain { color:var(--accent); }
-  .score { font-weight:700; margin:12px 0; }
-  .empty { text-align:center; color:var(--muted); padding:30px 10px; }
-  .badge.wait { color:var(--accent); } .badge.bad { color:var(--bad); }
-  .notice { padding:10px 12px; border-radius:10px; margin:8px 0; font-size:.95rem; border:1px solid var(--line); background:var(--card); }
-  .notice.info { border-color:var(--accent); }
-  .notice.ok { border-color:var(--ok); color:var(--ok); }
-  .notice.warn { border-color:var(--warn); color:var(--warn); }
-  .card.flash { outline:3px solid var(--accent); transition:outline-color .3s; }
-  .row { display:flex; gap:8px; margin-top:8px; }
-  .foot { margin-top:28px; padding-top:12px; border-top:1px solid var(--line); text-align:center; }
-  button.link { background:transparent; color:var(--muted); padding:6px 8px; font-size:.85rem; text-decoration:underline; }
-  .foot .row { max-width:420px; margin:8px auto 0; }
-  .row button { flex:1; }
-</style>
-</head>
-<body>
-<header>
-  <h1>IELTS Listening</h1>
-  <div class="muted" id="sub">Tests enregistrés</div>
-</header>
-<main>
-  <div id="adminTop" hidden>
-    <div class="add">
-      <input type="text" id="addInput" placeholder="Lien ou identifiant YouTube">
-      <button id="addBtn">Ajouter</button>
-    </div>
-    <div class="notice" id="notice" hidden></div>
-    <div class="status" id="statusBar" hidden></div>
-  </div>
-  <div id="list"></div>
-  <div id="adminMore" hidden>
-    <button class="wide" id="moreBtn">Afficher plus de vidéos</button>
-  </div>
-  <div class="foot">
-    <button class="link" id="adminLink">Espace administrateur</button>
-    <div class="row" id="loginBox" hidden>
-      <input type="password" id="adminPass" placeholder="Mot de passe administrateur" autocomplete="current-password">
-      <button id="loginBtn">Valider</button>
-    </div>
-    <div class="muted" id="loginMsg"></div>
-  </div>
-</main>
-<script>
+/* =========================================================
+   IELTS Listening : relie index.html à la bibliothèque du serveur
+   (liste des tests enregistrés, vidéo, vrai test, réponses,
+   espace administrateur pour ajouter ou chercher des vidéos).
+   À charger APRÈS le script principal de index.html.
+   ========================================================= */
 (function () {
-  // Mot de passe administrateur : gardé dans le navigateur de l'administrateur uniquement
+  'use strict';
+
+  var LIB_BASE = API_BASE + '/api/youtube/ielts/library';
+
+  // ---------- Textes (FR / EN / AR) ----------
+  var TEXT = {
+    fr: {
+      libEmptyUser: 'Aucun test IELTS disponible pour le moment.',
+      libEmptyAdmin: 'Aucune vidéo pour le moment. Utilise « Afficher plus de vidéos » ou ajoute un lien.',
+      libShowVideo: 'Afficher la vidéo', libStartTest: 'Commencer le test', libPreparing: 'Test en préparation…',
+      libQuestions: 'questions', libReview: 'À relire', libAnalyzing: 'analyse en cours…', libQueued: 'en attente', libFailed: 'échec',
+      libMsgAnalyzing: 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.',
+      libMsgQueued: 'En attente d’analyse : tu peux déjà regarder la vidéo.', libMsgFailed: 'Analyse impossible pour cette vidéo.',
+      libRetry: 'Réessayer', libClose: 'Fermer', libYourAnswer: 'Ta réponse', libChoose: '— choisir —',
+      libShowAnswers: 'Afficher les réponses', libHideAnswers: 'Masquer les réponses', libAnswer: 'Réponse',
+      libAnswerNA: 'Réponse non disponible', libScore: 'Score', libLoadingQuestions: 'Chargement des questions…',
+      libAdmin: 'Espace administrateur', libLogout: 'Se déconnecter (administrateur)', libPassword: 'Mot de passe administrateur',
+      libValidate: 'Valider', libChecking: 'Vérification…', libWrongPass: 'Mot de passe incorrect.', libConnFail: 'Connexion impossible, réessaie.',
+      libAddPlaceholder: 'Lien ou identifiant YouTube', libAdd: 'Ajouter', libMore: 'Afficher plus de vidéos',
+      libPasteLink: 'Colle un lien ou un identifiant YouTube.', libSearching: '🔎 Recherche de la vidéo…',
+      libExists: '✅ Vidéo existante :', libExistsEnd: 'Elle est déjà dans la liste.',
+      libAlreadyRunning: '⏳ Cette vidéo est déjà en cours d’analyse.', libFound: 'Vidéo trouvée :',
+      libFoundEnd: 'Analyse lancée : tu peux déjà la regarder, le test sera prêt dans quelques minutes.',
+      libWorking: 'Traitement en cours…', libWaiting: 'en attente', libAdded: 'ajoutées',
+      libLoadError: 'Impossible de charger les tests IELTS pour le moment.'
+    },
+    en: {
+      libEmptyUser: 'No IELTS test is available yet.',
+      libEmptyAdmin: 'No video yet. Use “Show more videos” or add a link.',
+      libShowVideo: 'Show the video', libStartTest: 'Start the test', libPreparing: 'Test being prepared…',
+      libQuestions: 'questions', libReview: 'Needs review', libAnalyzing: 'analysis in progress…', libQueued: 'waiting', libFailed: 'failed',
+      libMsgAnalyzing: 'Analysis in progress: you can already watch the video, the test will be ready in a few minutes.',
+      libMsgQueued: 'Waiting for analysis: you can already watch the video.', libMsgFailed: 'This video could not be analyzed.',
+      libRetry: 'Try again', libClose: 'Close', libYourAnswer: 'Your answer', libChoose: '— choose —',
+      libShowAnswers: 'Show answers', libHideAnswers: 'Hide answers', libAnswer: 'Answer',
+      libAnswerNA: 'Answer not available', libScore: 'Score', libLoadingQuestions: 'Loading questions…',
+      libAdmin: 'Administrator area', libLogout: 'Log out (administrator)', libPassword: 'Administrator password',
+      libValidate: 'Confirm', libChecking: 'Checking…', libWrongPass: 'Wrong password.', libConnFail: 'Connection failed, try again.',
+      libAddPlaceholder: 'YouTube link or ID', libAdd: 'Add', libMore: 'Show more videos',
+      libPasteLink: 'Paste a YouTube link or ID.', libSearching: '🔎 Looking for the video…',
+      libExists: '✅ Video already exists:', libExistsEnd: 'It is already in the list.',
+      libAlreadyRunning: '⏳ This video is already being analyzed.', libFound: 'Video found:',
+      libFoundEnd: 'Analysis started: you can already watch it, the test will be ready in a few minutes.',
+      libWorking: 'Working…', libWaiting: 'waiting', libAdded: 'added',
+      libLoadError: 'Unable to load IELTS tests right now.'
+    },
+    ar: {
+      libEmptyUser: 'لا توجد اختبارات IELTS متاحة حاليا.',
+      libEmptyAdmin: 'لا توجد فيديوهات بعد. استخدم «عرض المزيد من الفيديوهات» أو أضف رابطا.',
+      libShowVideo: 'عرض الفيديو', libStartTest: 'ابدأ الاختبار', libPreparing: 'الاختبار قيد الإعداد…',
+      libQuestions: 'سؤالا', libReview: 'قيد المراجعة', libAnalyzing: 'جار التحليل…', libQueued: 'في الانتظار', libFailed: 'فشل',
+      libMsgAnalyzing: 'التحليل جار: يمكنك مشاهدة الفيديو الآن، وسيكون الاختبار جاهزا خلال دقائق.',
+      libMsgQueued: 'في انتظار التحليل: يمكنك مشاهدة الفيديو الآن.', libMsgFailed: 'تعذر تحليل هذا الفيديو.',
+      libRetry: 'إعادة المحاولة', libClose: 'إغلاق', libYourAnswer: 'إجابتك', libChoose: '— اختر —',
+      libShowAnswers: 'عرض الإجابات', libHideAnswers: 'إخفاء الإجابات', libAnswer: 'الإجابة',
+      libAnswerNA: 'الإجابة غير متوفرة', libScore: 'النتيجة', libLoadingQuestions: 'جار تحميل الأسئلة…',
+      libAdmin: 'مساحة المشرف', libLogout: 'تسجيل الخروج (مشرف)', libPassword: 'كلمة مرور المشرف',
+      libValidate: 'تأكيد', libChecking: 'جار التحقق…', libWrongPass: 'كلمة المرور غير صحيحة.', libConnFail: 'تعذر الاتصال، حاول مرة أخرى.',
+      libAddPlaceholder: 'رابط أو معرف YouTube', libAdd: 'إضافة', libMore: 'عرض المزيد من الفيديوهات',
+      libPasteLink: 'ألصق رابط أو معرف YouTube.', libSearching: '🔎 جار البحث عن الفيديو…',
+      libExists: '✅ الفيديو موجود:', libExistsEnd: 'هو موجود بالفعل في القائمة.',
+      libAlreadyRunning: '⏳ هذا الفيديو قيد التحليل بالفعل.', libFound: 'تم العثور على الفيديو:',
+      libFoundEnd: 'بدأ التحليل: يمكنك مشاهدته الآن، وسيكون الاختبار جاهزا خلال دقائق.',
+      libWorking: 'جار المعالجة…', libWaiting: 'في الانتظار', libAdded: 'تمت إضافتها',
+      libLoadError: 'تعذر تحميل اختبارات IELTS حاليا.'
+    }
+  };
+
+  function L(key) {
+    var pack = TEXT[interfaceLanguage] || TEXT.fr;
+    return pack[key] !== undefined ? pack[key] : TEXT.fr[key];
+  }
+
+  // ---------- Styles (ajoutés sans toucher au CSS de index.html) ----------
+  var style = document.createElement('style');
+  style.textContent = [
+    '.ielts-video-card.lib-open{grid-column:1 / -1}',
+    '.lib-player{position:relative;width:100%;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:12px;background:#000;margin:12px 0}',
+    '.lib-player iframe{position:absolute;top:0;left:0;width:100%;height:100%;border:0}',
+    '.lib-msg{color:#64748b;font-size:13px;margin:6px 0;line-height:1.5}',
+    '.lib-issues{color:#b45309;font-size:13px;margin:6px 0;padding-left:18px;line-height:1.5}',
+    '[dir="rtl"] .lib-issues{padding-left:0;padding-right:18px}',
+    '.lib-row{display:flex;gap:8px;margin-top:8px}.lib-row button{flex:1}',
+    '.lib-chip-review{background:#fef3c7;color:#92400e}.lib-chip-wait{background:#e0e7ff;color:#3730a3}.lib-chip-bad{background:#fee2e2;color:#991b1b}',
+    '.lib-secondary{background:#fff;color:#4f46e5;border:1px solid #a5b4fc;box-shadow:none}',
+    '.lib-test{margin-top:14px;border-top:1px solid #e2e8f0;padding-top:12px}',
+    '.lib-head{margin:16px 0 6px;padding:10px 12px;border-left:4px solid #4f46e5;background:#f8fafc;border-radius:8px;font-size:14px;line-height:1.5}',
+    '[dir="rtl"] .lib-head{border-left:0;border-right:4px solid #4f46e5}',
+    '.lib-head b{display:block}',
+    '.lib-opts{margin:6px 0 0;padding-left:20px;font-size:14px;line-height:1.6}',
+    '[dir="rtl"] .lib-opts{padding-left:0;padding-right:20px}',
+    '.lib-q{padding:12px 0;border-bottom:1px solid #e2e8f0}',
+    '.lib-qtext{margin:0 0 8px;font-weight:700;line-height:1.45}',
+    '.lib-choice{display:flex;align-items:flex-start;gap:8px;padding:6px 0;cursor:pointer;line-height:1.45}',
+    '.lib-choice input{margin-top:4px}',
+    '.lib-input,.lib-select{width:100%;padding:12px;border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;font-size:16px;color:inherit}',
+    '.lib-answer{margin-top:8px;font-weight:700;font-size:14px}',
+    '.lib-answer.right{color:#16a34a}.lib-answer.wrong{color:#dc2626}.lib-answer.plain{color:#4f46e5}',
+    '.lib-score{font-weight:800;font-size:18px;margin:14px 0;text-align:center}',
+    '.lib-notice{padding:10px 12px;border-radius:10px;margin:10px 0;font-size:14px;border:1px solid #e2e8f0;background:#fff;line-height:1.5}',
+    '.lib-notice.info{border-color:#4f46e5}.lib-notice.ok{border-color:#16a34a;color:#166534}.lib-notice.warn{border-color:#d97706;color:#92400e}',
+    '.lib-add{display:flex;gap:8px;margin:12px 0}.lib-add input{flex:1}',
+    '.lib-foot{margin-top:26px;padding-top:12px;border-top:1px solid #e2e8f0;text-align:center}',
+    '.lib-link{background:transparent;color:#64748b;box-shadow:none;padding:6px 8px;font-size:13px;font-weight:600;text-decoration:underline}',
+    '.lib-foot .lib-row{max-width:420px;margin:8px auto 0}',
+    '.lib-flash{outline:3px solid #4f46e5}'
+  ].join('\n');
+  document.head.appendChild(style);
+
+  // ---------- Outils ----------
   var KEY = null;
   try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
+
   var isAdminUI = false;
-  var BASE = '/api/youtube/ielts/library';
-
-  var listEl = document.getElementById('list');
-  var statusBar = document.getElementById('statusBar');
-  var moreBtn = document.getElementById('moreBtn');
-  var addBtn = document.getElementById('addBtn');
-  var addInput = document.getElementById('addInput');
-  var subEl = document.getElementById('sub');
-  var noticeEl = document.getElementById('notice');
-  var adminTop = document.getElementById('adminTop');
-  var adminMore = document.getElementById('adminMore');
-  var adminLink = document.getElementById('adminLink');
-  var loginBox = document.getElementById('loginBox');
-  var adminPass = document.getElementById('adminPass');
-  var loginBtn = document.getElementById('loginBtn');
-  var loginMsg = document.getElementById('loginMsg');
-  var noticeTimer = null;
-
-  var pollTimer = null;
   var cards = {};
-  var emptyEl = null;
+  var pollTimer = null;
+  var noticeTimer = null;
+  var ui = null;
 
   function el(tag, props, kids) {
     var node = document.createElement(tag);
@@ -930,7 +130,6 @@ const PAGE = String.raw`<!doctype html>
       var v = props[k];
       if (k === 'text') node.textContent = v;
       else if (k === 'class') node.className = v;
-      else if (k.indexOf('on') === 0) node.addEventListener(k.slice(2), v);
       else node.setAttribute(k, v);
     });
     (kids || []).forEach(function (c) {
@@ -947,43 +146,56 @@ const PAGE = String.raw`<!doctype html>
       options.body = JSON.stringify(options.body);
       options.headers['Content-Type'] = 'application/json';
     }
-    return fetch(BASE + path, options).then(function (r) { return r.json(); });
+    return fetch(LIB_BASE + path, options).then(function (r) { return r.json(); });
   }
 
   function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
 
-  // ---------- Messages à la personne (ajout d'une vidéo) ----------
+  // Accepte les variantes de la réponse : "colour / color"
+  function matches(mine, correct) {
+    var m = norm(mine);
+    if (!m) return false;
+    return String(correct).split(/\s*(?:\/|\bor\b)\s*/i).some(function (alt) { return norm(alt) === m; });
+  }
+
+  function cleanText(q) {
+    var text = q.text || '';
+    if (/^\(\d{1,2}\)\s*/.test(text)) return text.replace(/^\(\d{1,2}\)\s*/, '');
+    return text.replace(/\(\d{1,2}\)/g, '________');
+  }
+
+  function fmtDuration(sec) {
+    sec = Math.max(0, Math.floor(Number(sec) || 0));
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    var two = function (n) { return (n < 10 ? '0' : '') + n; };
+    return h > 0 ? h + ':' + two(m) + ':' + two(s) : m + ':' + two(s);
+  }
+
+  function isReady(v) { return v.status === 'ok' || v.status === 'to_review'; }
+
+  // ---------- Messages à l'administrateur ----------
   function showNotice(text, kind, seconds) {
     if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
-    if (!text) { noticeEl.hidden = true; return; }
-    noticeEl.hidden = false;
-    noticeEl.className = 'notice ' + (kind || 'info');
-    noticeEl.textContent = text;
-    if (seconds) noticeTimer = setTimeout(function () { noticeEl.hidden = true; }, seconds * 1000);
+    if (!text) { ui.notice.hidden = true; return; }
+    ui.notice.hidden = false;
+    ui.notice.className = 'lib-notice ' + (kind || 'info');
+    ui.notice.textContent = text;
+    if (seconds) noticeTimer = setTimeout(function () { ui.notice.hidden = true; }, seconds * 1000);
   }
 
-  // Fait défiler jusqu'à la carte et la fait clignoter un instant
-  function highlight(videoId) {
-    var c = cards[videoId];
-    if (!c) return;
-    if (c.node.scrollIntoView) c.node.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    c.node.classList.add('flash');
-    setTimeout(function () { c.node.classList.remove('flash'); }, 2500);
-  }
-
-  // ---------- Statut ----------
   function showStatus(text) {
-    if (!text) { statusBar.hidden = true; return; }
-    statusBar.hidden = false;
-    statusBar.textContent = text;
+    if (!text) { ui.status.hidden = true; return; }
+    ui.status.hidden = false;
+    ui.status.className = 'lib-notice';
+    ui.status.textContent = text;
   }
 
   function updateStatus(s) {
-    moreBtn.disabled = !!s.searchActive;
+    ui.moreBtn.disabled = !!s.searchActive;
     if (s.running) {
-      var text = s.message || 'Traitement en cours…';
-      if (s.search) text += '  (' + s.search.analyzed + '/' + s.search.target + ' ajoutées)';
-      if (s.queueLength > 1) text += '  — ' + (s.queueLength - 1) + ' en attente';
+      var text = s.message || L('libWorking');
+      if (s.search) text += '  (' + s.search.analyzed + '/' + s.search.target + ' ' + L('libAdded') + ')';
+      if (s.queueLength > 1) text += '  — ' + (s.queueLength - 1) + ' ' + L('libWaiting');
       showStatus(text);
     } else if (s.lastError) {
       showStatus('⚠️ ' + s.lastError + (s.lastMessage ? ' — ' + s.lastMessage : ''));
@@ -992,24 +204,31 @@ const PAGE = String.raw`<!doctype html>
     }
   }
 
-  function schedulePoll() {
-    if (!pollTimer) pollTimer = setInterval(refreshAll, 4000);
-  }
-  function stopPoll() {
-    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  function highlight(videoId) {
+    var c = cards[videoId];
+    if (!c) return;
+    if (c.node.scrollIntoView) c.node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    c.node.classList.add('lib-flash');
+    setTimeout(function () { c.node.classList.remove('lib-flash'); }, 2500);
   }
 
-  // Affiche ou masque tout ce qui est réservé à l'administrateur
+  // ---------- Interface administrateur + zones ajoutées à la page ----------
+  function retextStatic() {
+    if (!ui) return;
+    ui.addInput.placeholder = L('libAddPlaceholder');
+    ui.addBtn.textContent = L('libAdd');
+    ui.moreBtn.textContent = L('libMore');
+    ui.adminLink.textContent = isAdminUI ? L('libLogout') : L('libAdmin');
+    ui.pass.placeholder = L('libPassword');
+    ui.loginBtn.textContent = L('libValidate');
+    ui.empty.textContent = isAdminUI ? L('libEmptyAdmin') : L('libEmptyUser');
+  }
+
   function setAdminUI(on) {
     isAdminUI = on;
-    adminTop.hidden = !on;
-    adminMore.hidden = !on;
-    adminLink.textContent = on ? 'Se déconnecter (administrateur)' : 'Espace administrateur';
-    if (emptyEl) {
-      emptyEl.textContent = on
-        ? 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.'
-        : 'Aucune vidéo disponible pour le moment.';
-    }
+    ui.top.hidden = !on;
+    ui.more.hidden = !on;
+    retextStatic();
   }
 
   function resetCards() {
@@ -1022,14 +241,141 @@ const PAGE = String.raw`<!doctype html>
     try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
   }
 
+  function ensureUI() {
+    if (ui) return;
+    ui = {};
+
+    // Zone d'ajout (administrateur)
+    ui.addInput = el('input', { type: 'text', class: 'lib-input', autocomplete: 'off', autocapitalize: 'off' });
+    ui.addBtn = el('button', { type: 'button' });
+    ui.notice = el('div', { class: 'lib-notice', hidden: '' });
+    ui.status = el('div', { class: 'lib-notice', hidden: '' });
+    ui.top = el('div', { hidden: '' }, [el('div', { class: 'lib-add' }, [ui.addInput, ui.addBtn]), ui.notice, ui.status]);
+    ieltsScreen.insertBefore(ui.top, ieltsError);
+
+    // Message "aucune vidéo"
+    ui.empty = el('div', { class: 'ielts-empty', hidden: '' });
+    ieltsScreen.insertBefore(ui.empty, ieltsVideoGrid);
+
+    // Bouton "Afficher plus de vidéos" (administrateur)
+    ui.moreBtn = el('button', { type: 'button', class: 'ielts-watch primary' });
+    ui.more = el('div', { hidden: '', style: 'margin-top:16px' }, [ui.moreBtn]);
+
+    // Connexion administrateur
+    ui.adminLink = el('button', { type: 'button', class: 'lib-link' });
+    ui.pass = el('input', { type: 'password', class: 'lib-input', autocomplete: 'current-password' });
+    ui.loginBtn = el('button', { type: 'button' });
+    ui.loginBox = el('div', { class: 'lib-row', hidden: '' }, [ui.pass, ui.loginBtn]);
+    ui.loginMsg = el('div', { class: 'lib-msg' });
+    ui.foot = el('div', { class: 'lib-foot' }, [ui.adminLink, ui.loginBox, ui.loginMsg]);
+
+    ieltsVideoGrid.parentNode.insertBefore(ui.more, ieltsVideoGrid.nextSibling);
+    ui.more.parentNode.insertBefore(ui.foot, ui.more.nextSibling);
+
+    ui.addBtn.addEventListener('click', addVideo);
+    ui.addInput.addEventListener('keydown', function (e) { if (e.key === 'Enter') addVideo(); });
+
+    ui.moreBtn.addEventListener('click', function () {
+      ui.moreBtn.disabled = true;
+      api('/search-more', { method: 'POST', body: { count: 3 } }).then(function (r) {
+        if (r.ok === false) showNotice('⚠️ ' + (r.error || 'Erreur'), 'warn', 10);
+        refreshAll();
+        schedulePoll();
+      });
+    });
+
+    ui.adminLink.addEventListener('click', function () {
+      if (isAdminUI) {
+        forgetKey();
+        resetCards();
+        ui.loginMsg.textContent = '';
+        refreshAll();
+      } else {
+        ui.loginBox.hidden = !ui.loginBox.hidden;
+        ui.loginMsg.textContent = '';
+        if (!ui.loginBox.hidden) ui.pass.focus();
+      }
+    });
+
+    ui.loginBtn.addEventListener('click', login);
+    ui.pass.addEventListener('keydown', function (e) { if (e.key === 'Enter') login(); });
+
+    retextStatic();
+  }
+
+  function login() {
+    var value = ui.pass.value;
+    if (!value) return;
+    ui.loginMsg.textContent = L('libChecking');
+    fetch(LIB_BASE + '/admin-check', { headers: { 'x-admin-key': value } })
+      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.ok) {
+          KEY = value;
+          try { localStorage.setItem('ieltsAdminKey', value); } catch (e) {}
+          ui.pass.value = '';
+          ui.loginBox.hidden = true;
+          ui.loginMsg.textContent = '';
+          resetCards();
+          refreshAll();
+        } else {
+          ui.loginMsg.textContent = r.error || L('libWrongPass');
+        }
+      })
+      .catch(function () { ui.loginMsg.textContent = L('libConnFail'); });
+  }
+
+  function addVideo() {
+    var value = ui.addInput.value.trim();
+    if (!value) { showNotice(L('libPasteLink'), 'warn', 6); return; }
+
+    ui.addBtn.disabled = true;
+    ui.addInput.disabled = true;
+    showNotice(L('libSearching'), 'info');
+
+    api('/analyze', { method: 'POST', body: { videoId: value } }).then(function (r) {
+      var id = r.video && r.video.videoId;
+      var title = r.video && r.video.title ? ' « ' + r.video.title + ' »' : '';
+
+      if (r.ok === false) { showNotice('⚠️ ' + (r.error || 'Erreur'), 'warn', 10); return; }
+
+      ui.addInput.value = '';
+      if (r.status === 'exists') showNotice(L('libExists') + title + '. ' + L('libExistsEnd'), 'ok', 10);
+      else if (r.status === 'already_queued') showNotice(L('libAlreadyRunning'), 'info', 10);
+      else showNotice(L('libFound') + title + '. ' + L('libFoundEnd'), 'ok', 12);
+
+      schedulePoll();
+      return refreshAll().then(function () { if (id) highlight(id); });
+    }).catch(function () {
+      showNotice('⚠️ ' + L('libConnFail'), 'warn', 10);
+    }).then(function () {
+      ui.addBtn.disabled = false;
+      ui.addInput.disabled = false;
+    });
+  }
+
+  // ---------- Mise à jour de la liste ----------
+  function schedulePoll() {
+    if (!pollTimer) pollTimer = setInterval(function () {
+      if (state.screen !== 'ielts') { stopPoll(); return; }
+      refreshAll();
+    }, 4000);
+  }
+  function stopPoll() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
   function refreshAll() {
+    ensureUI();
     return api('').then(function (data) {
+      if (!data || data.ok === false) throw new Error('api');
+      ieltsError.classList.add('hidden');
+
       // Mot de passe enregistré mais refusé par le serveur : on l'oublie
       if (KEY && !data.admin) forgetKey();
       setAdminUI(!!data.admin);
 
-      subEl.textContent = data.count + ' test(s) enregistré(s)';
-      reconcile(data.videos);
+      reconcile(data.videos || []);
 
       if (data.admin) {
         updateStatus(data.status);
@@ -1037,22 +383,16 @@ const PAGE = String.raw`<!doctype html>
       } else {
         stopPoll();
       }
-    }).catch(function () { if (isAdminUI) schedulePoll(); });
+    }).catch(function () {
+      if (!Object.keys(cards).length) {
+        ieltsError.textContent = L('libLoadError');
+        ieltsError.classList.remove('hidden');
+      }
+      if (isAdminUI) schedulePoll();
+    });
   }
 
-  // ---------- Liste des vidéos ----------
-  function isReady(v) { return v.status === 'ok' || v.status === 'to_review'; }
-
-  function badgeInfo(v) {
-    if (v.status === 'ok') return { cls: 'ok', text: 'vérifié' };
-    if (v.status === 'to_review') return { cls: 'review', text: 'à relire' };
-    if (v.status === 'analyzing') return { cls: 'wait', text: 'analyse en cours…' };
-    if (v.status === 'queued') return { cls: 'wait', text: 'en attente' };
-    return { cls: 'bad', text: 'échec' };
-  }
-
-  // Met à jour la liste sans toucher aux cartes déjà affichées
-  // (le lecteur vidéo ouvert ne doit pas être rechargé).
+  // Met à jour sans toucher aux cartes déjà affichées (la vidéo ouverte ne se recharge pas)
   function reconcile(videos) {
     var present = {};
     videos.forEach(function (v) { present[v.videoId] = true; });
@@ -1067,38 +407,52 @@ const PAGE = String.raw`<!doctype html>
       } else {
         var c = createCard(v);
         cards[v.videoId] = c;
-        listEl.prepend(c.node);
+        ieltsVideoGrid.insertBefore(c.node, ieltsVideoGrid.firstChild);
       }
     });
 
-    emptyEl.hidden = videos.length > 0;
+    ui.empty.hidden = videos.length > 0;
+  }
+
+  // ---------- Carte d'une vidéo ----------
+  function chipFor(v) {
+    if (v.status === 'ok') return null;
+    if (v.status === 'to_review') return { cls: 'lib-chip-review', text: L('libReview') };
+    if (v.status === 'analyzing') return { cls: 'lib-chip-wait', text: L('libAnalyzing') };
+    if (v.status === 'queued') return { cls: 'lib-chip-wait', text: L('libQueued') };
+    return { cls: 'lib-chip-bad', text: L('libFailed') };
   }
 
   function createCard(v) {
     var c = { v: v, playerShown: false, testStarted: false, startState: '', actionKey: '' };
 
-    c.node = el('div', { class: 'card' });
-    if (v.thumbnail) c.node.appendChild(el('img', { class: 'thumb', src: v.thumbnail, alt: '', loading: 'lazy' }));
+    c.node = el('article', { class: 'ielts-video-card' });
+    c.node.appendChild(el('img', {
+      class: 'ielts-thumbnail',
+      src: v.thumbnail || ('https://i.ytimg.com/vi/' + encodeURIComponent(v.videoId) + '/hqdefault.jpg'),
+      alt: '', loading: 'lazy'
+    }));
 
-    var body = el('div', { class: 'cardbody' });
-    c.title = el('h3', { text: v.title || v.videoId });
-    c.countText = document.createTextNode('');
-    c.badge = el('span', { class: 'badge' });
-    c.meta = el('div', { class: 'muted' }, [c.countText, c.badge]);
-    c.issues = el('ul', { class: 'issues' });
-    c.msg = el('div', { class: 'muted' });
-    c.actions = el('div', { class: 'row' });
+    var body = el('div', { class: 'ielts-video-body' });
+    c.title = el('div', { class: 'ielts-video-title' });
+    c.channel = el('div', { class: 'ielts-video-channel' });
+    c.meta = el('div', { class: 'ielts-video-meta' });
+    c.issues = el('ul', { class: 'lib-issues' });
+    c.msg = el('div', { class: 'lib-msg' });
+    c.actions = el('div', { class: 'lib-row' });
     c.area = el('div');
     c.startBox = el('div');
 
-    c.showBtn = el('button', { class: 'wide', text: 'Afficher la vidéo' });
+    c.showBtn = el('button', { type: 'button', class: 'ielts-watch' });
     c.showBtn.addEventListener('click', function () {
       c.showBtn.remove();
       c.playerShown = true;
-      c.area.appendChild(el('div', { class: 'player' }, [
+      c.node.classList.add('lib-open');
+      c.area.appendChild(el('div', { class: 'lib-player' }, [
         el('iframe', {
-          src: 'https://www.youtube.com/embed/' + v.videoId,
-          allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture',
+          src: 'https://www.youtube.com/embed/' + encodeURIComponent(c.v.videoId),
+          title: c.v.title || 'YouTube video player',
+          allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share',
           allowfullscreen: ''
         })
       ]));
@@ -1106,7 +460,7 @@ const PAGE = String.raw`<!doctype html>
       renderStart(c);
     });
 
-    [c.title, c.meta, c.issues, c.msg, c.actions, c.showBtn, c.area].forEach(function (n) { body.appendChild(n); });
+    [c.title, c.channel, c.meta, c.issues, c.msg, c.actions, c.showBtn, c.area].forEach(function (n) { body.appendChild(n); });
     c.node.appendChild(body);
 
     updateCard(c, v);
@@ -1116,31 +470,37 @@ const PAGE = String.raw`<!doctype html>
   function updateCard(c, v) {
     c.v = v;
     c.title.textContent = v.title || v.videoId;
-    c.countText.nodeValue = isReady(v) ? (v.questionCount + ' questions  ') : '';
+    c.channel.textContent = (v.channelTitle ? t('ieltsChannel') + ': ' + v.channelTitle : '');
+    c.showBtn.textContent = L('libShowVideo');
 
-    var b = badgeInfo(v);
-    c.badge.className = 'badge ' + b.cls;
-    c.badge.textContent = b.text;
+    // Pastilles : langue, durée, nombre de questions, état
+    c.meta.innerHTML = '';
+    c.meta.appendChild(el('span', { class: 'ielts-meta', text: t('ieltsEnglish') }));
+    if (v.durationSeconds) c.meta.appendChild(el('span', { class: 'ielts-meta', text: t('ieltsDuration') + ': ' + fmtDuration(v.durationSeconds) }));
+    if (isReady(v)) c.meta.appendChild(el('span', { class: 'ielts-meta', text: v.questionCount + ' ' + L('libQuestions') }));
+    var chip = chipFor(v);
+    if (chip) c.meta.appendChild(el('span', { class: 'ielts-meta ' + chip.cls, text: chip.text }));
 
+    // Détails techniques : administrateur seulement
     c.issues.innerHTML = '';
-    (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
+    if (isAdminUI) (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
 
-    if (v.status === 'analyzing') c.msg.textContent = 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.';
-    else if (v.status === 'queued') c.msg.textContent = 'En attente d’analyse : tu peux déjà regarder la vidéo.';
-    else if (v.status === 'failed') c.msg.textContent = '⚠️ ' + (v.error || 'Analyse impossible pour cette vidéo.');
+    if (v.status === 'analyzing') c.msg.textContent = L('libMsgAnalyzing');
+    else if (v.status === 'queued') c.msg.textContent = L('libMsgQueued');
+    else if (v.status === 'failed') c.msg.textContent = '⚠️ ' + (v.error || L('libMsgFailed'));
     else c.msg.textContent = '';
 
-    // Boutons "Réessayer" / "Fermer" : reconstruits seulement si l'état change
+    // "Réessayer" / "Fermer" : administrateur seulement, reconstruits si l'état change
     var key = (v.status === 'failed' && isAdminUI) ? 'failed' : '';
     if (key !== c.actionKey) {
       c.actionKey = key;
       c.actions.innerHTML = '';
       if (key === 'failed') {
-        var retry = el('button', { class: 'secondary', text: 'Réessayer' });
+        var retry = el('button', { type: 'button', class: 'lib-secondary', text: L('libRetry') });
         retry.addEventListener('click', function () {
           api('/analyze', { method: 'POST', body: { videoId: v.videoId, force: true } }).then(function () { refreshAll(); schedulePoll(); });
         });
-        var close = el('button', { class: 'secondary', text: 'Fermer' });
+        var close = el('button', { type: 'button', class: 'lib-secondary', text: L('libClose') });
         close.addEventListener('click', function () {
           api('/' + encodeURIComponent(v.videoId), { method: 'DELETE' }).then(refreshAll);
         });
@@ -1152,38 +512,39 @@ const PAGE = String.raw`<!doctype html>
     renderStart(c);
   }
 
-  // Bouton du test : désactivé pendant l'analyse, actif dès que le test est prêt
+  // Bouton du test : grisé pendant l'analyse, actif dès que le test est prêt
   function renderStart(c) {
     if (!c.playerShown || c.testStarted) return;
-    var state = isReady(c.v) ? 'ready' : (c.v.status === 'failed' ? 'none' : 'wait');
-    if (state === c.startState) return;
-    c.startState = state;
+    var state_ = isReady(c.v) ? 'ready' : (c.v.status === 'failed' ? 'none' : 'wait');
+
+    if (state_ === c.startState) {
+      var current = c.startBox.firstChild;
+      if (current) current.textContent = state_ === 'ready' ? L('libStartTest') : L('libPreparing');
+      return;
+    }
+
+    c.startState = state_;
     c.startBox.innerHTML = '';
-    if (state === 'ready') {
-      var btn = el('button', { class: 'wide secondary', text: 'Commencer le test' });
+    if (state_ === 'ready') {
+      var btn = el('button', { type: 'button', class: 'ielts-watch primary', style: 'margin-top:8px', text: L('libStartTest') });
       btn.addEventListener('click', function () {
         c.testStarted = true;
         c.startBox.innerHTML = '';
-        loadTest(c.area, c.v);
+        loadTest(c);
       });
       c.startBox.appendChild(btn);
-    } else if (state === 'wait') {
-      var wait = el('button', { class: 'wide secondary', text: 'Test en préparation…' });
+    } else if (state_ === 'wait') {
+      var wait = el('button', { type: 'button', class: 'ielts-watch lib-secondary', style: 'margin-top:8px', text: L('libPreparing') });
       wait.disabled = true;
       c.startBox.appendChild(wait);
     }
   }
 
-  // ---------- Test ----------
-  function cleanText(q) {
-    var t = q.text || '';
-    if (/^\(\d{1,2}\)\s*/.test(t)) return t.replace(/^\(\d{1,2}\)\s*/, '');
-    return t.replace(/\(\d{1,2}\)/g, '________');
-  }
-
-  function loadTest(area, v) {
-    var box = el('div', { class: 'test' }, [el('div', { class: 'muted', text: 'Chargement des questions…' })]);
-    area.appendChild(box);
+  // ---------- Le test ----------
+  function loadTest(c) {
+    var v = c.v;
+    var box = el('div', { class: 'lib-test' }, [el('div', { class: 'lib-msg', text: L('libLoadingQuestions') })]);
+    c.area.appendChild(box);
 
     api('/' + encodeURIComponent(v.videoId)).then(function (data) {
       box.innerHTML = '';
@@ -1197,7 +558,7 @@ const PAGE = String.raw`<!doctype html>
       data.video.questions.forEach(function (q) {
         var headKey = (q.instructions || '') + '|' + (q.context || '');
         if (headKey !== lastHead && (q.instructions || q.context)) {
-          var head = el('div', { class: 'head' });
+          var head = el('div', { class: 'lib-head' });
           if (q.instructions) head.appendChild(el('b', { text: q.instructions }));
           if (q.context) head.appendChild(el('span', { text: q.context }));
           box.appendChild(head);
@@ -1206,53 +567,53 @@ const PAGE = String.raw`<!doctype html>
 
         var optKey = JSON.stringify(q.options || []);
         if (q.options && q.options.length && optKey !== lastOptions) {
-          var ul = el('ul', { class: 'opts' });
+          var ul = el('ul', { class: 'lib-opts' });
           q.options.forEach(function (o) { ul.appendChild(el('li', { text: o.letter + ' — ' + o.text })); });
           box.appendChild(ul);
         }
         lastOptions = optKey;
 
-        var block = el('div', { class: 'q' });
-        block.appendChild(el('p', { class: 'qtext', text: q.number + '. ' + cleanText(q) }));
+        var block = el('div', { class: 'lib-q' });
+        block.appendChild(el('p', { class: 'lib-qtext', text: q.number + '. ' + cleanText(q) }));
 
-        var name = 'q' + v.videoId + '_' + q.number;
+        var name = 'lib_' + v.videoId + '_' + q.number;
         if (q.choices && q.choices.length) {
-          q.choices.forEach(function (c) {
-            var radio = el('input', { type: 'radio', name: name, value: c.letter });
-            block.appendChild(el('label', { class: 'choice' }, [radio, el('span', { text: c.letter + '. ' + c.text })]));
+          q.choices.forEach(function (ch) {
+            var radio = el('input', { type: 'radio', name: name, value: ch.letter });
+            block.appendChild(el('label', { class: 'lib-choice' }, [radio, el('span', { text: ch.letter + '. ' + ch.text })]));
           });
           inputs[q.number] = function () {
             var checked = block.querySelector('input[name="' + name + '"]:checked');
             return checked ? checked.value : '';
           };
         } else if (q.options && q.options.length) {
-          var select = el('select');
-          select.appendChild(el('option', { value: '', text: '— choisir —' }));
+          var select = el('select', { class: 'lib-select' });
+          select.appendChild(el('option', { value: '', text: L('libChoose') }));
           q.options.forEach(function (o) { select.appendChild(el('option', { value: o.letter, text: o.letter + ' — ' + o.text })); });
           block.appendChild(select);
           inputs[q.number] = function () { return select.value; };
         } else {
-          var input = el('input', { type: 'text', placeholder: 'Ta réponse', autocomplete: 'off', autocapitalize: 'off' });
+          var input = el('input', { type: 'text', class: 'lib-input', placeholder: L('libYourAnswer'), autocomplete: 'off', autocapitalize: 'off' });
           block.appendChild(input);
           inputs[q.number] = function () { return input.value; };
         }
 
-        var ans = el('div', { class: 'answer', hidden: '' });
+        var ans = el('div', { class: 'lib-answer', hidden: '' });
         block.appendChild(ans);
         answerEls[q.number] = ans;
         box.appendChild(block);
       });
 
-      var scoreEl = el('div', { class: 'score', hidden: '' });
+      var scoreEl = el('div', { class: 'lib-score', hidden: '' });
       var shown = false;
       var answers = null;
 
-      var btn = el('button', { class: 'wide', text: 'Afficher les réponses' });
+      var btn = el('button', { type: 'button', class: 'ielts-watch primary', style: 'margin-top:14px', text: L('libShowAnswers') });
       btn.addEventListener('click', function () {
         if (shown) {
           Object.keys(answerEls).forEach(function (n) { answerEls[n].hidden = true; });
           scoreEl.hidden = true;
-          btn.textContent = 'Afficher les réponses';
+          btn.textContent = L('libShowAnswers');
           shown = false;
           return;
         }
@@ -1262,24 +623,24 @@ const PAGE = String.raw`<!doctype html>
             var correct = answers[n];
             var node = answerEls[n];
             node.hidden = false;
-            if (!correct) { node.className = 'answer plain'; node.textContent = 'Réponse non disponible'; return; }
+            if (!correct) { node.className = 'lib-answer plain'; node.textContent = L('libAnswerNA'); return; }
             total++;
             var mine = inputs[n]();
-            if (mine && norm(mine) === norm(correct)) {
+            if (matches(mine, correct)) {
               good++;
-              node.className = 'answer right';
+              node.className = 'lib-answer right';
               node.textContent = '✓ ' + correct;
             } else if (mine) {
-              node.className = 'answer wrong';
-              node.textContent = '✗ Réponse : ' + correct;
+              node.className = 'lib-answer wrong';
+              node.textContent = '✗ ' + L('libAnswer') + ' : ' + correct;
             } else {
-              node.className = 'answer plain';
-              node.textContent = 'Réponse : ' + correct;
+              node.className = 'lib-answer plain';
+              node.textContent = L('libAnswer') + ' : ' + correct;
             }
           });
           scoreEl.hidden = false;
-          scoreEl.textContent = 'Score : ' + good + ' / ' + total;
-          btn.textContent = 'Masquer les réponses';
+          scoreEl.textContent = L('libScore') + ' : ' + good + ' / ' + total;
+          btn.textContent = L('libHideAnswers');
           shown = true;
         };
         if (answers) { render(); return; }
@@ -1291,113 +652,27 @@ const PAGE = String.raw`<!doctype html>
 
       box.appendChild(scoreEl);
       box.appendChild(btn);
-    });
-  }
-
-  // ---------- Boutons ----------
-  moreBtn.addEventListener('click', function () {
-    moreBtn.disabled = true;
-    api('/search-more', { method: 'POST', body: { count: 3 } }).then(function (r) {
-      if (r.ok === false) showStatus('⚠️ ' + (r.error || 'Erreur'));
-      refreshAll();
-      schedulePoll();
-    });
-  });
-
-  addBtn.addEventListener('click', function () {
-    var value = addInput.value.trim();
-    if (!value) { showNotice('Colle un lien ou un identifiant YouTube.', 'warn', 6); return; }
-
-    addBtn.disabled = true;
-    addInput.disabled = true;
-    showNotice('🔎 Recherche de la vidéo…', 'info');
-
-    api('/analyze', { method: 'POST', body: { videoId: value } }).then(function (r) {
-      var id = r.video && r.video.videoId;
-      var title = r.video && r.video.title ? ' « ' + r.video.title + ' »' : '';
-
-      if (r.ok === false) {
-        showNotice('⚠️ ' + (r.error || 'Erreur'), 'warn', 10);
-        return;
-      }
-
-      if (r.status === 'exists') {
-        addInput.value = '';
-        showNotice('✅ Vidéo existante :' + title + '. Elle est déjà dans la liste.', 'ok', 10);
-      } else if (r.status === 'already_queued') {
-        addInput.value = '';
-        showNotice('⏳ Cette vidéo est déjà en cours d’analyse.', 'info', 10);
-      } else {
-        addInput.value = '';
-        showNotice('Vidéo trouvée :' + title + '. Analyse lancée : tu peux déjà la regarder, le test sera prêt dans quelques minutes.', 'ok', 12);
-      }
-
-      schedulePoll();
-      return refreshAll().then(function () { if (id) highlight(id); });
     }).catch(function () {
-      showNotice('⚠️ Connexion impossible, réessaie dans un instant.', 'warn', 10);
-    }).then(function () {
-      addBtn.disabled = false;
-      addInput.disabled = false;
+      box.textContent = L('libConnFail');
     });
-  });
-
-  addInput.addEventListener('keydown', function (e) {
-    if (e.key === 'Enter') addBtn.click();
-  });
-
-  adminLink.addEventListener('click', function () {
-    if (isAdminUI) {
-      forgetKey();
-      resetCards();
-      loginMsg.textContent = '';
-      refreshAll();
-    } else {
-      loginBox.hidden = !loginBox.hidden;
-      loginMsg.textContent = '';
-      if (!loginBox.hidden) adminPass.focus();
-    }
-  });
-
-  function login() {
-    var value = adminPass.value;
-    if (!value) return;
-    loginMsg.textContent = 'Vérification…';
-    fetch(BASE + '/admin-check', { headers: { 'x-admin-key': value } })
-      .then(function (r) { return r.json(); })
-      .then(function (r) {
-        if (r.ok) {
-          KEY = value;
-          try { localStorage.setItem('ieltsAdminKey', value); } catch (e) {}
-          adminPass.value = '';
-          loginBox.hidden = true;
-          loginMsg.textContent = '';
-          resetCards();
-          refreshAll();
-        } else {
-          loginMsg.textContent = r.error || 'Mot de passe incorrect.';
-        }
-      })
-      .catch(function () { loginMsg.textContent = 'Connexion impossible, réessaie.'; });
   }
 
-  loginBtn.addEventListener('click', login);
-  adminPass.addEventListener('keydown', function (e) { if (e.key === 'Enter') login(); });
+  // ---------- Remplace l'ancienne recherche de index.html ----------
+  // (l'ancienne adresse /api/youtube/ielts est maintenant réservée à l'administrateur)
+  window.loadIeltsVideos = function () {
+    if (!requireLogin()) return Promise.resolve();
+    currentIeltsSkill = 'listening';
+    setIeltsSkillButton(currentIeltsSkill);
+    ensureUI();
+    ieltsError.classList.add('hidden');
+    if (!Object.keys(cards).length) ieltsLoading.classList.remove('hidden');
+    return refreshAll().then(function () { ieltsLoading.classList.add('hidden'); });
+  };
 
-  emptyEl = el('div', { class: 'empty', text: 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.' });
-  listEl.parentNode.insertBefore(emptyEl, listEl);
-
-  refreshAll();
+  // Appelée par index.html quand la langue change : on met à jour les textes sans recharger la liste
+  window.renderIeltsVideos = function () {
+    ensureUI();
+    retextStatic();
+    Object.keys(cards).forEach(function (id) { updateCard(cards[id], cards[id].v); });
+  };
 })();
-</script>
-</body>
-</html>`;
-
-router.get('/ielts-app', (req, res) => {
-  res.type('html').send(PAGE);
-});
-
-module.exports = router;
-
-// Utilisé par server.js pour protéger les anciennes adresses de recherche et de test
-module.exports.adminGuard = adminGuard;
