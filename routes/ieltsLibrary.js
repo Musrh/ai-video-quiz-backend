@@ -205,6 +205,44 @@ function buildRecord(video, result, source) {
 const queue = [];
 const queuedIds = new Set();
 
+// Vidéos en cours d'analyse (non sauvegardées) : elles apparaissent tout de suite
+// dans la liste, et la personne peut déjà les regarder en attendant le test.
+const pending = new Map();
+
+function setPending(video, pendingStatus, source, extra) {
+  const previous = pending.get(video.videoId);
+
+  pending.set(video.videoId, {
+    videoId: video.videoId,
+    url: `https://www.youtube.com/watch?v=${video.videoId}`,
+    title: video.title || video.videoId,
+    channelTitle: video.channelTitle || '',
+    thumbnail: video.thumbnail || null,
+    durationSeconds: video.durationSeconds || 0,
+    status: pendingStatus, // 'queued' | 'analyzing' | 'failed'
+    issues: [],
+    questionCount: 0,
+    hasAnswers: false,
+    addedAt: previous ? previous.addedAt : new Date().toISOString(),
+    source,
+    ...(extra || {})
+  });
+}
+
+function friendlyError(message) {
+  const text = String(message || '');
+
+  if (/sign in to confirm|not a bot/i.test(text)) {
+    return 'YouTube bloque le téléchargement (cookies à renouveler).';
+  }
+
+  if (/YOUTUBE_API_KEY/i.test(text)) {
+    return 'Clé YouTube manquante sur le serveur.';
+  }
+
+  return 'Analyse impossible pour cette vidéo.';
+}
+
 let working = false;
 
 const status = {
@@ -220,6 +258,7 @@ const status = {
 function statusSnapshot() {
   return {
     running: working || queue.length > 0,
+    searchActive: searchIsActive(),
     mode: status.mode,
     message: status.message,
     current: status.current,
@@ -236,12 +275,23 @@ async function analyzeAndStore(video, source) {
   status.current = { videoId: video.videoId, title: video.title };
   status.message = `Analyse de « ${video.title} »… (quelques minutes)`;
 
+  setPending(video, 'analyzing', source);
+
   try {
     // Lecture de la vidéo par OCR (questions + corrigé)
     const result = await helpers.analyzeVideoWithOCR(video, {});
 
     if (!result || !result.questions || result.questions.length === 0) {
       markFailed(video, 'no_questions', 'Aucune question détectée');
+
+      if (source === 'manual') {
+        setPending(video, 'failed', source, {
+          error: 'Aucune question exploitable dans cette vidéo.'
+        });
+      } else {
+        pending.delete(video.videoId);
+      }
+
       await saveState();
 
       return false;
@@ -249,6 +299,7 @@ async function analyzeAndStore(video, source) {
 
     state.videos[video.videoId] = buildRecord(video, result, source);
     delete state.failed[video.videoId];
+    pending.delete(video.videoId);
 
     await saveState();
 
@@ -264,6 +315,12 @@ async function analyzeAndStore(video, source) {
 
     markFailed(video, 'error', error.message.slice(0, 300));
     status.lastError = `Échec pour « ${video.title || video.videoId} »`;
+
+    if (source === 'manual') {
+      setPending(video, 'failed', source, { error: friendlyError(error.message) });
+    } else {
+      pending.delete(video.videoId);
+    }
 
     await saveState();
 
@@ -403,20 +460,24 @@ async function runAnalyze(task) {
     return;
   }
 
-  status.message = 'Récupération des informations de la vidéo…';
+  let video = task.video;
 
-  const details = await helpers.getVideoDetails([videoId]);
+  if (!video) {
+    status.message = 'Récupération des informations de la vidéo…';
 
-  if (!details || details.length === 0) {
-    markFailed({ videoId, title: '' }, 'error', 'Vidéo YouTube introuvable');
-    status.lastError = 'Vidéo YouTube introuvable';
+    const details = await helpers.getVideoDetails([videoId]);
 
-    await saveState();
+    if (!details || details.length === 0) {
+      setPending({ videoId, title: '' }, 'failed', 'manual', {
+        error: 'Vidéo YouTube introuvable.'
+      });
+      status.lastError = 'Vidéo YouTube introuvable';
 
-    return;
+      return;
+    }
+
+    video = helpers.buildVideoObject(details[0]);
   }
-
-  const video = helpers.buildVideoObject(details[0]);
 
   const ok = await analyzeAndStore(video, 'manual');
 
@@ -504,14 +565,20 @@ function requireAdmin(req, res, next) {
 
 // Liste des vidéos sauvegardées
 router.get(API, (req, res) => {
-  const videos = Object.values(state.videos)
+  const saved = Object.values(state.videos)
+    .filter(record => !pending.has(record.videoId))
     .sort((a, b) => String(b.addedAt).localeCompare(String(a.addedAt)))
     .map(summarize);
 
+  // Les vidéos en cours d'analyse apparaissent en premier
+  const inProgress = [...pending.values()].sort((a, b) =>
+    String(b.addedAt).localeCompare(String(a.addedAt))
+  );
+
   res.json({
     ok: true,
-    count: videos.length,
-    videos,
+    count: Object.keys(state.videos).length,
+    videos: [...inProgress, ...saved],
     status: statusSnapshot()
   });
 });
@@ -521,8 +588,9 @@ router.get(`${API}/status`, (req, res) => {
   res.json({ ok: true, ...statusSnapshot() });
 });
 
-// Ajouter une vidéo précise (lien ou identifiant)
-router.post(`${API}/analyze`, requireAdmin, (req, res) => {
+// Ajouter une vidéo précise (lien ou identifiant) :
+// elle apparaît tout de suite dans la liste, l'analyse se fait en arrière-plan.
+router.post(`${API}/analyze`, requireAdmin, async (req, res) => {
   const videoId = helpers.getVideoIdFromUrl(
     (req.body && (req.body.videoId || req.body.url)) || ''
   );
@@ -544,13 +612,41 @@ router.post(`${API}/analyze`, requireAdmin, (req, res) => {
     });
   }
 
-  if (queuedIds.has(videoId)) {
-    return res.json({ ok: true, status: 'already_queued', videoId });
+  if (queuedIds.has(videoId) || (status.current && status.current.videoId === videoId)) {
+    return res.json({
+      ok: true,
+      status: 'already_queued',
+      video: pending.get(videoId) || null
+    });
   }
 
-  enqueue({ type: 'analyze', videoId, force });
+  try {
+    const details = await helpers.getVideoDetails([videoId]);
 
-  return res.json({ ok: true, status: 'queued', videoId });
+    if (!details || details.length === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: 'Vidéo YouTube introuvable'
+      });
+    }
+
+    const video = helpers.buildVideoObject(details[0]);
+
+    setPending(video, 'queued', 'manual');
+
+    enqueue({ type: 'analyze', videoId, force, video });
+
+    return res.json({
+      ok: true,
+      status: 'queued',
+      video: pending.get(videoId)
+    });
+  } catch (error) {
+    return res.status(502).json({
+      ok: false,
+      error: friendlyError(error.message)
+    });
+  }
 });
 
 // "Afficher plus de vidéos" : nouvelle recherche, analyse une par une
@@ -603,6 +699,13 @@ router.get(`${API}/:videoId/answers`, (req, res) => {
 // Supprimer une vidéo (pour pouvoir la refaire)
 router.delete(`${API}/:videoId`, requireAdmin, (req, res) => {
   const id = req.params.videoId;
+
+  // Une carte "échec" ou "en cours" se ferme sans supprimer la vidéo déjà enregistrée
+  if (pending.has(id)) {
+    pending.delete(id);
+
+    return res.json({ ok: true });
+  }
 
   delete state.videos[id];
   delete state.failed[id];
@@ -661,6 +764,14 @@ const PAGE = String.raw`<!doctype html>
   .answer.right { color:var(--ok); } .answer.wrong { color:var(--bad); } .answer.plain { color:var(--accent); }
   .score { font-weight:700; margin:12px 0; }
   .empty { text-align:center; color:var(--muted); padding:30px 10px; }
+  .badge.wait { color:var(--accent); } .badge.bad { color:var(--bad); }
+  .notice { padding:10px 12px; border-radius:10px; margin:8px 0; font-size:.95rem; border:1px solid var(--line); background:var(--card); }
+  .notice.info { border-color:var(--accent); }
+  .notice.ok { border-color:var(--ok); color:var(--ok); }
+  .notice.warn { border-color:var(--warn); color:var(--warn); }
+  .card.flash { outline:3px solid var(--accent); transition:outline-color .3s; }
+  .row { display:flex; gap:8px; margin-top:8px; }
+  .row button { flex:1; }
 </style>
 </head>
 <body>
@@ -673,6 +784,7 @@ const PAGE = String.raw`<!doctype html>
     <input type="text" id="addInput" placeholder="Lien ou identifiant YouTube">
     <button id="addBtn">Ajouter</button>
   </div>
+  <div class="notice" id="notice" hidden></div>
   <div class="status" id="statusBar" hidden></div>
   <div id="list"></div>
   <button class="wide" id="moreBtn">Afficher plus de vidéos</button>
@@ -689,9 +801,12 @@ const PAGE = String.raw`<!doctype html>
   var addBtn = document.getElementById('addBtn');
   var addInput = document.getElementById('addInput');
   var subEl = document.getElementById('sub');
+  var noticeEl = document.getElementById('notice');
+  var noticeTimer = null;
 
   var pollTimer = null;
-  var lastCount = -1;
+  var cards = {};
+  var emptyEl = null;
 
   function el(tag, props, kids) {
     var node = document.createElement(tag);
@@ -721,7 +836,26 @@ const PAGE = String.raw`<!doctype html>
 
   function norm(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
 
-  // ---------- Statut de la recherche ----------
+  // ---------- Messages à la personne (ajout d'une vidéo) ----------
+  function showNotice(text, kind, seconds) {
+    if (noticeTimer) { clearTimeout(noticeTimer); noticeTimer = null; }
+    if (!text) { noticeEl.hidden = true; return; }
+    noticeEl.hidden = false;
+    noticeEl.className = 'notice ' + (kind || 'info');
+    noticeEl.textContent = text;
+    if (seconds) noticeTimer = setTimeout(function () { noticeEl.hidden = true; }, seconds * 1000);
+  }
+
+  // Fait défiler jusqu'à la carte et la fait clignoter un instant
+  function highlight(videoId) {
+    var c = cards[videoId];
+    if (!c) return;
+    if (c.node.scrollIntoView) c.node.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    c.node.classList.add('flash');
+    setTimeout(function () { c.node.classList.remove('flash'); }, 2500);
+  }
+
+  // ---------- Statut ----------
   function showStatus(text) {
     if (!text) { statusBar.hidden = true; return; }
     statusBar.hidden = false;
@@ -729,10 +863,8 @@ const PAGE = String.raw`<!doctype html>
   }
 
   function updateStatus(s) {
-    var running = s.running;
-    moreBtn.disabled = running;
-    addBtn.disabled = running;
-    if (running) {
+    moreBtn.disabled = !!s.searchActive;
+    if (s.running) {
       var text = s.message || 'Traitement en cours…';
       if (s.search) text += '  (' + s.search.analyzed + '/' + s.search.target + ' ajoutées)';
       if (s.queueLength > 1) text += '  — ' + (s.queueLength - 1) + ' en attente';
@@ -744,80 +876,154 @@ const PAGE = String.raw`<!doctype html>
     }
   }
 
-  function refreshStatus() {
-    return api('/status').then(function (s) {
-      updateStatus(s);
-      if (s.libraryCount !== lastCount) {
-        lastCount = s.libraryCount;
-        loadList();
-      }
-      if (s.running) schedulePoll(); else stopPoll();
-    }).catch(function () { schedulePoll(); });
-  }
-
   function schedulePoll() {
-    if (!pollTimer) pollTimer = setInterval(refreshStatus, 4000);
+    if (!pollTimer) pollTimer = setInterval(refreshAll, 4000);
   }
   function stopPoll() {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
-  // ---------- Liste des vidéos ----------
-  function loadList() {
+  function refreshAll() {
     return api('').then(function (data) {
-      listEl.innerHTML = '';
       subEl.textContent = data.count + ' test(s) enregistré(s)';
-      if (!data.videos.length) {
-        listEl.appendChild(el('div', { class: 'empty', text: 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.' }));
-        return;
-      }
-      data.videos.forEach(function (v) { listEl.appendChild(renderCard(v)); });
-    });
+      reconcile(data.videos);
+      updateStatus(data.status);
+      if (data.status.running) schedulePoll(); else stopPoll();
+    }).catch(function () { schedulePoll(); });
   }
 
-  function renderCard(v) {
-    var card = el('div', { class: 'card' });
-    if (v.thumbnail) card.appendChild(el('img', { class: 'thumb', src: v.thumbnail, alt: '', loading: 'lazy' }));
+  // ---------- Liste des vidéos ----------
+  function isReady(v) { return v.status === 'ok' || v.status === 'to_review'; }
+
+  function badgeInfo(v) {
+    if (v.status === 'ok') return { cls: 'ok', text: 'vérifié' };
+    if (v.status === 'to_review') return { cls: 'review', text: 'à relire' };
+    if (v.status === 'analyzing') return { cls: 'wait', text: 'analyse en cours…' };
+    if (v.status === 'queued') return { cls: 'wait', text: 'en attente' };
+    return { cls: 'bad', text: 'échec' };
+  }
+
+  // Met à jour la liste sans toucher aux cartes déjà affichées
+  // (le lecteur vidéo ouvert ne doit pas être rechargé).
+  function reconcile(videos) {
+    var present = {};
+    videos.forEach(function (v) { present[v.videoId] = true; });
+
+    Object.keys(cards).forEach(function (id) {
+      if (!present[id]) { cards[id].node.remove(); delete cards[id]; }
+    });
+
+    videos.slice().reverse().forEach(function (v) {
+      if (cards[v.videoId]) {
+        updateCard(cards[v.videoId], v);
+      } else {
+        var c = createCard(v);
+        cards[v.videoId] = c;
+        listEl.prepend(c.node);
+      }
+    });
+
+    emptyEl.hidden = videos.length > 0;
+  }
+
+  function createCard(v) {
+    var c = { v: v, playerShown: false, testStarted: false, startState: '', actionKey: '' };
+
+    c.node = el('div', { class: 'card' });
+    if (v.thumbnail) c.node.appendChild(el('img', { class: 'thumb', src: v.thumbnail, alt: '', loading: 'lazy' }));
 
     var body = el('div', { class: 'cardbody' });
-    body.appendChild(el('h3', { text: v.title }));
+    c.title = el('h3', { text: v.title || v.videoId });
+    c.countText = document.createTextNode('');
+    c.badge = el('span', { class: 'badge' });
+    c.meta = el('div', { class: 'muted' }, [c.countText, c.badge]);
+    c.issues = el('ul', { class: 'issues' });
+    c.msg = el('div', { class: 'muted' });
+    c.actions = el('div', { class: 'row' });
+    c.area = el('div');
+    c.startBox = el('div');
 
-    var meta = el('div', { class: 'muted' });
-    meta.appendChild(document.createTextNode(v.questionCount + ' questions  '));
-    meta.appendChild(el('span', {
-      class: 'badge ' + (v.status === 'ok' ? 'ok' : 'review'),
-      text: v.status === 'ok' ? 'vérifié' : 'à relire'
-    }));
-    body.appendChild(meta);
-
-    if (v.issues && v.issues.length) {
-      var ul = el('ul', { class: 'issues' });
-      v.issues.forEach(function (i) { ul.appendChild(el('li', { text: i })); });
-      body.appendChild(ul);
-    }
-
-    var area = el('div');
-    var showBtn = el('button', { class: 'wide', text: 'Afficher la vidéo' });
-    showBtn.addEventListener('click', function () {
-      showBtn.remove();
-      area.appendChild(el('div', { class: 'player' }, [
+    c.showBtn = el('button', { class: 'wide', text: 'Afficher la vidéo' });
+    c.showBtn.addEventListener('click', function () {
+      c.showBtn.remove();
+      c.playerShown = true;
+      c.area.appendChild(el('div', { class: 'player' }, [
         el('iframe', {
           src: 'https://www.youtube.com/embed/' + v.videoId,
           allow: 'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture',
           allowfullscreen: ''
         })
       ]));
-      var startBtn = el('button', { class: 'wide secondary', text: 'Commencer le test' });
-      startBtn.addEventListener('click', function () {
-        startBtn.remove();
-        loadTest(area, v);
-      });
-      area.appendChild(startBtn);
+      c.area.appendChild(c.startBox);
+      renderStart(c);
     });
-    body.appendChild(showBtn);
-    body.appendChild(area);
-    card.appendChild(body);
-    return card;
+
+    [c.title, c.meta, c.issues, c.msg, c.actions, c.showBtn, c.area].forEach(function (n) { body.appendChild(n); });
+    c.node.appendChild(body);
+
+    updateCard(c, v);
+    return c;
+  }
+
+  function updateCard(c, v) {
+    c.v = v;
+    c.title.textContent = v.title || v.videoId;
+    c.countText.nodeValue = isReady(v) ? (v.questionCount + ' questions  ') : '';
+
+    var b = badgeInfo(v);
+    c.badge.className = 'badge ' + b.cls;
+    c.badge.textContent = b.text;
+
+    c.issues.innerHTML = '';
+    (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
+
+    if (v.status === 'analyzing') c.msg.textContent = 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.';
+    else if (v.status === 'queued') c.msg.textContent = 'En attente d’analyse : tu peux déjà regarder la vidéo.';
+    else if (v.status === 'failed') c.msg.textContent = '⚠️ ' + (v.error || 'Analyse impossible pour cette vidéo.');
+    else c.msg.textContent = '';
+
+    // Boutons "Réessayer" / "Fermer" : reconstruits seulement si l'état change
+    var key = v.status === 'failed' ? 'failed' : '';
+    if (key !== c.actionKey) {
+      c.actionKey = key;
+      c.actions.innerHTML = '';
+      if (key === 'failed') {
+        var retry = el('button', { class: 'secondary', text: 'Réessayer' });
+        retry.addEventListener('click', function () {
+          api('/analyze', { method: 'POST', body: { videoId: v.videoId, force: true } }).then(function () { refreshAll(); schedulePoll(); });
+        });
+        var close = el('button', { class: 'secondary', text: 'Fermer' });
+        close.addEventListener('click', function () {
+          api('/' + encodeURIComponent(v.videoId), { method: 'DELETE' }).then(refreshAll);
+        });
+        c.actions.appendChild(retry);
+        c.actions.appendChild(close);
+      }
+    }
+
+    renderStart(c);
+  }
+
+  // Bouton du test : désactivé pendant l'analyse, actif dès que le test est prêt
+  function renderStart(c) {
+    if (!c.playerShown || c.testStarted) return;
+    var state = isReady(c.v) ? 'ready' : (c.v.status === 'failed' ? 'none' : 'wait');
+    if (state === c.startState) return;
+    c.startState = state;
+    c.startBox.innerHTML = '';
+    if (state === 'ready') {
+      var btn = el('button', { class: 'wide secondary', text: 'Commencer le test' });
+      btn.addEventListener('click', function () {
+        c.testStarted = true;
+        c.startBox.innerHTML = '';
+        loadTest(c.area, c.v);
+      });
+      c.startBox.appendChild(btn);
+    } else if (state === 'wait') {
+      var wait = el('button', { class: 'wide secondary', text: 'Test en préparation…' });
+      wait.disabled = true;
+      c.startBox.appendChild(wait);
+    }
   }
 
   // ---------- Test ----------
@@ -945,24 +1151,57 @@ const PAGE = String.raw`<!doctype html>
     moreBtn.disabled = true;
     api('/search-more', { method: 'POST', body: { count: 3 } }).then(function (r) {
       if (r.ok === false) showStatus('⚠️ ' + (r.error || 'Erreur'));
-      refreshStatus();
+      refreshAll();
       schedulePoll();
     });
   });
 
   addBtn.addEventListener('click', function () {
     var value = addInput.value.trim();
-    if (!value) return;
+    if (!value) { showNotice('Colle un lien ou un identifiant YouTube.', 'warn', 6); return; }
+
+    addBtn.disabled = true;
+    addInput.disabled = true;
+    showNotice('🔎 Recherche de la vidéo…', 'info');
+
     api('/analyze', { method: 'POST', body: { videoId: value } }).then(function (r) {
-      if (r.ok === false) { showStatus('⚠️ ' + (r.error || 'Erreur')); return; }
-      if (r.status === 'exists') showStatus('Cette vidéo est déjà enregistrée.');
-      else addInput.value = '';
-      refreshStatus();
+      var id = r.video && r.video.videoId;
+      var title = r.video && r.video.title ? ' « ' + r.video.title + ' »' : '';
+
+      if (r.ok === false) {
+        showNotice('⚠️ ' + (r.error || 'Erreur'), 'warn', 10);
+        return;
+      }
+
+      if (r.status === 'exists') {
+        addInput.value = '';
+        showNotice('✅ Vidéo existante :' + title + '. Elle est déjà dans la liste.', 'ok', 10);
+      } else if (r.status === 'already_queued') {
+        addInput.value = '';
+        showNotice('⏳ Cette vidéo est déjà en cours d’analyse.', 'info', 10);
+      } else {
+        addInput.value = '';
+        showNotice('Vidéo trouvée :' + title + '. Analyse lancée : tu peux déjà la regarder, le test sera prêt dans quelques minutes.', 'ok', 12);
+      }
+
       schedulePoll();
+      return refreshAll().then(function () { if (id) highlight(id); });
+    }).catch(function () {
+      showNotice('⚠️ Connexion impossible, réessaie dans un instant.', 'warn', 10);
+    }).then(function () {
+      addBtn.disabled = false;
+      addInput.disabled = false;
     });
   });
 
-  loadList().then(refreshStatus);
+  addInput.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') addBtn.click();
+  });
+
+  emptyEl = el('div', { class: 'empty', text: 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.' });
+  listEl.parentNode.insertBefore(emptyEl, listEl);
+
+  refreshAll();
 })();
 </script>
 </body>
