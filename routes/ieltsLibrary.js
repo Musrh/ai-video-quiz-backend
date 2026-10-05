@@ -3,6 +3,7 @@ const axios = require('axios');
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const crypto = require('crypto');
 
 const ielts = require('./ielts');
 
@@ -543,49 +544,140 @@ function searchIsActive() {
 }
 
 // ============================================================
-// PROTECTION (facultative) : variable IELTS_ADMIN_KEY
+// ACCÈS ADMINISTRATEUR (variable IELTS_ADMIN_KEY)
 // ============================================================
+// Seul l'administrateur peut lancer des recherches, ajouter ou supprimer une
+// vidéo (ce sont ces actions qui consomment du crédit). Les autres personnes
+// voient uniquement les vidéos déjà enregistrées.
+// Tant que IELTS_ADMIN_KEY n'est pas définie, ces actions sont bloquées pour tous.
 
-function requireAdmin(req, res, next) {
-  const key = process.env.IELTS_ADMIN_KEY;
+const failedAdminAttempts = new Map();
+const MAX_ADMIN_ATTEMPTS = 10;
+const ADMIN_LOCK_MS = 15 * 60 * 1000;
 
-  if (!key || req.get('x-admin-key') === key) {
-    return next();
+function clientIp(req) {
+  return String(req.get('x-forwarded-for') || req.ip || '')
+    .split(',')[0]
+    .trim();
+}
+
+function keyMatches(given) {
+  const secret = process.env.IELTS_ADMIN_KEY || '';
+
+  if (!secret || !given) {
+    return false;
   }
 
-  return res.status(401).json({
-    ok: false,
-    error: 'Clé administrateur requise'
-  });
+  const a = Buffer.from(String(given));
+  const b = Buffer.from(secret);
+
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
+
+// La clé est envoyée dans l'en-tête "x-admin-key" (ou "?key=" pour les
+// anciennes adresses de test, utilisables depuis un navigateur).
+function providedKey(req, allowQuery) {
+  return req.get('x-admin-key') || (allowQuery ? req.query.key : '') || '';
+}
+
+function isAdminRequest(req, allowQuery = false) {
+  return keyMatches(providedKey(req, allowQuery));
+}
+
+function adminGuard(allowQuery = false) {
+  return (req, res, next) => {
+    if (!process.env.IELTS_ADMIN_KEY) {
+      return res.status(403).json({
+        ok: false,
+        error:
+          'Action réservée à l’administrateur : la variable IELTS_ADMIN_KEY ' +
+          'n’est pas définie sur le serveur.'
+      });
+    }
+
+    const ip = clientIp(req);
+    const now = Date.now();
+    const record = failedAdminAttempts.get(ip);
+
+    if (record && record.count >= MAX_ADMIN_ATTEMPTS && now < record.resetAt) {
+      return res.status(429).json({
+        ok: false,
+        error: 'Trop de tentatives. Réessaie dans quelques minutes.'
+      });
+    }
+
+    if (isAdminRequest(req, allowQuery)) {
+      failedAdminAttempts.delete(ip);
+
+      return next();
+    }
+
+    if (providedKey(req, allowQuery)) {
+      const current =
+        record && now < record.resetAt
+          ? record
+          : { count: 0, resetAt: now + ADMIN_LOCK_MS };
+
+      current.count++;
+      failedAdminAttempts.set(ip, current);
+    }
+
+    return res.status(401).json({
+      ok: false,
+      error: 'Accès réservé à l’administrateur'
+    });
+  };
+}
+
+const requireAdmin = adminGuard(false);
 
 // ============================================================
 // ROUTES
 // ============================================================
 
-// Liste des vidéos sauvegardées
+// Liste des vidéos sauvegardées.
+// L'administrateur voit aussi les vidéos en cours d'analyse et l'état de la file.
 router.get(API, (req, res) => {
+  const admin = isAdminRequest(req);
+
   const saved = Object.values(state.videos)
-    .filter(record => !pending.has(record.videoId))
+    .filter(record => !(admin && pending.has(record.videoId)))
     .sort((a, b) => String(b.addedAt).localeCompare(String(a.addedAt)))
     .map(summarize);
 
-  // Les vidéos en cours d'analyse apparaissent en premier
-  const inProgress = [...pending.values()].sort((a, b) =>
-    String(b.addedAt).localeCompare(String(a.addedAt))
-  );
+  const inProgress = admin
+    ? [...pending.values()].sort((a, b) =>
+        String(b.addedAt).localeCompare(String(a.addedAt))
+      )
+    : [];
 
   res.json({
     ok: true,
+    admin,
     count: Object.keys(state.videos).length,
     videos: [...inProgress, ...saved],
-    status: statusSnapshot()
+    status: admin
+      ? statusSnapshot()
+      : { running: false, libraryCount: Object.keys(state.videos).length }
   });
 });
 
-// État de la file d'analyse
+// Vérifie le mot de passe administrateur (utilisé par la page)
+router.get(`${API}/admin-check`, requireAdmin, (req, res) => {
+  res.json({ ok: true, admin: true });
+});
+
+// État de la file d'analyse (administrateur uniquement pour les détails)
 router.get(`${API}/status`, (req, res) => {
-  res.json({ ok: true, ...statusSnapshot() });
+  if (!isAdminRequest(req)) {
+    return res.json({
+      ok: true,
+      running: false,
+      libraryCount: Object.keys(state.videos).length
+    });
+  }
+
+  return res.json({ ok: true, ...statusSnapshot() });
 });
 
 // Ajouter une vidéo précise (lien ou identifiant) :
@@ -739,7 +831,7 @@ const PAGE = String.raw`<!doctype html>
   button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
   button:disabled { opacity:.5; cursor:default; }
   button.wide { width:100%; margin-top:8px; }
-  input[type=text], select { font:inherit; width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
+  input[type=text], input[type=password], select { font:inherit; width:100%; padding:10px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--text); }
   .add { display:flex; gap:8px; margin:12px 0; }
   .add input { flex:1; }
   .status { padding:10px 12px; border-radius:10px; background:var(--card); border:1px solid var(--line); margin:12px 0; font-size:.95rem; }
@@ -771,6 +863,9 @@ const PAGE = String.raw`<!doctype html>
   .notice.warn { border-color:var(--warn); color:var(--warn); }
   .card.flash { outline:3px solid var(--accent); transition:outline-color .3s; }
   .row { display:flex; gap:8px; margin-top:8px; }
+  .foot { margin-top:28px; padding-top:12px; border-top:1px solid var(--line); text-align:center; }
+  button.link { background:transparent; color:var(--muted); padding:6px 8px; font-size:.85rem; text-decoration:underline; }
+  .foot .row { max-width:420px; margin:8px auto 0; }
   .row button { flex:1; }
 </style>
 </head>
@@ -780,19 +875,33 @@ const PAGE = String.raw`<!doctype html>
   <div class="muted" id="sub">Tests enregistrés</div>
 </header>
 <main>
-  <div class="add">
-    <input type="text" id="addInput" placeholder="Lien ou identifiant YouTube">
-    <button id="addBtn">Ajouter</button>
+  <div id="adminTop" hidden>
+    <div class="add">
+      <input type="text" id="addInput" placeholder="Lien ou identifiant YouTube">
+      <button id="addBtn">Ajouter</button>
+    </div>
+    <div class="notice" id="notice" hidden></div>
+    <div class="status" id="statusBar" hidden></div>
   </div>
-  <div class="notice" id="notice" hidden></div>
-  <div class="status" id="statusBar" hidden></div>
   <div id="list"></div>
-  <button class="wide" id="moreBtn">Afficher plus de vidéos</button>
+  <div id="adminMore" hidden>
+    <button class="wide" id="moreBtn">Afficher plus de vidéos</button>
+  </div>
+  <div class="foot">
+    <button class="link" id="adminLink">Espace administrateur</button>
+    <div class="row" id="loginBox" hidden>
+      <input type="password" id="adminPass" placeholder="Mot de passe administrateur" autocomplete="current-password">
+      <button id="loginBtn">Valider</button>
+    </div>
+    <div class="muted" id="loginMsg"></div>
+  </div>
 </main>
 <script>
 (function () {
-  var params = new URLSearchParams(location.search);
-  var KEY = params.get('key');
+  // Mot de passe administrateur : gardé dans le navigateur de l'administrateur uniquement
+  var KEY = null;
+  try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
+  var isAdminUI = false;
   var BASE = '/api/youtube/ielts/library';
 
   var listEl = document.getElementById('list');
@@ -802,6 +911,13 @@ const PAGE = String.raw`<!doctype html>
   var addInput = document.getElementById('addInput');
   var subEl = document.getElementById('sub');
   var noticeEl = document.getElementById('notice');
+  var adminTop = document.getElementById('adminTop');
+  var adminMore = document.getElementById('adminMore');
+  var adminLink = document.getElementById('adminLink');
+  var loginBox = document.getElementById('loginBox');
+  var adminPass = document.getElementById('adminPass');
+  var loginBtn = document.getElementById('loginBtn');
+  var loginMsg = document.getElementById('loginMsg');
   var noticeTimer = null;
 
   var pollTimer = null;
@@ -883,13 +999,45 @@ const PAGE = String.raw`<!doctype html>
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
+  // Affiche ou masque tout ce qui est réservé à l'administrateur
+  function setAdminUI(on) {
+    isAdminUI = on;
+    adminTop.hidden = !on;
+    adminMore.hidden = !on;
+    adminLink.textContent = on ? 'Se déconnecter (administrateur)' : 'Espace administrateur';
+    if (emptyEl) {
+      emptyEl.textContent = on
+        ? 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.'
+        : 'Aucune vidéo disponible pour le moment.';
+    }
+  }
+
+  function resetCards() {
+    Object.keys(cards).forEach(function (id) { cards[id].node.remove(); });
+    cards = {};
+  }
+
+  function forgetKey() {
+    KEY = null;
+    try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
+  }
+
   function refreshAll() {
     return api('').then(function (data) {
+      // Mot de passe enregistré mais refusé par le serveur : on l'oublie
+      if (KEY && !data.admin) forgetKey();
+      setAdminUI(!!data.admin);
+
       subEl.textContent = data.count + ' test(s) enregistré(s)';
       reconcile(data.videos);
-      updateStatus(data.status);
-      if (data.status.running) schedulePoll(); else stopPoll();
-    }).catch(function () { schedulePoll(); });
+
+      if (data.admin) {
+        updateStatus(data.status);
+        if (data.status.running) schedulePoll(); else stopPoll();
+      } else {
+        stopPoll();
+      }
+    }).catch(function () { if (isAdminUI) schedulePoll(); });
   }
 
   // ---------- Liste des vidéos ----------
@@ -983,7 +1131,7 @@ const PAGE = String.raw`<!doctype html>
     else c.msg.textContent = '';
 
     // Boutons "Réessayer" / "Fermer" : reconstruits seulement si l'état change
-    var key = v.status === 'failed' ? 'failed' : '';
+    var key = (v.status === 'failed' && isAdminUI) ? 'failed' : '';
     if (key !== c.actionKey) {
       c.actionKey = key;
       c.actions.innerHTML = '';
@@ -1198,6 +1346,44 @@ const PAGE = String.raw`<!doctype html>
     if (e.key === 'Enter') addBtn.click();
   });
 
+  adminLink.addEventListener('click', function () {
+    if (isAdminUI) {
+      forgetKey();
+      resetCards();
+      loginMsg.textContent = '';
+      refreshAll();
+    } else {
+      loginBox.hidden = !loginBox.hidden;
+      loginMsg.textContent = '';
+      if (!loginBox.hidden) adminPass.focus();
+    }
+  });
+
+  function login() {
+    var value = adminPass.value;
+    if (!value) return;
+    loginMsg.textContent = 'Vérification…';
+    fetch(BASE + '/admin-check', { headers: { 'x-admin-key': value } })
+      .then(function (r) { return r.json(); })
+      .then(function (r) {
+        if (r.ok) {
+          KEY = value;
+          try { localStorage.setItem('ieltsAdminKey', value); } catch (e) {}
+          adminPass.value = '';
+          loginBox.hidden = true;
+          loginMsg.textContent = '';
+          resetCards();
+          refreshAll();
+        } else {
+          loginMsg.textContent = r.error || 'Mot de passe incorrect.';
+        }
+      })
+      .catch(function () { loginMsg.textContent = 'Connexion impossible, réessaie.'; });
+  }
+
+  loginBtn.addEventListener('click', login);
+  adminPass.addEventListener('keydown', function (e) { if (e.key === 'Enter') login(); });
+
   emptyEl = el('div', { class: 'empty', text: 'Aucune vidéo pour le moment. Appuie sur « Afficher plus de vidéos » ou ajoute un lien.' });
   listEl.parentNode.insertBefore(emptyEl, listEl);
 
@@ -1212,3 +1398,6 @@ router.get('/ielts-app', (req, res) => {
 });
 
 module.exports = router;
+
+// Utilisé par server.js pour protéger les anciennes adresses de recherche et de test
+module.exports.adminGuard = adminGuard;
