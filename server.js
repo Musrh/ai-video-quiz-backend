@@ -15,6 +15,11 @@ const { adminGuard } = ieltsLibraryRouter;
 
 const app = express();
 
+const ieltsLibraryRouter = require('./routes/ieltsLibrary');
+
+
+app.use('/', ieltsLibraryRouter);
+
 app.use(cors());
 app.use(express.json());
 
