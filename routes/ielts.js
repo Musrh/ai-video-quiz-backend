@@ -24,8 +24,25 @@ const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
 
 // OCR
-const OCR_INTERVAL_SECONDS = Number(process.env.IELTS_OCR_INTERVAL || 8);
-const OCR_MAX_FRAMES = Number(process.env.IELTS_OCR_MAX_FRAMES || 180);
+// Les images sont prises sur TOUTE la durée de la vidéo : l'intervalle s'adapte
+// à la durée (entre 3 et 20 secondes) au lieu d'une image toutes les 8 s qui
+// s'arrêtait à 24 minutes. IELTS_OCR_INTERVAL force un intervalle fixe.
+const OCR_FIXED_INTERVAL = Number(process.env.IELTS_OCR_INTERVAL || 0);
+const OCR_TARGET_FRAMES = Number(process.env.IELTS_OCR_TARGET_FRAMES || 360);
+const OCR_MIN_INTERVAL = 3;
+const OCR_MAX_INTERVAL = 20;
+const OCR_MAX_FRAMES = Number(process.env.IELTS_OCR_MAX_FRAMES || 480);
+const OCR_FRAME_WIDTH = Number(process.env.IELTS_OCR_WIDTH || 1600);
+const OCR_VIDEO_HEIGHT = Number(process.env.IELTS_VIDEO_HEIGHT || 720);
+
+// Images quasi identiques (même page de questions affichée longtemps) :
+// on n'en lit que 3 par page, ce qui accélère beaucoup l'analyse.
+const OCR_SAME_THRESHOLD = 1.5; // différence moyenne (sur 255) sous laquelle deux images sont "identiques"
+const OCR_MAX_PER_RUN = 3;
+
+// Sondage avant l'analyse complète : si aucune page de questions n'apparaît
+// dans ces images réparties sur la vidéo, on abandonne tout de suite (économie de crédit).
+const OCR_PROBE_FRAMES = 20;
 
 // Numérotation des questions IELTS Listening : 1 à 40
 const MAX_QUESTION_NUMBER = 40;
@@ -467,9 +484,13 @@ async function downloadYoutubeVideo(videoId, outputPath) {
   const options = {
     noPlaylist: true,
 
-    // Format tolérant, limité à 720p (suffisant pour l'OCR)
+    // Image seule (le son est inutile pour lire les questions), en haute qualité.
+    // L'ancien format "best[ext=mp4]" ne donnait en pratique que du 360p, trop
+    // flou pour les petits textes. IELTS_VIDEO_FORMAT permet de revenir en arrière.
     format:
-      'best[height<=720][ext=mp4]/bv*[height<=720]+ba/best[height<=720]/best',
+      process.env.IELTS_VIDEO_FORMAT ||
+      `bv*[height<=${OCR_VIDEO_HEIGHT}][ext=mp4]/bv*[height<=${OCR_VIDEO_HEIGHT}]/` +
+      `best[height<=${OCR_VIDEO_HEIGHT}][ext=mp4]/best[height<=${OCR_VIDEO_HEIGHT}]/best`,
 
     output: outputPath,
     mergeOutputFormat: 'mp4',
@@ -541,14 +562,52 @@ async function downloadYoutubeVideo(videoId, outputPath) {
 // OCR : EXTRACTION DES FRAMES
 // ============================================================
 
-async function extractFrames(videoPath, framesDir) {
+const SIGNATURE_WIDTH = 64;
+const SIGNATURE_HEIGHT = 36;
+
+// Durée réelle de la vidéo téléchargée (lue dans les messages de ffmpeg)
+async function probeDuration(videoPath) {
+  try {
+    await execFileAsync(ffmpegPath, ['-hide_banner', '-i', videoPath], {
+      timeout: 60000,
+      maxBuffer: 5 * 1024 * 1024
+    });
+  } catch (error) {
+    const match = String(error.stderr || '').match(
+      /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/
+    );
+
+    if (match) {
+      return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]);
+    }
+  }
+
+  return 0;
+}
+
+function chooseInterval(durationSeconds) {
+  if (OCR_FIXED_INTERVAL > 0) {
+    return OCR_FIXED_INTERVAL;
+  }
+
+  const duration = durationSeconds > 0 ? durationSeconds : 1800;
+
+  return Math.min(
+    OCR_MAX_INTERVAL,
+    Math.max(OCR_MIN_INTERVAL, Math.ceil(duration / OCR_TARGET_FRAMES))
+  );
+}
+
+// Une seule lecture de la vidéo produit à la fois les images (JPEG) et une
+// "signature" minuscule de chacune (64x36 en gris) pour repérer les doublons.
+async function extractFrames(videoPath, framesDir, interval) {
   await fsp.mkdir(framesDir, { recursive: true });
 
   const outputPattern = path.join(framesDir, 'frame-%05d.jpg');
 
-  console.log(`🎞️ Extraction des frames toutes les ${OCR_INTERVAL_SECONDS}s...`);
+  console.log(`🎞️ Extraction d'une image toutes les ${interval}s...`);
 
-  await execFileAsync(
+  const { stdout } = await execFileAsync(
     ffmpegPath,
     [
       '-hide_banner',
@@ -558,20 +617,34 @@ async function extractFrames(videoPath, framesDir) {
       '-i',
       videoPath,
 
-      '-vf',
-      `fps=1/${OCR_INTERVAL_SECONDS},scale=1280:-2`,
+      '-filter_complex',
+      `[0:v]fps=1/${interval},split=2[a][b];` +
+        `[a]scale=${OCR_FRAME_WIDTH}:-2:flags=lanczos[o1];` +
+        `[b]scale=${SIGNATURE_WIDTH}:${SIGNATURE_HEIGHT}:flags=area,format=gray[o2]`,
 
+      '-map',
+      '[o1]',
       '-q:v',
       '3',
-
       '-frames:v',
       String(OCR_MAX_FRAMES),
+      outputPattern,
 
-      outputPattern
+      '-map',
+      '[o2]',
+      '-frames:v',
+      String(OCR_MAX_FRAMES),
+      '-f',
+      'rawvideo',
+      '-pix_fmt',
+      'gray',
+      'pipe:1'
     ],
     {
-      timeout: 10 * 60 * 1000,
-      maxBuffer: 10 * 1024 * 1024
+      encoding: 'buffer',
+      timeout: 20 * 60 * 1000,
+      maxBuffer:
+        SIGNATURE_WIDTH * SIGNATURE_HEIGHT * OCR_MAX_FRAMES + 5 * 1024 * 1024
     }
   );
 
@@ -579,13 +652,93 @@ async function extractFrames(videoPath, framesDir) {
     .filter(file => file.endsWith('.jpg'))
     .sort();
 
-  console.log(`🖼️ ${files.length} frames extraites`);
+  const frameBytes = SIGNATURE_WIDTH * SIGNATURE_HEIGHT;
+  const signatures = [];
 
-  return files.map((file, index) => ({
+  for (let i = 0; i + frameBytes <= stdout.length; i += frameBytes) {
+    signatures.push(stdout.subarray(i, i + frameBytes));
+  }
+
+  console.log(`🖼️ ${files.length} images extraites`);
+
+  const frames = files.map((file, index) => ({
     file: path.join(framesDir, file),
     index,
-    timestamp: index * OCR_INTERVAL_SECONDS
+    timestamp: index * interval
   }));
+
+  return { frames, signatures };
+}
+
+function frameDifference(a, b) {
+  const n = Math.min(a.length, b.length);
+
+  if (n === 0) {
+    return 255;
+  }
+
+  let sum = 0;
+
+  for (let i = 0; i < n; i++) {
+    sum += Math.abs(a[i] - b[i]);
+  }
+
+  return sum / n;
+}
+
+// Regroupe les images identiques qui se suivent (même page affichée longtemps)
+// et n'en garde que 3 par groupe : début, milieu, fin.
+function selectFramesForOcr(frames, signatures) {
+  if (!signatures || signatures.length < frames.length) {
+    return frames.slice();
+  }
+
+  const runs = [];
+  let start = 0;
+
+  for (let i = 1; i <= frames.length; i++) {
+    let same = false;
+
+    if (i < frames.length) {
+      same =
+        frameDifference(signatures[i - 1], signatures[i]) < OCR_SAME_THRESHOLD &&
+        frameDifference(signatures[start], signatures[i]) < OCR_SAME_THRESHOLD * 3;
+    }
+
+    if (!same) {
+      runs.push([start, i - 1]);
+      start = i;
+    }
+  }
+
+  const chosen = [];
+
+  for (const [first, last] of runs) {
+    const length = last - first + 1;
+
+    const indexes =
+      length <= OCR_MAX_PER_RUN
+        ? Array.from({ length }, (_, k) => first + k)
+        : [first, Math.round((first + last) / 2), last];
+
+    indexes.forEach(index => chosen.push(frames[index]));
+  }
+
+  return chosen;
+}
+
+function evenlySpaced(list, count) {
+  if (list.length <= count) {
+    return list.slice();
+  }
+
+  const picked = [];
+
+  for (let i = 0; i < count; i++) {
+    picked.push(list[Math.floor((i * list.length) / count)]);
+  }
+
+  return picked;
 }
 
 // ============================================================
@@ -627,49 +780,65 @@ function cleanOcrText(text) {
     .trim();
 }
 
-async function runOCR(frames) {
-  if (!frames || frames.length === 0) {
-    return [];
-  }
+// Signal fort : une vraie page de questions IELTS (et pas un texte quelconque)
+function hasStrongQuestionSignal(text) {
+  const value = String(text || '');
 
-  console.log(`🔎 OCR de ${frames.length} frames...`);
+  return (
+    /\(\d{1,2}\)/.test(value) ||
+    /questions?\s*\d{1,2}\s*(?:-|–|—|to)\s*\d{1,2}/i.test(value) ||
+    /write\s+no\s+more\s+than/i.test(value) ||
+    /choose\s+the\s+correct/i.test(value) ||
+    /complete\s+the\s+(?:form|notes|table|sentences?|summary|flow)/i.test(value)
+  );
+}
 
-  const worker = await createWorker('eng');
-
-  const results = [];
-
+async function ocrOneFrame(worker, frame) {
   try {
-    for (let i = 0; i < frames.length; i++) {
-      const frame = frames[i];
+    const result = await worker.recognize(frame.file);
 
-      try {
-        const result = await worker.recognize(frame.file);
+    const text = cleanOcrText(result?.data?.text || '');
 
-        const text = cleanOcrText(result?.data?.text || '');
-
-        if (text.length > 10) {
-          const isQuestion = looksLikeQuestionText(text);
-
-          if (isQuestion) {
-            console.log(`📝 Question détectée vers ${formatTime(frame.timestamp)}`);
-          }
-
-          results.push({
-            timestamp: frame.timestamp,
-            timestampFormatted: formatTime(frame.timestamp),
-            text,
-            questionLike: isQuestion
-          });
-        }
-      } catch (error) {
-        console.warn(`⚠️ OCR frame ${i} échoué:`, error.message);
-      }
+    if (text.length <= 10) {
+      return null;
     }
 
-    return results;
-  } finally {
-    await worker.terminate();
+    const isQuestion = looksLikeQuestionText(text);
+
+    if (isQuestion) {
+      console.log(`📝 Question détectée vers ${formatTime(frame.timestamp)}`);
+    }
+
+    return {
+      timestamp: frame.timestamp,
+      timestampFormatted: formatTime(frame.timestamp),
+      text,
+      questionLike: isQuestion
+    };
+  } catch (error) {
+    console.warn(`⚠️ OCR image ${frame.index} échoué:`, error.message);
+
+    return null;
   }
+}
+
+// Lit les images avec un lecteur déjà créé ; le cache évite de relire une image
+async function runOCR(frames, worker, cache = new Map()) {
+  const results = [];
+
+  for (const frame of frames) {
+    if (!cache.has(frame.index)) {
+      cache.set(frame.index, await ocrOneFrame(worker, frame));
+    }
+
+    const result = cache.get(frame.index);
+
+    if (result) {
+      results.push(result);
+    }
+  }
+
+  return results;
 }
 
 // ============================================================
@@ -1776,6 +1945,23 @@ function buildUniqueOcrMatches(ocrResults) {
 // ANALYSE OCR D'UNE VIDEO
 // ============================================================
 
+// Résultat "vide" qui explique pourquoi la vidéo n'a pas pu être lue
+function emptyOcrResult(video, reason, diagnostics) {
+  return {
+    ...video,
+
+    verified: false,
+    extractionMethod: 'video_ocr',
+    questionCount: 0,
+    questions: [],
+    missingNumbers: Array.from({ length: MAX_QUESTION_NUMBER }, (_, i) => i + 1),
+    answers: {},
+    groups: [],
+    rejected: reason,
+    diagnostics
+  };
+}
+
 async function analyzeVideoWithOCR(video, options = {}) {
   const debug = Boolean(options.debug);
 
@@ -1789,12 +1975,60 @@ async function analyzeVideoWithOCR(video, options = {}) {
 
     await downloadYoutubeVideo(video.videoId, videoPath);
 
-    const frames = await extractFrames(videoPath, framesDir);
+    // Images prises sur toute la durée réelle de la vidéo
+    const duration = (await probeDuration(videoPath)) || video.durationSeconds || 0;
+    const interval = chooseInterval(duration);
 
-    const ocrResults = await runOCR(frames);
+    const { frames, signatures } = await extractFrames(videoPath, framesDir, interval);
+
+    const chosen = selectFramesForOcr(frames, signatures);
 
     const maxTimestamp =
       frames.length > 0 ? frames[frames.length - 1].timestamp : 0;
+
+    const diagnostics = {
+      durationSeconds: Math.round(duration),
+      intervalSeconds: interval,
+      framesSampled: frames.length,
+      framesRead: chosen.length,
+      coveredSeconds: maxTimestamp,
+      probeHits: 0,
+      framesWithQuestions: 0
+    };
+
+    console.log(
+      `🔎 ${chosen.length} image(s) à lire sur ${frames.length} ` +
+        `(les images identiques sont ignorées)`
+    );
+
+    const cache = new Map();
+    const worker = await createWorker('eng');
+
+    let ocrResults;
+
+    try {
+      // 1) Sondage : quelques images réparties sur toute la vidéo
+      const probe = await runOCR(evenlySpaced(chosen, OCR_PROBE_FRAMES), worker, cache);
+
+      diagnostics.probeHits = probe.filter(item =>
+        hasStrongQuestionSignal(item.text)
+      ).length;
+
+      if (diagnostics.probeHits === 0) {
+        console.log('❌ Aucune page de questions repérée : vidéo abandonnée');
+
+        return emptyOcrResult(video, 'no_questions_on_screen', diagnostics);
+      }
+
+      // 2) Lecture complète
+      ocrResults = await runOCR(chosen, worker, cache);
+    } finally {
+      await worker.terminate();
+    }
+
+    diagnostics.framesWithQuestions = ocrResults.filter(
+      item => item.questionLike
+    ).length;
 
     const questions = extractQuestionsFromOcr(ocrResults, maxTimestamp);
 
@@ -1818,7 +2052,7 @@ async function analyzeVideoWithOCR(video, options = {}) {
     if (validQuestions.length === 0) {
       console.log('❌ Aucune question IELTS détectée par OCR');
 
-      return null;
+      return emptyOcrResult(video, 'no_questions_detected', diagnostics);
     }
 
     console.log(`✅ ${validQuestions.length} question(s) détectée(s) par OCR`);
@@ -1844,6 +2078,7 @@ async function analyzeVideoWithOCR(video, options = {}) {
       missingNumbers,
       answers,
       groups,
+      diagnostics,
       answerFrames: answerFrames.slice(0, 2)
     };
 
@@ -2043,7 +2278,7 @@ router.get('/ielts/test-video', async (req, res) => {
       debug: req.query.debug === '1'
     });
 
-    if (!result) {
+    if (!result || !result.questions || result.questions.length === 0) {
       return res.json({
         ok: false,
         videoId,
@@ -2140,12 +2375,14 @@ router.get('/ielts/test-ocr', async (req, res) => {
       debug: req.query.debug === '1'
     });
 
-    if (!result) {
+    if (!result || !result.questions || result.questions.length === 0) {
       return res.json({
         ok: false,
         videoId,
         title: video.title,
-        error: 'Aucune question IELTS détectée par OCR'
+        error: 'Aucune question IELTS détectée par OCR',
+        reason: result ? result.rejected : undefined,
+        diagnostics: result ? result.diagnostics : undefined
       });
     }
 
@@ -2159,6 +2396,7 @@ router.get('/ielts/test-ocr', async (req, res) => {
       missingNumbers: result.missingNumbers,
       answers: result.answers,
       groups: result.groups,
+      diagnostics: result.diagnostics,
       answerFrames: result.answerFrames
     };
 

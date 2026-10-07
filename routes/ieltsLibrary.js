@@ -30,6 +30,13 @@ const MAX_SEARCH_COUNT = 5;
 const MAX_API_SEARCHES_PER_RUN = 4; // limite le quota YouTube (100 unités / recherche)
 const MAX_ATTEMPTS = 2; // essais maximum pour une vidéo en erreur
 
+// Une vidéo trouvée par la RECHERCHE n'est gardée que si (presque) toutes ses
+// questions et ses réponses ont été lues. Sinon elle est écartée, et jamais
+// réanalysée (pas de crédit gaspillé). Les vidéos ajoutées à la main par
+// l'administrateur sont toujours gardées (marquées « à relire » si incomplètes).
+const MIN_QUESTIONS = Number(process.env.IELTS_MIN_QUESTIONS || 36);
+const MIN_ANSWERS = Number(process.env.IELTS_MIN_ANSWERS || 30);
+
 // ============================================================
 // SAUVEGARDE (fichier JSON)
 // ============================================================
@@ -111,7 +118,7 @@ function isKnown(videoId) {
   );
 }
 
-function markFailed(video, kind, message) {
+function markFailed(video, kind, message, diagnostics) {
   const previous = state.failed[video.videoId];
 
   state.failed[video.videoId] = {
@@ -119,10 +126,66 @@ function markFailed(video, kind, message) {
     title: video.title || '',
     kind, // 'no_questions' | 'error'
     message: message || '',
+    diagnostics: diagnostics || null,
     attempts: (previous ? previous.attempts : 0) + 1,
     at: new Date().toISOString()
   };
 }
+
+// Écarte une vidéo de la recherche si elle est trop incomplète
+function searchQualityProblem(result) {
+  const found = result && result.questions ? result.questions.length : 0;
+
+  const answers = Math.max(
+    result && result.answers ? Object.keys(result.answers).length : 0,
+    result && result.questions
+      ? result.questions.filter(question => question.answer).length
+      : 0
+  );
+
+  if (found < MIN_QUESTIONS) {
+    return `Seulement ${found} questions lues sur 40 (minimum ${MIN_QUESTIONS})`;
+  }
+
+  if (answers < MIN_ANSWERS) {
+    return `Seulement ${answers} réponses lues (minimum ${MIN_ANSWERS})`;
+  }
+
+  return '';
+}
+
+// Au démarrage : retire les vidéos de la recherche déjà enregistrées mais trop incomplètes
+function pruneWeakSearchVideos() {
+  let removed = 0;
+
+  Object.keys(state.videos).forEach(id => {
+    const record = state.videos[id];
+
+    if (record.source !== 'search') {
+      return;
+    }
+
+    const answers = Object.keys(record.answers || {}).length;
+
+    if (record.questionCount < MIN_QUESTIONS || answers < MIN_ANSWERS) {
+      markFailed(
+        { videoId: id, title: record.title },
+        'no_questions',
+        `Retirée : ${record.questionCount} questions et ${answers} réponses lues`
+      );
+
+      delete state.videos[id];
+      removed++;
+    }
+  });
+
+  if (removed > 0) {
+    console.log(`🧹 ${removed} vidéo(s) de la recherche retirée(s) (trop incomplètes)`);
+    saveState();
+  }
+}
+
+pruneWeakSearchVideos();
 
 function summarize(record) {
   return {
@@ -194,6 +257,7 @@ function buildRecord(video, result, source) {
     questions,
     answers,
     groups: result.groups || [],
+    diagnostics: result.diagnostics || null,
     source,
     addedAt: new Date().toISOString()
   };
@@ -283,17 +347,42 @@ async function analyzeAndStore(video, source) {
     const result = await helpers.analyzeVideoWithOCR(video, {});
 
     if (!result || !result.questions || result.questions.length === 0) {
-      markFailed(video, 'no_questions', 'Aucune question détectée');
+      const onScreen = result && result.rejected === 'no_questions_on_screen';
+
+      markFailed(
+        video,
+        'no_questions',
+        onScreen
+          ? 'Aucune page de questions à l’écran'
+          : 'Aucune question détectée',
+        result && result.diagnostics
+      );
 
       if (source === 'manual') {
         setPending(video, 'failed', source, {
-          error: 'Aucune question exploitable dans cette vidéo.'
+          error: onScreen
+            ? 'Aucune page de questions n’apparaît à l’écran dans cette vidéo.'
+            : 'Aucune question exploitable dans cette vidéo.'
         });
       } else {
         pending.delete(video.videoId);
       }
 
       await saveState();
+
+      return false;
+    }
+
+    // Recherche automatique : on ne garde que les vidéos (presque) complètes
+    const problem = source === 'search' ? searchQualityProblem(result) : '';
+
+    if (problem) {
+      markFailed(video, 'no_questions', problem, result.diagnostics);
+      pending.delete(video.videoId);
+
+      await saveState();
+
+      console.log(`🚫 Vidéo écartée ${video.videoId} : ${problem}`);
 
       return false;
     }
@@ -799,8 +888,20 @@ router.delete(`${API}/:videoId`, requireAdmin, (req, res) => {
     return res.json({ ok: true });
   }
 
+  const had = state.videos[id];
+
   delete state.videos[id];
-  delete state.failed[id];
+
+  if (had) {
+    // On s'en souvient : la recherche ne la proposera plus
+    markFailed(
+      { videoId: id, title: had.title },
+      'no_questions',
+      'Supprimée par l’administrateur'
+    );
+  } else {
+    delete state.failed[id];
+  }
 
   saveState();
 
@@ -1123,7 +1224,7 @@ const PAGE = String.raw`<!doctype html>
     c.badge.textContent = b.text;
 
     c.issues.innerHTML = '';
-    (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
+    if (isAdminUI) (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
 
     if (v.status === 'analyzing') c.msg.textContent = 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.';
     else if (v.status === 'queued') c.msg.textContent = 'En attente d’analyse : tu peux déjà regarder la vidéo.';
@@ -1131,10 +1232,18 @@ const PAGE = String.raw`<!doctype html>
     else c.msg.textContent = '';
 
     // Boutons "Réessayer" / "Fermer" : reconstruits seulement si l'état change
-    var key = (v.status === 'failed' && isAdminUI) ? 'failed' : '';
+    var key = isAdminUI ? (v.status === 'failed' ? 'failed' : (isReady(v) ? 'ready' : '')) : '';
     if (key !== c.actionKey) {
       c.actionKey = key;
       c.actions.innerHTML = '';
+      if (key === 'ready') {
+        var del = el('button', { class: 'secondary', text: 'Supprimer' });
+        del.addEventListener('click', function () {
+          if (!confirm('Supprimer cette vidéo de la bibliothèque ?')) return;
+          api('/' + encodeURIComponent(v.videoId), { method: 'DELETE' }).then(refreshAll);
+        });
+        c.actions.appendChild(del);
+      }
       if (key === 'failed') {
         var retry = el('button', { class: 'secondary', text: 'Réessayer' });
         retry.addEventListener('click', function () {
