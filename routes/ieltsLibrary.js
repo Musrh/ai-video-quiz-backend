@@ -344,7 +344,12 @@ async function analyzeAndStore(video, source) {
 
   try {
     // Lecture de la vidéo par OCR (questions + corrigé)
-    const result = await helpers.analyzeVideoWithOCR(video, {});
+    const result = await helpers.analyzeVideoWithOCR(video, {
+      // Avancement affiché à l'administrateur (téléchargement, lecture, Claude...)
+      onProgress: step => {
+        status.message = `« ${video.title} » : ${step}`;
+      }
+    });
 
     if (!result || !result.questions || result.questions.length === 0) {
       const onScreen = result && result.rejected === 'no_questions_on_screen';

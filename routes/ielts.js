@@ -20,7 +20,8 @@ const execFileAsync = promisify(execFile);
 
 const YOUTUBE_API_URL = 'https://www.googleapis.com/youtube/v3';
 const TRANSCRIPT_API_URL = 'https://www.youtubetranscript.dev/api/v2/transcribe';
-const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_URL =
+  process.env.ANTHROPIC_API_URL || 'https://api.anthropic.com/v1/messages';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-5';
 
 // OCR
@@ -43,6 +44,23 @@ const OCR_MAX_PER_RUN = 3;
 // Sondage avant l'analyse complète : si aucune page de questions n'apparaît
 // dans ces images réparties sur la vidéo, on abandonne tout de suite (économie de crédit).
 const OCR_PROBE_FRAMES = 20;
+
+// ----- Lecture des pages par Claude (vision) -----
+// L'OCR repère les pages ; Claude les lit comme une personne (deux colonnes,
+// numéros dessinés, schémas, petits textes) puis corrige/complète l'OCR.
+//   ANTHROPIC_API_KEY      : clé API (sans elle, seul l'OCR est utilisé)
+//   IELTS_CLAUDE_MODE      : "rescue" (défaut : seulement si l'OCR est incomplet),
+//                            "always" (toujours) ou "off"
+//   IELTS_CLAUDE_MODEL     : modèle de lecture (défaut claude-sonnet-5-5)
+//   IELTS_CLAUDE_CHECK_MODEL : modèle économique pour vérifier si la vidéo montre des questions
+//   IELTS_CLAUDE_MAX_IMAGES  : nombre maximum d'images envoyées par vidéo (défaut 30)
+const CLAUDE_MODE = String(process.env.IELTS_CLAUDE_MODE || 'rescue').toLowerCase();
+const CLAUDE_READ_MODEL = process.env.IELTS_CLAUDE_MODEL || 'claude-sonnet-5-5';
+const CLAUDE_CHECK_MODEL =
+  process.env.IELTS_CLAUDE_CHECK_MODEL || 'claude-haiku-4-5-20251001';
+const CLAUDE_MAX_IMAGES = Number(process.env.IELTS_CLAUDE_MAX_IMAGES || 30);
+const CLAUDE_BATCH_SIZE = Number(process.env.IELTS_CLAUDE_BATCH || 6);
+const CLAUDE_CHECK_IMAGES = 6;
 
 // Numérotation des questions IELTS Listening : 1 à 40
 const MAX_QUESTION_NUMBER = 40;
@@ -686,11 +704,11 @@ function frameDifference(a, b) {
   return sum / n;
 }
 
-// Regroupe les images identiques qui se suivent (même page affichée longtemps)
-// et n'en garde que 3 par groupe : début, milieu, fin.
-function selectFramesForOcr(frames, signatures) {
+// Groupes d'images identiques qui se suivent (même page affichée longtemps) :
+// [[première, dernière], ...]. Sans signatures, chaque image est son propre groupe.
+function findRuns(frames, signatures) {
   if (!signatures || signatures.length < frames.length) {
-    return frames.slice();
+    return frames.map((_, index) => [index, index]);
   }
 
   const runs = [];
@@ -711,9 +729,18 @@ function selectFramesForOcr(frames, signatures) {
     }
   }
 
+  return runs;
+}
+
+// N'en garde que 3 par groupe : début, milieu, fin.
+function selectFramesForOcr(frames, signatures) {
+  if (!signatures || signatures.length < frames.length) {
+    return frames.slice();
+  }
+
   const chosen = [];
 
-  for (const [first, last] of runs) {
+  for (const [first, last] of findRuns(frames, signatures)) {
     const length = last - first + 1;
 
     const indexes =
@@ -1945,6 +1972,401 @@ function buildUniqueOcrMatches(ocrResults) {
 // ANALYSE OCR D'UNE VIDEO
 // ============================================================
 
+// ============================================================
+// LECTURE DES PAGES PAR CLAUDE (VISION)
+// ============================================================
+
+function claudeEnabled() {
+  return Boolean(process.env.ANTHROPIC_API_KEY) && CLAUDE_MODE !== 'off';
+}
+
+function newClaudeUsage() {
+  return { models: [], requests: 0, images: 0, inputTokens: 0, outputTokens: 0 };
+}
+
+const CLAUDE_READ_SYSTEM = [
+  'You read screenshots taken from YouTube videos of IELTS Listening practice tests (40 questions numbered 1 to 40, in 4 sections).',
+  'Each image is labelled "Image N". For each image decide what it shows and transcribe it exactly as printed:',
+  '- "questions": a page of test questions;',
+  '- "answers": the answer key (list of correct answers);',
+  '- "other": anything else (title card, presenter, ads, transcript...).',
+  '',
+  'Rules:',
+  '- Transcribe only what is clearly legible. Never guess and never invent. If a question or an answer is cut off or unreadable, leave it out.',
+  '- Keep the printed wording and spelling, even if it looks wrong. Ignore watermarks, timers, subtitles, logos and banners such as "Read Carefully" or "Subscribe".',
+  '- "number" is the printed question number (1 to 40).',
+  '- Sentence, note, table or form completion: put the printed line in "text" and write the blank as (n), n being the question number, for example "Last name: (1)".',
+  '- Multiple choice: "text" is the question without its number, and "choices" lists every option as {"letter":"A","text":"..."}.',
+  '- Matching or "choose from the box": put the shared options in "options" (same format as choices) on EVERY question of the group, and the item in "text".',
+  '- "instructions": the printed instruction of the group (for example "Complete the notes below. Write NO MORE THAN TWO WORDS."). "context": the title or introduction line of the group. Use an empty string when absent.',
+  '- Diagrams, maps and flow charts: describe each blank in "text" using the printed labels around it.',
+  '- Answer pages: list every printed number with its answer text, in "answers".',
+  '',
+  'Reply with ONE JSON object and nothing else, in this shape:',
+  '{"pages":[{"image":1,"kind":"questions","questions":[{"number":1,"text":"Last name: (1)","choices":[],"options":[],"instructions":"","context":""}],"answers":[]},{"image":2,"kind":"answers","questions":[],"answers":[{"number":1,"answer":"Wright"}]}]}'
+].join('\n');
+
+const CLAUDE_CHECK_SYSTEM = [
+  'You look at screenshots taken from a YouTube video.',
+  'Decide whether at least one image shows a page of IELTS Listening test questions or an answer key (numbered questions with blanks or choices, or a list of numbered answers).',
+  'Reply with ONE JSON object and nothing else: {"questionPages": true} or {"questionPages": false}.'
+].join('\n');
+
+async function callClaude({ model, system, content, maxTokens }, usage) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const response = await axios.post(
+        ANTHROPIC_URL,
+        {
+          model,
+          max_tokens: maxTokens,
+          system,
+          messages: [{ role: 'user', content }]
+        },
+        {
+          headers: {
+            'x-api-key': process.env.ANTHROPIC_API_KEY,
+            'anthropic-version': '2023-06-01',
+            'content-type': 'application/json'
+          },
+          timeout: 180000,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity
+        }
+      );
+
+      const data = response.data || {};
+
+      usage.requests++;
+
+      if (!usage.models.includes(model)) {
+        usage.models.push(model);
+      }
+
+      if (data.usage) {
+        usage.inputTokens += data.usage.input_tokens || 0;
+        usage.outputTokens += data.usage.output_tokens || 0;
+      }
+
+      return (data.content || [])
+        .filter(block => block.type === 'text')
+        .map(block => block.text)
+        .join('\n');
+    } catch (error) {
+      lastError = error;
+
+      const status = error.response && error.response.status;
+
+      // Surcharge ou erreur passagère : on réessaie ; sinon (clé invalide...) on arrête
+      if (status === 429 || status === 529 || (status >= 500 && status < 600) || !status) {
+        await new Promise(resolve => setTimeout(resolve, attempt * 2500));
+        continue;
+      }
+
+      break;
+    }
+  }
+
+  const detail =
+    (lastError.response && lastError.response.data && lastError.response.data.error &&
+      lastError.response.data.error.message) ||
+    lastError.message;
+
+  throw new Error(`Claude : ${String(detail).slice(0, 200)}`);
+}
+
+function parseJsonObject(text) {
+  const value = String(text || '');
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+
+  if (start === -1 || end <= start) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value.slice(start, end + 1));
+  } catch (_) {
+    return null;
+  }
+}
+
+async function imageBlocks(frames, usage) {
+  const content = [];
+
+  for (let i = 0; i < frames.length; i++) {
+    const data = (await fsp.readFile(frames[i].file)).toString('base64');
+
+    content.push({ type: 'text', text: `Image ${i + 1}:` });
+    content.push({
+      type: 'image',
+      source: { type: 'base64', media_type: 'image/jpeg', data }
+    });
+
+    usage.images++;
+  }
+
+  return content;
+}
+
+// Quelques images réparties sur la vidéo : y a-t-il des pages de questions ?
+async function claudeScreenCheck(frames, usage) {
+  if (frames.length === 0) {
+    return false;
+  }
+
+  const content = await imageBlocks(frames, usage);
+
+  content.push({ type: 'text', text: 'Do these images show IELTS Listening question pages or an answer key? JSON only.' });
+
+  const text = await callClaude(
+    { model: CLAUDE_CHECK_MODEL, system: CLAUDE_CHECK_SYSTEM, content, maxTokens: 100 },
+    usage
+  );
+
+  const parsed = parseJsonObject(text);
+
+  return Boolean(parsed && parsed.questionPages === true);
+}
+
+// Choix des images à envoyer : le milieu de chaque page affichée.
+//   "blind"   : l'OCR ne lit rien -> pages réparties sur toute la vidéo
+//   "wide"    : l'OCR a raté beaucoup de questions -> pages repérées par l'OCR d'abord,
+//               puis les autres pages (l'OCR peut être aveugle aux petits textes)
+//   "flagged" : l'OCR a lu presque tout -> seulement les pages repérées (pour les corriger)
+function chooseClaudeFrames(frames, runs, cache, maxTimestamp, mode) {
+  const all = runs.map(([first, last]) => ({
+    length: last - first + 1,
+    frame: frames[Math.round((first + last) / 2)]
+  }));
+
+  const stable = all.filter(item => item.length >= 2);
+  const pool = stable.length > 0 ? stable : all;
+
+  let picked;
+
+  if (mode === 'blind') {
+    picked = evenlySpaced(pool.map(item => item.frame), CLAUDE_MAX_IMAGES);
+  } else {
+    const scored = pool.map(item => {
+      const result = cache.get(item.frame.index);
+
+      let score = 1;
+
+      if (result) {
+        if (hasStrongQuestionSignal(result.text) || isAnswerKeyFrame(result, maxTimestamp)) {
+          score = 3;
+        } else if (result.questionLike) {
+          score = 2;
+        }
+      }
+
+      return { ...item, score };
+    });
+
+    const relevant = scored.filter(item => item.score >= 2);
+
+    const candidates =
+      mode === 'wide' || relevant.length === 0 ? scored : relevant;
+
+    picked = candidates
+      .sort((a, b) => b.score - a.score || b.length - a.length)
+      .slice(0, CLAUDE_MAX_IMAGES)
+      .map(item => item.frame);
+  }
+
+  return picked.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+// Lit les images par lots ; renvoie la liste des pages reconnues par Claude
+async function claudeReadPages(frames, usage, progress) {
+  const pages = [];
+
+  for (let i = 0; i < frames.length; i += CLAUDE_BATCH_SIZE) {
+    const batch = frames.slice(i, i + CLAUDE_BATCH_SIZE);
+
+    progress(
+      `lecture des pages par Claude (${Math.min(i + batch.length, frames.length)}/${frames.length})…`
+    );
+
+    const content = await imageBlocks(batch, usage);
+
+    content.push({
+      type: 'text',
+      text: `Transcribe these ${batch.length} image(s) following the rules. JSON only.`
+    });
+
+    let parsed = null;
+
+    // Une seconde tentative si la réponse n'est pas du JSON valide
+    for (let attempt = 1; attempt <= 2 && !parsed; attempt++) {
+      const text = await callClaude(
+        { model: CLAUDE_READ_MODEL, system: CLAUDE_READ_SYSTEM, content, maxTokens: 12000 },
+        usage
+      );
+
+      parsed = parseJsonObject(text);
+    }
+
+    if (!parsed || !Array.isArray(parsed.pages)) {
+      continue;
+    }
+
+    for (const page of parsed.pages) {
+      const frame = batch[Number(page.image) - 1];
+
+      if (frame) {
+        pages.push({ ...page, timestamp: frame.timestamp });
+      }
+    }
+  }
+
+  return pages;
+}
+
+function plainText(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function cleanLetterList(list) {
+  return (Array.isArray(list) ? list : [])
+    .map(item => ({
+      letter: plainText(item && item.letter).toUpperCase(),
+      text: plainText(item && item.text)
+    }))
+    .filter(item => /^[A-H]$/.test(item.letter) && item.text);
+}
+
+// Fusionne la lecture de Claude et celle de l'OCR : pour chaque numéro on garde
+// Claude s'il a lu la question, sinon l'OCR.
+function mergeWithClaude(ocrQuestions, ocrAnswers, pages) {
+  const candidates = new Map(); // numéro -> meilleure lecture de Claude
+  const answerVotes = new Map(); // numéro -> réponse -> nombre de pages
+
+  for (const page of pages) {
+    for (const item of Array.isArray(page.questions) ? page.questions : []) {
+      const number = Number(item && item.number);
+      const text = plainText(item && item.text);
+
+      if (!isValidQuestionNumber(number) || text.length < 2) {
+        continue;
+      }
+
+      const choices = cleanLetterList(item.choices);
+      const options = cleanLetterList(item.options);
+
+      const score = choices.length * 50 + options.length * 10 + Math.min(text.length, 300) / 10;
+
+      const existing = candidates.get(number);
+
+      if (!existing || score > existing.score) {
+        candidates.set(number, {
+          score,
+          firstTime: existing ? Math.min(existing.firstTime, page.timestamp) : page.timestamp,
+          number,
+          text,
+          choices,
+          options,
+          instructions: plainText(item.instructions),
+          context: plainText(item.context)
+        });
+      } else {
+        existing.firstTime = Math.min(existing.firstTime, page.timestamp);
+      }
+    }
+
+    for (const item of Array.isArray(page.answers) ? page.answers : []) {
+      const number = Number(item && item.number);
+      const answer = plainText(item && item.answer);
+
+      if (!isValidQuestionNumber(number) || !answer || answer.length > 80) {
+        continue;
+      }
+
+      if (!answerVotes.has(number)) {
+        answerVotes.set(number, new Map());
+      }
+
+      const votes = answerVotes.get(number);
+
+      votes.set(answer, (votes.get(answer) || 0) + 1);
+    }
+  }
+
+  const answers = { ...ocrAnswers };
+  let claudeAnswers = 0;
+
+  for (const [number, votes] of answerVotes) {
+    let best = null;
+    let bestCount = 0;
+
+    for (const [answer, count] of votes) {
+      if (count > bestCount) {
+        best = answer;
+        bestCount = count;
+      }
+    }
+
+    if (best) {
+      answers[number] = best;
+      claudeAnswers++;
+    }
+  }
+
+  const ocrByNumber = new Map(ocrQuestions.map(question => [question.number, question]));
+
+  const questions = [];
+
+  for (let number = 1; number <= MAX_QUESTION_NUMBER; number++) {
+    const fromClaude = candidates.get(number);
+    const fromOcr = ocrByNumber.get(number);
+
+    if (fromClaude) {
+      const question = {
+        number,
+        section: sectionFromNumber(number),
+        text: fromClaude.text,
+        choices: fromClaude.choices,
+        startTime: fromClaude.firstTime,
+        startTimeFormatted: formatTime(fromClaude.firstTime),
+        source: 'claude_vision'
+      };
+
+      // Question à compléter ou ouverte (sans choix) : on garde un emplacement de réponse "(n)"
+      if (question.choices.length === 0 && !/\(\d{1,2}\)/.test(question.text)) {
+        question.text = `${question.text} (${number})`;
+      }
+
+      if (fromClaude.options.length > 0) question.options = fromClaude.options;
+      if (fromClaude.instructions) question.instructions = fromClaude.instructions;
+      if (fromClaude.context) question.context = fromClaude.context;
+
+      questions.push(question);
+    } else if (fromOcr) {
+      questions.push({ ...fromOcr });
+    }
+  }
+
+  for (const question of questions) {
+    if (answers[question.number]) {
+      question.answer = answers[question.number];
+    } else {
+      delete question.answer;
+    }
+  }
+
+  return {
+    questions,
+    answers,
+    claudeQuestions: candidates.size,
+    claudeAnswers
+  };
+}
+
 // Résultat "vide" qui explique pourquoi la vidéo n'a pas pu être lue
 function emptyOcrResult(video, reason, diagnostics) {
   return {
@@ -1965,6 +2387,9 @@ function emptyOcrResult(video, reason, diagnostics) {
 async function analyzeVideoWithOCR(video, options = {}) {
   const debug = Boolean(options.debug);
 
+  const progress =
+    typeof options.onProgress === 'function' ? options.onProgress : () => {};
+
   const tempDir = await createTempDir();
 
   const videoPath = path.join(tempDir, 'video.mp4');
@@ -1973,7 +2398,11 @@ async function analyzeVideoWithOCR(video, options = {}) {
   try {
     console.log(`\n🔬 ANALYSE OCR IELTS: ${video.videoId}`);
 
+    progress('téléchargement de la vidéo…');
+
     await downloadYoutubeVideo(video.videoId, videoPath);
+
+    progress('extraction des images…');
 
     // Images prises sur toute la durée réelle de la vidéo
     const duration = (await probeDuration(videoPath)) || video.durationSeconds || 0;
@@ -1981,6 +2410,7 @@ async function analyzeVideoWithOCR(video, options = {}) {
 
     const { frames, signatures } = await extractFrames(videoPath, framesDir, interval);
 
+    const runs = findRuns(frames, signatures);
     const chosen = selectFramesForOcr(frames, signatures);
 
     const maxTimestamp =
@@ -2001,12 +2431,17 @@ async function analyzeVideoWithOCR(video, options = {}) {
         `(les images identiques sont ignorées)`
     );
 
+    const usage = newClaudeUsage();
+
     const cache = new Map();
     const worker = await createWorker('eng');
 
     let ocrResults;
+    let blindOcr = false; // l'OCR ne voit rien mais Claude voit des questions
 
     try {
+      progress('lecture des images (OCR)…');
+
       // 1) Sondage : quelques images réparties sur toute la vidéo
       const probe = await runOCR(evenlySpaced(chosen, OCR_PROBE_FRAMES), worker, cache);
 
@@ -2015,13 +2450,47 @@ async function analyzeVideoWithOCR(video, options = {}) {
       ).length;
 
       if (diagnostics.probeHits === 0) {
-        console.log('❌ Aucune page de questions repérée : vidéo abandonnée');
+        // L'OCR ne voit aucune page de questions : si Claude est disponible,
+        // il vérifie sur quelques images (l'OCR est parfois aveugle aux petits textes).
+        let claudeSees = false;
 
-        return emptyOcrResult(video, 'no_questions_on_screen', diagnostics);
+        if (claudeEnabled()) {
+          try {
+            progress('vérification par Claude…');
+
+            claudeSees = await claudeScreenCheck(
+              evenlySpaced(
+                runs
+                  .filter(([first, last]) => last - first + 1 >= 2)
+                  .map(([first, last]) => frames[Math.round((first + last) / 2)]),
+                CLAUDE_CHECK_IMAGES
+              ),
+              usage
+            );
+          } catch (error) {
+            console.warn('⚠️ Vérification Claude impossible :', error.message);
+            diagnostics.claude = { ...usage, error: error.message.slice(0, 200) };
+          }
+        }
+
+        if (!claudeSees) {
+          console.log('❌ Aucune page de questions repérée : vidéo abandonnée');
+
+          if (usage.requests > 0) {
+            diagnostics.claude = { ...usage };
+          }
+
+          return emptyOcrResult(video, 'no_questions_on_screen', diagnostics);
+        }
+
+        console.log('👁️ Claude voit des pages de questions que l’OCR ne lit pas');
+
+        blindOcr = true;
+        ocrResults = probe;
+      } else {
+        // 2) Lecture complète
+        ocrResults = await runOCR(chosen, worker, cache);
       }
-
-      // 2) Lecture complète
-      ocrResults = await runOCR(chosen, worker, cache);
     } finally {
       await worker.terminate();
     }
@@ -2030,32 +2499,79 @@ async function analyzeVideoWithOCR(video, options = {}) {
       item => item.questionLike
     ).length;
 
-    const questions = extractQuestionsFromOcr(ocrResults, maxTimestamp);
+    const ocrQuestions = extractQuestionsFromOcr(ocrResults, maxTimestamp);
 
     const groups = buildQuestionGroups(ocrResults, maxTimestamp);
 
     const answerFrames = collectAnswerFrames(ocrResults, maxTimestamp, 12);
 
-    const answers = parseAnswerKey(answerFrames);
+    const ocrAnswers = parseAnswerKey(answerFrames);
 
-    const validQuestions = questions.filter(
+    let validQuestions = ocrQuestions.filter(
       question => question.text && question.text.length >= 4
     );
 
-    // Réponse lue dans le corrigé de fin de vidéo (OCR : peut contenir des erreurs)
     for (const question of validQuestions) {
-      if (answers[question.number]) {
-        question.answer = answers[question.number];
+      if (ocrAnswers[question.number]) {
+        question.answer = ocrAnswers[question.number];
+      }
+    }
+
+    let answers = ocrAnswers;
+
+    // ----- Lecture par Claude : seulement si l'OCR est incomplet (ou mode "always") -----
+    const incomplete =
+      validQuestions.length < MAX_QUESTION_NUMBER ||
+      Object.keys(ocrAnswers).length < MAX_QUESTION_NUMBER;
+
+    if (claudeEnabled() && (blindOcr || CLAUDE_MODE === 'always' || incomplete)) {
+      try {
+        const targets = chooseClaudeFrames(
+          frames,
+          runs,
+          cache,
+          maxTimestamp,
+          blindOcr
+            ? 'blind'
+            : validQuestions.length < MAX_QUESTION_NUMBER - 4
+              ? 'wide'
+              : 'flagged'
+        );
+
+        console.log(`🤖 Lecture par Claude : ${targets.length} image(s)`);
+
+        const pages = await claudeReadPages(targets, usage, progress);
+
+        const merged = mergeWithClaude(validQuestions, ocrAnswers, pages);
+
+        validQuestions = merged.questions;
+        answers = merged.answers;
+
+        diagnostics.claude = {
+          ...usage,
+          questionsRead: merged.claudeQuestions,
+          answersRead: merged.claudeAnswers
+        };
+
+        console.log(
+          `🤖 Claude : ${merged.claudeQuestions} question(s), ${merged.claudeAnswers} réponse(s) ` +
+            `(${usage.inputTokens} + ${usage.outputTokens} tokens)`
+        );
+      } catch (error) {
+        // L'OCR reste le secours : on garde son résultat
+        console.warn('⚠️ Lecture par Claude impossible :', error.message);
+
+        diagnostics.claude = { ...usage, error: error.message.slice(0, 200) };
       }
     }
 
     if (validQuestions.length === 0) {
-      console.log('❌ Aucune question IELTS détectée par OCR');
+      console.log('❌ Aucune question IELTS détectée');
 
       return emptyOcrResult(video, 'no_questions_detected', diagnostics);
     }
 
-    console.log(`✅ ${validQuestions.length} question(s) détectée(s) par OCR`);
+    console.log(`✅ ${validQuestions.length} question(s) détectée(s)`);
 
     // Numéros de 1 à 40 non retrouvés
     const foundNumbers = new Set(validQuestions.map(question => question.number));
@@ -2068,11 +2584,13 @@ async function analyzeVideoWithOCR(video, options = {}) {
       }
     }
 
+    const usedClaude = validQuestions.some(question => question.source === 'claude_vision');
+
     const response = {
       ...video,
 
       verified: true,
-      extractionMethod: 'video_ocr',
+      extractionMethod: usedClaude ? 'claude_vision' : 'video_ocr',
       questionCount: validQuestions.length,
       questions: validQuestions,
       missingNumbers,
