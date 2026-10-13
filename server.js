@@ -10,15 +10,11 @@ const questionsRouter = require('./routes/questions');
 
 const ieltsRouter = require('./routes/ielts');
 const ieltsLibraryRouter = require('./routes/ieltsLibrary');
+const rewardsRouter = require('./routes/rewards');
 
 const { adminGuard } = ieltsLibraryRouter;
 
 const app = express();
-
-
-
-
-
 
 app.use(cors());
 app.use(express.json());
@@ -30,6 +26,10 @@ app.get('/', (req, res) => {
     version: '1.0.0'
   });
 });
+
+// Quiz : le serveur vérifie l'identité de l'élève (jeton Firebase), applique la
+// limite de vidéos par jour et garde les bonnes réponses (jamais envoyées au navigateur).
+app.use('/api/youtube/questions', rewardsRouter.quizGate);
 
 app.use('/api/youtube', youtubeRouter);
 app.use('/api/youtube', contentRouter);
@@ -56,6 +56,9 @@ app.use('/api/youtube', ieltsRouter);
 
 // Bibliothèque IELTS (vidéos sauvegardées) + page web /ielts-app
 app.use('/', ieltsLibraryRouter);
+
+// Récompenses : solde, retraits, panneau administrateur /admin
+app.use('/', rewardsRouter);
 
 
 const PORT = process.env.PORT || 8080;
