@@ -37,6 +37,11 @@ const MAX_ATTEMPTS = 2; // essais maximum pour une vidéo en erreur
 const MIN_QUESTIONS = Number(process.env.IELTS_MIN_QUESTIONS || 36);
 const MIN_ANSWERS = Number(process.env.IELTS_MIN_ANSWERS || 30);
 
+// Vérification régulière : les vidéos supprimées ou rendues privées sur YouTube
+// sont masquées aux élèves (les questions restent enregistrées, au cas où la
+// vidéo reviendrait). 1 unité de quota YouTube pour 50 vidéos. 0 = désactivé.
+const CHECK_INTERVAL_HOURS = Number(process.env.IELTS_CHECK_HOURS || 24);
+
 // ============================================================
 // SAUVEGARDE (fichier JSON)
 // ============================================================
@@ -154,6 +159,93 @@ function searchQualityProblem(result) {
   return '';
 }
 
+// Vérifie auprès de YouTube que les vidéos enregistrées existent toujours
+let lastAvailabilityCheck = null;
+
+async function checkAvailability() {
+  const ids = Object.keys(state.videos);
+
+  if (ids.length === 0 || !process.env.YOUTUBE_API_KEY) {
+    return { checked: 0, unavailable: 0 };
+  }
+
+  let changed = false;
+
+  for (let i = 0; i < ids.length; i += 50) {
+    const chunk = ids.slice(i, i + 50);
+
+    // En cas d'erreur (quota, réseau) on s'arrête sans rien modifier
+    const details = await helpers.getVideoDetails(chunk);
+
+    // Réponse vide pour un gros lot : probablement un incident, pas 5 suppressions d'un coup
+    if ((!details || details.length === 0) && chunk.length >= 5) {
+      continue;
+    }
+
+    const alive = new Set(
+      details
+        .filter(item => {
+          const info = item.status;
+
+          return (
+            !info ||
+            ((info.privacyStatus === 'public' || info.privacyStatus === 'unlisted') &&
+              info.embeddable !== false)
+          );
+        })
+        .map(item => item.id)
+    );
+
+    for (const id of chunk) {
+      const record = state.videos[id];
+
+      if (!record) {
+        continue;
+      }
+
+      if (!alive.has(id) && !record.unavailable) {
+        record.unavailable = true;
+        record.unavailableSince = new Date().toISOString();
+        changed = true;
+        console.log(`🚫 Vidéo indisponible sur YouTube : ${id}`);
+      } else if (alive.has(id) && record.unavailable) {
+        delete record.unavailable;
+        delete record.unavailableSince;
+        changed = true;
+        console.log(`✅ Vidéo de nouveau disponible : ${id}`);
+      }
+    }
+  }
+
+  if (changed) {
+    await saveState();
+  }
+
+  lastAvailabilityCheck = new Date().toISOString();
+
+  return {
+    checked: ids.length,
+    unavailable: Object.values(state.videos).filter(record => record.unavailable).length
+  };
+}
+
+function scheduleAvailabilityChecks() {
+  if (!(CHECK_INTERVAL_HOURS > 0)) {
+    return;
+  }
+
+  const run = () =>
+    checkAvailability().catch(error =>
+      console.warn('⚠️ Vérification des vidéos impossible :', error.message)
+    );
+
+  // Une première vérification peu après le démarrage, puis régulièrement
+  setTimeout(run, 60 * 1000).unref();
+  setInterval(run, CHECK_INTERVAL_HOURS * 3600 * 1000).unref();
+}
+
+scheduleAvailabilityChecks();
+
 // Au démarrage : retire les vidéos de la recherche déjà enregistrées mais trop incomplètes
 function pruneWeakSearchVideos() {
   let removed = 0;
@@ -195,6 +287,7 @@ function summarize(record) {
     channelTitle: record.channelTitle,
     thumbnail: record.thumbnail,
     durationSeconds: record.durationSeconds,
+    unavailable: Boolean(record.unavailable),
     status: record.status, // 'ok' | 'to_review'
     issues: record.issues,
     questionCount: record.questionCount,
@@ -736,6 +829,7 @@ router.get(API, (req, res) => {
 
   const saved = Object.values(state.videos)
     .filter(record => !(admin && pending.has(record.videoId)))
+    .filter(record => admin || !record.unavailable)
     .sort((a, b) => String(b.addedAt).localeCompare(String(a.addedAt)))
     .map(summarize);
 
@@ -857,7 +951,7 @@ router.post(`${API}/search-more`, requireAdmin, (req, res) => {
 router.get(`${API}/:videoId`, (req, res) => {
   const record = state.videos[req.params.videoId];
 
-  if (!record) {
+  if (!record || (record.unavailable && !isAdminRequest(req))) {
     return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
   }
 
@@ -875,11 +969,22 @@ router.get(`${API}/:videoId`, (req, res) => {
 router.get(`${API}/:videoId/answers`, (req, res) => {
   const record = state.videos[req.params.videoId];
 
-  if (!record) {
+  if (!record || (record.unavailable && !isAdminRequest(req))) {
     return res.status(404).json({ ok: false, error: 'Vidéo introuvable' });
   }
 
   return res.json({ ok: true, answers: record.answers || {} });
+});
+
+// Vérifier maintenant que les vidéos existent toujours sur YouTube
+router.post(`${API}/check`, requireAdmin, async (req, res) => {
+  try {
+    const result = await checkAvailability();
+
+    res.json({ ok: true, ...result, lastCheck: lastAvailabilityCheck });
+  } catch (error) {
+    res.status(502).json({ ok: false, error: friendlyError(error.message) });
+  }
 });
 
 // Supprimer une vidéo (pour pouvoir la refaire)
@@ -1150,6 +1255,7 @@ const PAGE = String.raw`<!doctype html>
   function isReady(v) { return v.status === 'ok' || v.status === 'to_review'; }
 
   function badgeInfo(v) {
+    if (v.unavailable) return { cls: 'bad', text: 'indisponible' };
     if (v.status === 'ok') return { cls: 'ok', text: 'vérifié' };
     if (v.status === 'to_review') return { cls: 'review', text: 'à relire' };
     if (v.status === 'analyzing') return { cls: 'wait', text: 'analyse en cours…' };
@@ -1231,7 +1337,8 @@ const PAGE = String.raw`<!doctype html>
     c.issues.innerHTML = '';
     if (isAdminUI) (v.issues || []).forEach(function (i) { c.issues.appendChild(el('li', { text: i })); });
 
-    if (v.status === 'analyzing') c.msg.textContent = 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.';
+    if (v.unavailable) c.msg.textContent = 'Cette vidéo n’est plus disponible sur YouTube : les élèves ne la voient plus.';
+    else if (v.status === 'analyzing') c.msg.textContent = 'Analyse en cours : tu peux déjà regarder la vidéo, le test sera prêt dans quelques minutes.';
     else if (v.status === 'queued') c.msg.textContent = 'En attente d’analyse : tu peux déjà regarder la vidéo.';
     else if (v.status === 'failed') c.msg.textContent = '⚠️ ' + (v.error || 'Analyse impossible pour cette vidéo.');
     else c.msg.textContent = '';
@@ -1269,7 +1376,7 @@ const PAGE = String.raw`<!doctype html>
   // Bouton du test : désactivé pendant l'analyse, actif dès que le test est prêt
   function renderStart(c) {
     if (!c.playerShown || c.testStarted) return;
-    var state = isReady(c.v) ? 'ready' : (c.v.status === 'failed' ? 'none' : 'wait');
+    var state = c.v.unavailable ? 'none' : (isReady(c.v) ? 'ready' : (c.v.status === 'failed' ? 'none' : 'wait'));
     if (state === c.startState) return;
     c.startState = state;
     c.startBox.innerHTML = '';
