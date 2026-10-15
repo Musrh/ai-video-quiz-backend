@@ -31,6 +31,14 @@ const CERTS_URL =
   process.env.FIREBASE_CERTS_URL ||
   'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com';
 
+// Ancien stockage des points : Firestore (document de l'élève, lu avec SON jeton).
+// Adapte ces valeurs si ta collection / ton champ ont un autre nom.
+const LEGACY_COLLECTION = process.env.LEGACY_POINTS_COLLECTION || 'users';
+const LEGACY_FIELDS = (process.env.LEGACY_POINTS_FIELDS || 'totalPoints,points,score,totalScore')
+  .split(',')
+  .map(item => item.trim())
+  .filter(Boolean);
+
 // Fuseau horaire qui définit le "jour" de la limite quotidienne
 const TIME_ZONE = process.env.REWARDS_TIMEZONE || 'UTC';
 
@@ -323,6 +331,7 @@ async function requireUser(req, res, next) {
     }
 
     req.rewardUser = user;
+    req.rewardToken = token;
 
     return next();
   } catch (error) {
@@ -332,6 +341,105 @@ async function requireUser(req, res, next) {
       error: 'Session invalide, reconnecte-toi.'
     });
   }
+}
+
+// ============================================================
+// MIGRATION : reprise des points déjà cumulés dans Firebase (Firestore)
+// ============================================================
+// Pour un compte qui existait avant la mise à jour, le serveur lit une seule
+// fois son ancien cumul dans Firestore (avec le jeton de l'élève, donc avec
+// les règles de sécurité normales) et l'ajoute à son solde. Si la lecture
+// échoue (réseau, règles), rien n'est marqué : on réessaiera à la prochaine
+// connexion.
+
+const migrations = new Map(); // uid -> promesse en cours (évite un double crédit)
+
+function readFirestoreNumber(field) {
+  if (!field || typeof field !== 'object') return null;
+
+  if (field.integerValue !== undefined) return Number(field.integerValue);
+  if (field.doubleValue !== undefined) return Number(field.doubleValue);
+  if (field.stringValue !== undefined && field.stringValue.trim() !== '') {
+    return Number(field.stringValue);
+  }
+
+  return null;
+}
+
+async function fetchLegacyPoints(uid, token) {
+  const url =
+    `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}` +
+    `/databases/(default)/documents/${encodeURIComponent(LEGACY_COLLECTION)}/${encodeURIComponent(uid)}`;
+
+  const response = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    timeout: 10000,
+    validateStatus: () => true
+  });
+
+  if (response.status === 404) {
+    return { found: false, points: 0 }; // pas d'ancien document : rien à reprendre
+  }
+
+  if (response.status !== 200) {
+    throw new Error(`Firestore HTTP ${response.status}`);
+  }
+
+  const fields = (response.data && response.data.fields) || {};
+
+  for (const name of LEGACY_FIELDS) {
+    const value = readFirestoreNumber(fields[name]);
+
+    if (Number.isFinite(value) && value >= 0) {
+      return { found: true, points: Math.floor(value), field: name };
+    }
+  }
+
+  return { found: true, points: 0 };
+}
+
+async function migrateLegacyPoints(req, res, next) {
+  const uid = req.rewardUser.uid;
+  const user = getUser(uid, req.rewardUser.email);
+
+  if (user.legacyMigrated) {
+    return next();
+  }
+
+  try {
+    if (!migrations.has(uid)) {
+      migrations.set(
+        uid,
+        fetchLegacyPoints(uid, req.rewardToken).finally(() => migrations.delete(uid))
+      );
+    }
+
+    const legacy = await migrations.get(uid);
+
+    // Un autre appel simultané a pu terminer la migration entre-temps
+    if (!user.legacyMigrated) {
+      user.points += legacy.points;
+      user.legacyPoints = legacy.points;
+      user.legacyMigrated = true;
+      user.legacyMigratedAt = new Date().toISOString();
+
+      audit({
+        type: 'legacy_import',
+        uid,
+        email: user.email,
+        points: legacy.points,
+        field: legacy.field || null,
+        found: legacy.found
+      });
+
+      saveState();
+    }
+  } catch (error) {
+    // On ne bloque pas l'élève et on ne marque rien : nouvel essai à la prochaine requête
+    console.error(`⚠️ Reprise des anciens points impossible (${uid}) :`, error.message);
+  }
+
+  return next();
 }
 
 // ============================================================
@@ -481,7 +589,7 @@ const quizGate = [
 // ROUTES DE L'ÉLÈVE
 // ============================================================
 
-router.get('/api/rewards/me', requireUser, (req, res) => {
+router.get('/api/rewards/me', requireUser, migrateLegacyPoints, (req, res) => {
   const user = getUser(req.rewardUser.uid, req.rewardUser.email);
 
   saveState();
@@ -490,7 +598,7 @@ router.get('/api/rewards/me', requireUser, (req, res) => {
 });
 
 // Correction du quiz et crédit du point : uniquement ici
-router.post('/api/rewards/submit', requireUser, (req, res) => {
+router.post('/api/rewards/submit', requireUser, migrateLegacyPoints, (req, res) => {
   const uid = req.rewardUser.uid;
   const user = getUser(uid, req.rewardUser.email);
 
@@ -570,7 +678,7 @@ router.post('/api/rewards/submit', requireUser, (req, res) => {
 });
 
 // Demande de retrait
-router.post('/api/rewards/withdraw', requireUser, (req, res) => {
+router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res) => {
   const uid = req.rewardUser.uid;
   const user = getUser(uid, req.rewardUser.email);
 
