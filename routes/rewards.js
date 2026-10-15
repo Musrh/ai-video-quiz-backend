@@ -39,6 +39,21 @@ const LEGACY_FIELDS = (process.env.LEGACY_POINTS_FIELDS || 'totalPoints,points,s
   .map(item => item.trim())
   .filter(Boolean);
 
+// E-mails (code de retrait Western Union / Wafacash) — service Resend (https://resend.com)
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const MAIL_FROM = process.env.MAIL_FROM || ''; // ex : AI Video Quiz <retraits@ton-domaine.com>
+
+// PayPal Payouts (paiement automatique, facultatif)
+const PAYPAL_CLIENT_ID = process.env.PAYPAL_CLIENT_ID || '';
+const PAYPAL_CLIENT_SECRET = process.env.PAYPAL_CLIENT_SECRET || '';
+const PAYPAL_BASE =
+  process.env.PAYPAL_ENV === 'live'
+    ? 'https://api-m.paypal.com'
+    : 'https://api-m.sandbox.paypal.com';
+
+const MAIL_ENABLED = Boolean(RESEND_API_KEY && MAIL_FROM);
+const PAYPAL_ENABLED = Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET);
+
 // Fuseau horaire qui définit le "jour" de la limite quotidienne
 const TIME_ZONE = process.env.REWARDS_TIMEZONE || 'UTC';
 
@@ -200,6 +215,9 @@ function summarize(uid, user) {
       amountCents: item.amountCents,
       points: item.points,
       status: item.status,
+      method: item.payout ? item.payout.method : null,
+      network: item.payout && item.payout.network ? item.payout.network : null,
+      codeSent: Boolean(item.codeSentAt),
       createdAt: item.createdAt,
       resolvedAt: item.resolvedAt || null
     }));
@@ -586,6 +604,184 @@ const quizGate = [
 ];
 
 // ============================================================
+// MOYENS DE RETRAIT : validation des coordonnées, e-mails, PayPal
+// ============================================================
+
+const PAYOUT_METHODS = {
+  card: 'Carte bancaire (Stripe)',
+  paypal: 'PayPal',
+  cash: 'Western Union / Wafacash'
+};
+
+const CASH_NETWORKS = {
+  western_union: 'Western Union',
+  wafacash: 'Wafacash'
+};
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+function cleanText(value, min, max) {
+  const text = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+
+  return text.length >= min && text.length <= max ? text : null;
+}
+
+function payoutError(code, error) {
+  return { error: { code, error } };
+}
+
+// Vérifie les coordonnées envoyées par l'élève selon le moyen choisi
+function buildPayout(body, user) {
+  const method = String((body && body.method) || '');
+
+  if (!PAYOUT_METHODS[method]) {
+    return payoutError('payout_method', 'Choisis un moyen de paiement.');
+  }
+
+  const fullName = cleanText(body.fullName, 2, 80);
+  const country = cleanText(body.country, 2, 60);
+
+  if (!fullName || !country) {
+    return payoutError('payout_info', 'Indique ton nom complet et ton pays.');
+  }
+
+  const payout = { method, fullName, country };
+
+  if (method === 'paypal') {
+    const email = cleanText(body.paypalEmail, 5, 120);
+
+    if (!email || !EMAIL_RE.test(email)) {
+      return payoutError('payout_info', 'Indique l’e-mail de ton compte PayPal.');
+    }
+
+    payout.paypalEmail = email.toLowerCase();
+  }
+
+  if (method === 'card') {
+    const email = cleanText(body.contactEmail, 5, 120) || user.email;
+
+    if (!email || !EMAIL_RE.test(email)) {
+      return payoutError('payout_info', 'Indique une adresse e-mail de contact valide.');
+    }
+
+    payout.contactEmail = email.toLowerCase();
+  }
+
+  if (method === 'cash') {
+    const network = String(body.network || '');
+    const phone = cleanText(body.phone, 6, 25);
+    const city = cleanText(body.city, 2, 60);
+
+    if (!CASH_NETWORKS[network]) {
+      return payoutError('payout_info', 'Choisis Western Union ou Wafacash.');
+    }
+
+    if (!phone || !/^[+0-9 ()-]{6,25}$/.test(phone) || !city) {
+      return payoutError('payout_info', 'Indique ton téléphone (avec indicatif) et ta ville.');
+    }
+
+    if (!user.email || !EMAIL_RE.test(user.email)) {
+      return payoutError('payout_info', 'Ton compte n’a pas d’adresse e-mail valide.');
+    }
+
+    payout.network = network;
+    payout.phone = phone;
+    payout.city = city;
+    payout.deliveryEmail = user.email; // le code de retrait part vers l'e-mail vérifié du compte
+  }
+
+  const parts = [PAYOUT_METHODS[method], fullName, country];
+
+  if (payout.paypalEmail) parts.push(payout.paypalEmail);
+  if (payout.contactEmail) parts.push(payout.contactEmail);
+  if (payout.network) parts.push(CASH_NETWORKS[payout.network], payout.city, payout.phone);
+
+  return { payout, summary: parts.join(' · ') };
+}
+
+async function sendMail(to, subject, text) {
+  if (!MAIL_ENABLED) {
+    throw new Error('Envoi d’e-mails non configuré (RESEND_API_KEY et MAIL_FROM).');
+  }
+
+  try {
+    await axios.post(
+      'https://api.resend.com/emails',
+      { from: MAIL_FROM, to: [to], subject, text },
+      { headers: { Authorization: `Bearer ${RESEND_API_KEY}` }, timeout: 15000 }
+    );
+  } catch (error) {
+    const detail =
+      (error.response && error.response.data && error.response.data.message) || error.message;
+
+    throw new Error(`E-mail non envoyé : ${detail}`);
+  }
+}
+
+// Paiement PayPal automatique (identifiant de lot fixe = pas de double paiement)
+async function paypalPayout(withdrawal) {
+  try {
+    const auth = await axios.post(`${PAYPAL_BASE}/v1/oauth2/token`, 'grant_type=client_credentials', {
+      auth: { username: PAYPAL_CLIENT_ID, password: PAYPAL_CLIENT_SECRET },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 15000
+    });
+
+    const reference = `withdrawal-${withdrawal.id}`;
+
+    const response = await axios.post(
+      `${PAYPAL_BASE}/v1/payments/payouts`,
+      {
+        sender_batch_header: {
+          sender_batch_id: reference,
+          email_subject: 'Tes gains AI Video Quiz',
+          email_message: 'Voici le paiement de tes points AI Video Quiz.'
+        },
+        items: [
+          {
+            recipient_type: 'EMAIL',
+            receiver: withdrawal.payout.paypalEmail,
+            amount: { value: (withdrawal.amountCents / 100).toFixed(2), currency: 'USD' },
+            note: 'AI Video Quiz',
+            sender_item_id: reference
+          }
+        ]
+      },
+      { headers: { Authorization: `Bearer ${auth.data.access_token}` }, timeout: 20000 }
+    );
+
+    return response.data.batch_header.payout_batch_id;
+  } catch (error) {
+    const detail =
+      (error.response && error.response.data && (error.response.data.message || error.response.data.error_description)) ||
+      error.message;
+
+    throw new Error(`PayPal : ${detail}`);
+  }
+}
+
+function cashCodeEmail(withdrawal, code) {
+  const payout = withdrawal.payout;
+  const amount = (withdrawal.amountCents / 100).toFixed(2);
+
+  return [
+    `Bonjour ${payout.fullName},`,
+    '',
+    `Ta demande de retrait n°${withdrawal.id} (${amount} $) a été payée.`,
+    '',
+    `Réseau : ${CASH_NETWORKS[payout.network]}`,
+    `Code de retrait : ${code}`,
+    `Montant : ${amount} $ USD`,
+    `Bénéficiaire : ${payout.fullName} (${payout.city}, ${payout.country})`,
+    '',
+    `Présente-toi dans une agence ${CASH_NETWORKS[payout.network]} avec une pièce d’identité au nom de ${payout.fullName}.`,
+    'Ne communique ce code à personne d’autre.',
+    '',
+    'AI Video Quiz'
+  ].join('\n');
+}
+
+// ============================================================
 // ROUTES DE L'ÉLÈVE
 // ============================================================
 
@@ -709,17 +905,13 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
     });
   }
 
-  const payoutInfo = String((req.body && req.body.payoutInfo) || '')
-    .replace(/\s+/g, ' ')
-    .trim();
+  const built = buildPayout(req.body || {}, user);
 
-  if (payoutInfo.length < 3 || payoutInfo.length > 120) {
-    return res.status(400).json({
-      ok: false,
-      code: 'payout_info',
-      error: 'Indique où recevoir ton paiement (3 à 120 caractères).'
-    });
+  if (built.error) {
+    return res.status(400).json({ ok: false, ...built.error });
   }
+
+  const payoutInfo = built.summary;
 
   const withdrawal = {
     id: state.nextWithdrawalId++,
@@ -728,6 +920,7 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
     points,
     amountCents,
     payoutInfo,
+    payout: built.payout,
     status: 'pending',
     createdAt: new Date().toISOString()
   };
@@ -763,6 +956,7 @@ router.get('/api/rewards/admin/overview', requireAdmin, (req, res) => {
     ok: true,
     config: publicConfig(),
     timeZone: TIME_ZONE,
+    capabilities: { mail: MAIL_ENABLED, paypalAuto: PAYPAL_ENABLED },
     stats: {
       users: users.length,
       usersWithPoints: users.filter(user => user.points > 0).length,
@@ -826,7 +1020,9 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
   return res.json({ ok: true, config: publicConfig() });
 });
 
-router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, (req, res) => {
+const resolving = new Set(); // demandes en cours de traitement (évite un double paiement)
+
+router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res) => {
   const withdrawal = state.withdrawals.find(item => item.id === Number(req.params.id));
 
   if (!withdrawal) {
@@ -837,31 +1033,86 @@ router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, (req, res) => {
     return res.status(409).json({ ok: false, error: 'Cette demande est déjà traitée.' });
   }
 
-  const action = req.body && req.body.action;
+  const body = req.body || {};
+  const action = body.action;
 
   if (action !== 'paid' && action !== 'rejected') {
     return res.status(400).json({ ok: false, error: 'Action invalide.' });
   }
 
-  const user = state.users[withdrawal.uid];
-
-  if (user) {
-    user.lockedPoints = Math.max(0, user.lockedPoints - withdrawal.points);
-
-    if (action === 'paid') {
-      user.withdrawnPoints += withdrawal.points;
-    }
+  if (resolving.has(withdrawal.id)) {
+    return res.status(409).json({ ok: false, error: 'Cette demande est en cours de traitement.' });
   }
 
-  withdrawal.status = action;
-  withdrawal.resolvedAt = new Date().toISOString();
-  withdrawal.note = String((req.body && req.body.note) || '').slice(0, 200);
+  resolving.add(withdrawal.id);
 
-  audit({ type: `withdrawal_${action}`, id: withdrawal.id, uid: withdrawal.uid, amountCents: withdrawal.amountCents });
+  try {
+    const payout = withdrawal.payout || {};
 
-  saveState();
+    if (action === 'paid') {
+      if (payout.method === 'cash') {
+        // Le code de retrait est envoyé à l'élève ; sans e-mail réussi, la demande reste en attente
+        const code = String(body.code || '').trim();
 
-  return res.json({ ok: true, withdrawal });
+        if (!/^[A-Za-z0-9 -]{4,40}$/.test(code)) {
+          return res.status(400).json({ ok: false, error: 'Code de retrait invalide (4 à 40 caractères).' });
+        }
+
+        try {
+          await sendMail(
+            payout.deliveryEmail,
+            `Ton code de retrait ${CASH_NETWORKS[payout.network]}`,
+            cashCodeEmail(withdrawal, code)
+          );
+        } catch (error) {
+          return res.status(502).json({ ok: false, error: error.message });
+        }
+
+        withdrawal.cashCode = code;
+        withdrawal.codeSentAt = new Date().toISOString();
+      } else if (payout.method === 'paypal' && body.auto === true) {
+        if (!PAYPAL_ENABLED) {
+          return res.status(400).json({ ok: false, error: 'PayPal automatique non configuré.' });
+        }
+
+        try {
+          withdrawal.paypalBatchId = await paypalPayout(withdrawal);
+        } catch (error) {
+          return res.status(502).json({ ok: false, error: error.message });
+        }
+      }
+    }
+
+    const user = state.users[withdrawal.uid];
+
+    if (user) {
+      user.lockedPoints = Math.max(0, user.lockedPoints - withdrawal.points);
+
+      if (action === 'paid') {
+        user.withdrawnPoints += withdrawal.points;
+      }
+    }
+
+    withdrawal.status = action;
+    withdrawal.resolvedAt = new Date().toISOString();
+    withdrawal.note = String(body.note || '').slice(0, 200);
+
+    audit({
+      type: `withdrawal_${action}`,
+      id: withdrawal.id,
+      uid: withdrawal.uid,
+      amountCents: withdrawal.amountCents,
+      method: payout.method || null,
+      paypalBatchId: withdrawal.paypalBatchId || null,
+      codeSent: Boolean(withdrawal.codeSentAt)
+    });
+
+    saveState();
+
+    return res.json({ ok: true, withdrawal });
+  } finally {
+    resolving.delete(withdrawal.id);
+  }
 });
 
 // ============================================================
@@ -961,6 +1212,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   var KEY = null;
   try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
   var cfg = null;
+  var caps = {};
 
   function $(id) { return document.getElementById(id); }
   function money(cents) { return '$' + (cents / 100).toFixed(2); }
@@ -984,6 +1236,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
   function render(data) {
     cfg = data.config;
+    caps = data.capabilities || {};
     $('switchText').textContent = cfg.withdrawalsEnabled ? 'Les élèves peuvent demander un retrait.' : 'Le bouton « Retirer » est désactivé pour tous les élèves.';
     var t = $('toggleBtn');
     t.textContent = cfg.withdrawalsEnabled ? 'Désactiver les retraits' : 'Activer les retraits';
@@ -1002,14 +1255,43 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     var any = false;
     data.withdrawals.forEach(function (w) {
       var when = new Date(w.createdAt).toLocaleString();
-      var lines = [el('div', { text: '#' + w.id + ' · ' + w.email + ' · ' + money(w.amountCents) + ' (' + w.points + ' points)' }),
-                   el('div', { class: 'muted', text: 'Paiement : ' + w.payoutInfo + ' · ' + when })];
+      var p = w.payout || {};
+      var NAMES = { card: 'Carte bancaire (Stripe)', paypal: 'PayPal', cash: 'Western Union / Wafacash' };
+      var lines = [el('div', { text: '#' + w.id + ' · ' + w.email + ' · ' + money(w.amountCents) + ' (' + w.points + ' points)' })];
+      if (p.method) {
+        lines.push(el('div', { text: 'Moyen : ' + (NAMES[p.method] || p.method) + (p.network ? ' (' + (p.network === 'wafacash' ? 'Wafacash' : 'Western Union') + ')' : '') }));
+        lines.push(el('div', { class: 'muted', text: 'Bénéficiaire : ' + p.fullName + ' · ' + (p.city ? p.city + ', ' : '') + p.country }));
+        if (p.paypalEmail) lines.push(el('div', { class: 'muted', text: 'E-mail PayPal : ' + p.paypalEmail }));
+        if (p.contactEmail) lines.push(el('div', { class: 'muted', text: 'E-mail de contact : ' + p.contactEmail }));
+        if (p.phone) lines.push(el('div', { class: 'muted', text: 'Téléphone : ' + p.phone + ' · code envoyé à : ' + p.deliveryEmail }));
+        lines.push(el('div', { class: 'muted', text: when }));
+      } else {
+        lines.push(el('div', { class: 'muted', text: 'Paiement : ' + w.payoutInfo + ' · ' + when }));
+      }
       if (w.status === 'pending') {
         any = true;
-        var paid = el('button', { text: 'Marquer payé' }), rej = el('button', { class: 'secondary', text: 'Refuser' });
-        paid.addEventListener('click', function () { resolve(w.id, 'paid'); });
-        rej.addEventListener('click', function () { resolve(w.id, 'rejected'); });
-        lines.push(el('div', { class: 'actions' }, [paid, rej]));
+        var rej = el('button', { class: 'secondary', text: 'Refuser' });
+        rej.addEventListener('click', function () { resolve(w, 'rejected', 'manual'); });
+        var buttons = [];
+        if (p.method === 'cash') {
+          var send = el('button', { text: caps.mail ? 'Envoyer le code et marquer payé' : 'E-mail non configuré' });
+          send.disabled = !caps.mail;
+          send.addEventListener('click', function () { resolve(w, 'paid', 'cash'); });
+          buttons.push(send);
+        } else if (p.method === 'paypal' && caps.paypalAuto) {
+          var auto = el('button', { text: 'Payer via PayPal' });
+          auto.addEventListener('click', function () { resolve(w, 'paid', 'paypal-auto'); });
+          buttons.push(auto);
+          var man = el('button', { class: 'secondary', text: 'Déjà payé à la main' });
+          man.addEventListener('click', function () { resolve(w, 'paid', 'manual'); });
+          buttons.push(man);
+        } else {
+          var paid = el('button', { text: 'Marquer payé' });
+          paid.addEventListener('click', function () { resolve(w, 'paid', 'manual'); });
+          buttons.push(paid);
+        }
+        buttons.push(rej);
+        lines.push(el('div', { class: 'actions' }, buttons));
         pending.appendChild(el('div', { class: 'req' }, lines));
       } else {
         lines.push(el('div', { class: w.status === 'paid' ? 'on' : 'off', text: (w.status === 'paid' ? 'Payé' : 'Refusé') + (w.note ? ' · ' + w.note : '') }));
@@ -1020,11 +1302,22 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
   }
 
-  function resolve(id, action) {
-    var label = action === 'paid' ? 'Confirmer que tu as payé cette demande ?' : 'Refuser cette demande ? Les points reviennent à l’élève.';
-    if (!confirm(label)) return;
-    var note = action === 'rejected' ? (prompt('Motif (facultatif)') || '') : '';
-    api('/withdrawals/' + id, { method: 'POST', body: { action: action, note: note } }).then(function (r) {
+  function resolve(w, action, mode) {
+    var body = { action: action };
+    if (action === 'rejected') {
+      if (!confirm('Refuser cette demande ? Les points reviennent à l’élève.')) return;
+      body.note = prompt('Motif (facultatif)') || '';
+    } else if (mode === 'cash') {
+      var code = prompt('Code de retrait ' + (w.payout.network === 'wafacash' ? 'Wafacash' : 'Western Union') + ' (il sera envoyé par e-mail à ' + w.payout.deliveryEmail + ')');
+      if (!code) return;
+      body.code = code.trim();
+    } else if (mode === 'paypal-auto') {
+      if (!confirm('Envoyer ' + money(w.amountCents) + ' à ' + w.payout.paypalEmail + ' via PayPal ?')) return;
+      body.auto = true;
+    } else if (!confirm('Confirmer que tu as payé cette demande ?')) {
+      return;
+    }
+    api('/withdrawals/' + w.id, { method: 'POST', body: body }).then(function (r) {
       notice(r.ok ? 'Demande mise à jour.' : (r.error || 'Erreur'), !r.ok); load();
     });
   }
