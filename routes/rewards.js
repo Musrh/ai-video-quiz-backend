@@ -657,7 +657,7 @@ const quizGate = [
 // ============================================================
 
 const PAYOUT_METHODS = {
-  card: 'Carte bancaire (Stripe)',
+  card: 'Carte / virement bancaire',
   paypal: 'PayPal',
   cash: 'Western Union / Wafacash'
 };
@@ -713,7 +713,16 @@ function buildPayout(body, user) {
       return payoutError('payout_info', 'Indique une adresse e-mail de contact valide.');
     }
 
+    // RIB (24 chiffres au Maroc) ou IBAN : chiffres et lettres, espaces tolérés
+    const account = cleanText(body.bankAccount, 10, 50);
+    const compact = account ? account.replace(/\s+/g, '') : '';
+
+    if (!account || !/^[A-Za-z0-9 ]+$/.test(account) || compact.length < 10 || compact.length > 34) {
+      return payoutError('payout_info', 'Indique ton RIB ou ton IBAN (10 à 34 chiffres ou lettres).');
+    }
+
     payout.contactEmail = email.toLowerCase();
+    payout.bankAccount = compact.toUpperCase();
   }
 
   if (method === 'cash') {
@@ -743,6 +752,7 @@ function buildPayout(body, user) {
 
   if (payout.paypalEmail) parts.push(payout.paypalEmail);
   if (payout.contactEmail) parts.push(payout.contactEmail);
+  if (payout.bankAccount) parts.push('RIB/IBAN ' + payout.bankAccount);
   if (payout.network) parts.push(CASH_NETWORKS[payout.network], payout.city, payout.phone);
 
   return { payout, summary: parts.join(' · ') };
@@ -1167,6 +1177,15 @@ router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res)
       }
     }
 
+    // Le RIB n'est gardé que le temps de payer : on l'efface, il ne reste que les 4 derniers caractères
+    if (payout.bankAccount) {
+      const last4 = payout.bankAccount.slice(-4);
+
+      payout.bankAccountMasked = '****' + last4;
+      delete payout.bankAccount;
+      withdrawal.payoutInfo = String(withdrawal.payoutInfo || '').replace(/RIB\/IBAN \S+/, 'RIB/IBAN ****' + last4);
+    }
+
     withdrawal.status = action;
     withdrawal.resolvedAt = new Date().toISOString();
     withdrawal.note = String(body.note || '').slice(0, 200);
@@ -1338,13 +1357,15 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     data.withdrawals.forEach(function (w) {
       var when = new Date(w.createdAt).toLocaleString();
       var p = w.payout || {};
-      var NAMES = { card: 'Carte bancaire (Stripe)', paypal: 'PayPal', cash: 'Western Union / Wafacash' };
+      var NAMES = { card: 'Carte / virement bancaire', paypal: 'PayPal', cash: 'Western Union / Wafacash' };
       var lines = [el('div', { text: '#' + w.id + ' · ' + w.email + ' · ' + money(w.amountCents) + ' (' + w.points + ' points)' })];
       if (p.method) {
         lines.push(el('div', { text: 'Moyen : ' + (NAMES[p.method] || p.method) + (p.network ? ' (' + (p.network === 'wafacash' ? 'Wafacash' : 'Western Union') + ')' : '') }));
         lines.push(el('div', { class: 'muted', text: 'Bénéficiaire : ' + p.fullName + ' · ' + (p.city ? p.city + ', ' : '') + p.country }));
         if (p.paypalEmail) lines.push(el('div', { class: 'muted', text: 'E-mail PayPal : ' + p.paypalEmail }));
         if (p.contactEmail) lines.push(el('div', { class: 'muted', text: 'E-mail de contact : ' + p.contactEmail }));
+        if (p.bankAccount) lines.push(el('div', { text: 'RIB / IBAN : ' + p.bankAccount }));
+        if (p.bankAccountMasked) lines.push(el('div', { class: 'muted', text: 'RIB / IBAN effacé après traitement : ' + p.bankAccountMasked }));
         if (p.phone) lines.push(el('div', { class: 'muted', text: 'Téléphone : ' + p.phone + ' · code envoyé à : ' + p.deliveryEmail }));
         lines.push(el('div', { class: 'muted', text: when }));
       } else {
