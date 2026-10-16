@@ -34,6 +34,7 @@ const CERTS_URL =
 // Ancien stockage des points : Firestore (document de l'élève, lu avec SON jeton).
 // Adapte ces valeurs si ta collection / ton champ ont un autre nom.
 const LEGACY_COLLECTION = process.env.LEGACY_POINTS_COLLECTION || 'users';
+const LEGACY_DATABASE_ID = process.env.LEGACY_DATABASE_ID || '(default)';
 const LEGACY_FIELDS = (process.env.LEGACY_POINTS_FIELDS || 'totalPoints,points,score,totalScore')
   .split(',')
   .map(item => item.trim())
@@ -234,6 +235,7 @@ function summarize(uid, user) {
       withdrawals: mine
     },
     config: publicConfig(),
+    legacy: { status: user.legacyStatus || null, message: user.legacyMessage || '' },
     today: { used: todayCount(user), limit: state.config.dailyVideoLimit },
     canWithdraw:
       state.config.withdrawalsEnabled &&
@@ -387,7 +389,8 @@ function readFirestoreNumber(field) {
 async function fetchLegacyPoints(uid, token) {
   const url =
     `https://firestore.googleapis.com/v1/projects/${PROJECT_ID}` +
-    `/databases/(default)/documents/${encodeURIComponent(LEGACY_COLLECTION)}/${encodeURIComponent(uid)}`;
+    `/databases/${encodeURIComponent(LEGACY_DATABASE_ID)}/documents/` +
+    `${encodeURIComponent(LEGACY_COLLECTION)}/${encodeURIComponent(uid)}`;
 
   const response = await axios.get(url, {
     headers: { Authorization: `Bearer ${token}` },
@@ -396,11 +399,16 @@ async function fetchLegacyPoints(uid, token) {
   });
 
   if (response.status === 404) {
-    return { found: false, points: 0 }; // pas d'ancien document : rien à reprendre
+    return { found: false, points: 0 };
   }
 
   if (response.status !== 200) {
-    throw new Error(`Firestore HTTP ${response.status}`);
+    const detail =
+      response.data && response.data.error && response.data.error.message
+        ? response.data.error.message
+        : '';
+
+    throw new Error(`Firestore HTTP ${response.status}${detail ? ' – ' + detail : ''}`);
   }
 
   const fields = (response.data && response.data.fields) || {};
@@ -413,12 +421,27 @@ async function fetchLegacyPoints(uid, token) {
     }
   }
 
-  return { found: true, points: 0 };
+  return { found: true, points: 0, fieldNames: Object.keys(fields) };
+}
+
+function setLegacyStatus(user, status, message) {
+  user.legacyStatus = status;
+  user.legacyMessage = message;
 }
 
 async function migrateLegacyPoints(req, res, next) {
   const uid = req.rewardUser.uid;
   const user = getUser(uid, req.rewardUser.email);
+
+  // Comptes migrés par l'ancienne version avec 0 point : on refait une lecture, une seule fois
+  if (user.legacyMigrated && !user.legacyVersion) {
+    if ((user.legacyPoints || 0) > 0) {
+      user.legacyVersion = 2;
+      saveState();
+    } else {
+      user.legacyMigrated = false;
+    }
+  }
 
   if (user.legacyMigrated) {
     return next();
@@ -436,10 +459,33 @@ async function migrateLegacyPoints(req, res, next) {
 
     // Un autre appel simultané a pu terminer la migration entre-temps
     if (!user.legacyMigrated) {
-      user.points += legacy.points;
-      user.legacyPoints = legacy.points;
-      user.legacyMigrated = true;
-      user.legacyMigratedAt = new Date().toISOString();
+      const finalize = () => {
+        user.points += legacy.points;
+        user.legacyPoints = legacy.points;
+        user.legacyMigrated = true;
+        user.legacyVersion = 2;
+        user.legacyMigratedAt = new Date().toISOString();
+      };
+
+      if (legacy.found && legacy.field) {
+        finalize();
+        setLegacyStatus(user, 'ok', `${legacy.points} points repris depuis ${LEGACY_COLLECTION}/${legacy.field}`);
+      } else {
+        // Document ou champ introuvable : on réessaie 3 fois avant de conclure « 0 point »
+        user.legacyAttempts = (user.legacyAttempts || 0) + 1;
+
+        setLegacyStatus(
+          user,
+          legacy.found ? 'nofield' : 'notfound',
+          legacy.found
+            ? `Aucun champ de points trouvé (champs vus : ${(legacy.fieldNames || []).join(', ') || 'aucun'})`
+            : `Document ${LEGACY_COLLECTION}/${uid} introuvable (base « ${LEGACY_DATABASE_ID} »)`
+        );
+
+        if (user.legacyAttempts >= 3) {
+          finalize();
+        }
+      }
 
       audit({
         type: 'legacy_import',
@@ -447,7 +493,8 @@ async function migrateLegacyPoints(req, res, next) {
         email: user.email,
         points: legacy.points,
         field: legacy.field || null,
-        found: legacy.found
+        found: legacy.found,
+        status: user.legacyStatus
       });
 
       saveState();
@@ -455,6 +502,8 @@ async function migrateLegacyPoints(req, res, next) {
   } catch (error) {
     // On ne bloque pas l'élève et on ne marque rien : nouvel essai à la prochaine requête
     console.error(`⚠️ Reprise des anciens points impossible (${uid}) :`, error.message);
+    setLegacyStatus(user, 'error', error.message);
+    saveState();
   }
 
   return next();
@@ -1020,6 +1069,31 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
   return res.json({ ok: true, config: publicConfig() });
 });
 
+// Relance la reprise des points Firebase d'un compte : l'import se refait à sa prochaine connexion
+router.post('/api/rewards/admin/legacy-reset', requireAdmin, (req, res) => {
+  const email = String((req.body && req.body.email) || '').trim().toLowerCase();
+  const entry = Object.entries(state.users).find(([, item]) => String(item.email).toLowerCase() === email);
+
+  if (!email || !entry) {
+    return res.status(404).json({ ok: false, error: 'Aucun compte avec cet e-mail (il doit s’être connecté au moins une fois).' });
+  }
+
+  const [uid, user] = entry;
+
+  // On retire seulement ce qui avait été importé : les points gagnés depuis restent
+  user.points = Math.max(0, user.points - (user.legacyPoints || 0));
+  user.legacyPoints = 0;
+  user.legacyMigrated = false;
+  user.legacyVersion = undefined;
+  user.legacyAttempts = 0;
+  setLegacyStatus(user, null, '');
+
+  audit({ type: 'legacy_reset', uid, email: user.email });
+  saveState();
+
+  return res.json({ ok: true });
+});
+
 const resolving = new Set(); // demandes en cours de traitement (évite un double paiement)
 
 router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res) => {
@@ -1190,6 +1264,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </section>
 
     <section>
+      <h2>Points Firebase (anciens comptes)</h2>
+      <div class="muted">Si un élève ne voit pas ses anciens points, relance la reprise : elle se refait à sa prochaine connexion.</div>
+      <label for="legacyEmail">E-mail du compte</label>
+      <input id="legacyEmail" type="email" autocomplete="off">
+      <div class="row" style="margin-top:8px"><button id="legacyBtn" class="secondary">Relancer la reprise</button></div>
+    </section>
+
+    <section>
       <h2>Résumé</h2>
       <div class="grid" id="stats"></div>
     </section>
@@ -1342,6 +1424,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     });
   });
   $('pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
+
+  $('legacyBtn').addEventListener('click', function () {
+    var email = $('legacyEmail').value.trim();
+    if (!email) return;
+    api('/legacy-reset', { method: 'POST', body: { email: email } }).then(function (r) {
+      notice(r.ok ? 'Reprise relancée : l’élève doit se reconnecter (ou recharger la page).' : (r.error || 'Erreur'), !r.ok);
+    });
+  });
 
   $('toggleBtn').addEventListener('click', function () {
     var next = !cfg.withdrawalsEnabled;
