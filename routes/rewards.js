@@ -77,7 +77,10 @@ const DEFAULT_CONFIG = {
   pointValueCents: 10, // 1 point = 0,10 $
   minWithdrawalCents: 1000, // minimum de retrait : 10 $
   dailyVideoLimit: 10, // vidéos jouées par jour et par élève
-  withdrawalsEnabled: true // interrupteur général des retraits
+  withdrawalsEnabled: true, // interrupteur général des retraits
+  depositCents: 500, // dépôt de garantie du mode récompense : 5 $
+  depositRefundDays: 3, // délai de remboursement quand l'élève quitte le mode récompense
+  depositInstructions: '' // comment payer le dépôt (affiché aux élèves)
 };
 
 // ============================================================
@@ -185,6 +188,20 @@ function availablePoints(user) {
   return Math.max(0, user.points - user.lockedPoints - user.withdrawnPoints);
 }
 
+// Mode récompense actif : l'élève a choisi ce mode et son dépôt est confirmé
+// (statuts du dépôt : pending, held, refunding, leaving, refunded, rejected)
+function rewardActive(user) {
+  return (
+    user.mode === 'reward' &&
+    Boolean(user.deposit) &&
+    ['held', 'refunding', 'refunded'].includes(user.deposit.status)
+  );
+}
+
+function depositBusy(user) {
+  return rewardActive(user) || Boolean(user.deposit && ['pending', 'leaving'].includes(user.deposit.status));
+}
+
 function pendingWithdrawal(uid) {
   return state.withdrawals.find(item => item.uid === uid && item.status === 'pending');
 }
@@ -196,9 +213,25 @@ function todayCount(user) {
 }
 
 function publicConfig() {
-  const { pointValueCents, minWithdrawalCents, dailyVideoLimit, withdrawalsEnabled } = state.config;
+  const {
+    pointValueCents,
+    minWithdrawalCents,
+    dailyVideoLimit,
+    withdrawalsEnabled,
+    depositCents,
+    depositRefundDays,
+    depositInstructions
+  } = state.config;
 
-  return { pointValueCents, minWithdrawalCents, dailyVideoLimit, withdrawalsEnabled };
+  return {
+    pointValueCents,
+    minWithdrawalCents,
+    dailyVideoLimit,
+    withdrawalsEnabled,
+    depositCents,
+    depositRefundDays,
+    depositInstructions
+  };
 }
 
 // Tout ce que la page a besoin de savoir sur l'élève
@@ -216,6 +249,9 @@ function summarize(uid, user) {
       amountCents: item.amountCents,
       points: item.points,
       status: item.status,
+      type: item.type || 'withdrawal',
+      depositCents: item.depositCents || 0,
+      dueBy: item.dueBy || null,
       method: item.payout ? item.payout.method : null,
       network: item.payout && item.payout.network ? item.payout.network : null,
       codeSent: Boolean(item.codeSentAt),
@@ -232,6 +268,16 @@ function summarize(uid, user) {
       lockedPoints: user.lockedPoints,
       withdrawnPoints: user.withdrawnPoints,
       balanceCents,
+      mode: user.mode || null,
+      rewardActive: rewardActive(user),
+      deposit: {
+        status: user.deposit ? user.deposit.status : null,
+        heldCents:
+          user.deposit && ['held', 'refunding', 'leaving'].includes(user.deposit.status)
+            ? user.deposit.amountCents
+            : 0,
+        refundDueBy: user.deposit ? user.deposit.refundDueBy || null : null
+      },
       withdrawals: mine
     },
     config: publicConfig(),
@@ -239,6 +285,7 @@ function summarize(uid, user) {
     today: { used: todayCount(user), limit: state.config.dailyVideoLimit },
     canWithdraw:
       state.config.withdrawalsEnabled &&
+      rewardActive(user) &&
       !pending &&
       balanceCents >= state.config.minWithdrawalCents
   };
@@ -902,6 +949,8 @@ router.post('/api/rewards/submit', requireUser, migrateLegacyPoints, (req, res) 
 
   if (user.plays[quiz.videoId]) {
     reason = 'already_played'; // une seule tentative rémunérée par vidéo
+  } else if (!rewardActive(user)) {
+    reason = 'no_reward_mode'; // jeu libre : on joue, mais sans points ni cumul
   } else {
     user.plays[quiz.videoId] = {
       at: new Date().toISOString(),
@@ -945,6 +994,14 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
     });
   }
 
+  if (!rewardActive(user)) {
+    return res.status(403).json({
+      ok: false,
+      code: 'reward_mode_required',
+      error: 'Les retraits sont réservés au mode récompense.'
+    });
+  }
+
   if (pendingWithdrawal(uid)) {
     return res.status(409).json({
       ok: false,
@@ -954,9 +1011,13 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
   }
 
   const points = availablePoints(user);
-  const amountCents = points * state.config.pointValueCents;
+  const pointsCents = points * state.config.pointValueCents;
 
-  if (amountCents < state.config.minWithdrawalCents) {
+  // Le dépôt de garantie est rendu avec le premier retrait
+  const depositCents = user.deposit.status === 'held' ? user.deposit.amountCents : 0;
+  const amountCents = pointsCents + depositCents;
+
+  if (pointsCents < state.config.minWithdrawalCents) {
     return res.status(400).json({
       ok: false,
       code: 'below_minimum',
@@ -978,16 +1039,148 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
     email: user.email,
     points,
     amountCents,
+    depositCents,
     payoutInfo,
     payout: built.payout,
     status: 'pending',
     createdAt: new Date().toISOString()
   };
 
+  if (depositCents > 0) {
+    user.deposit.status = 'refunding';
+  }
+
   user.lockedPoints += points;
   state.withdrawals.push(withdrawal);
 
   audit({ type: 'withdrawal_requested', id: withdrawal.id, uid, email: user.email, points, amountCents });
+
+  saveState();
+
+  return res.json(summarize(uid, user));
+});
+
+// Choix « jeu libre » : on joue sans points ni cumul
+router.post('/api/rewards/mode', requireUser, (req, res) => {
+  const user = getUser(req.rewardUser.uid, req.rewardUser.email);
+
+  if (String((req.body && req.body.mode) || '') !== 'free') {
+    return res.status(400).json({ ok: false, error: 'Mode invalide.' });
+  }
+
+  if (depositBusy(user)) {
+    return res.status(409).json({
+      ok: false,
+      code: 'quit_first',
+      error: 'Quitte d’abord le mode récompense.'
+    });
+  }
+
+  user.mode = 'free';
+  saveState();
+
+  return res.json(summarize(req.rewardUser.uid, user));
+});
+
+// Mode récompense : l'élève déclare avoir payé le dépôt, l'administrateur le confirme
+router.post('/api/rewards/deposit', requireUser, (req, res) => {
+  const uid = req.rewardUser.uid;
+  const user = getUser(uid, req.rewardUser.email);
+  const body = req.body || {};
+
+  if (depositBusy(user)) {
+    return res.status(409).json({
+      ok: false,
+      code: 'deposit_exists',
+      error: 'Tu as déjà un dépôt en cours ou un mode récompense actif.'
+    });
+  }
+
+  const payMethod = cleanText(body.payMethod, 2, 40);
+  const payerName = cleanText(body.payerName, 2, 80);
+  const reference = cleanText(body.reference, 4, 80);
+
+  if (!payMethod || !payerName || !reference) {
+    return res.status(400).json({
+      ok: false,
+      code: 'deposit_info',
+      error: 'Indique comment tu as payé, ton nom et la référence du paiement.'
+    });
+  }
+
+  user.mode = 'reward';
+  user.deposit = {
+    status: 'pending',
+    amountCents: state.config.depositCents,
+    payMethod,
+    payerName,
+    reference,
+    declaredAt: new Date().toISOString()
+  };
+
+  audit({ type: 'deposit_declared', uid, email: user.email, amountCents: user.deposit.amountCents, payMethod, reference });
+
+  saveState();
+
+  return res.json(summarize(uid, user));
+});
+
+// Quitter le mode récompense : le dépôt est remboursé dans le délai prévu
+router.post('/api/rewards/leave', requireUser, (req, res) => {
+  const uid = req.rewardUser.uid;
+  const user = getUser(uid, req.rewardUser.email);
+
+  if (user.mode !== 'reward' || !user.deposit) {
+    return res.status(409).json({ ok: false, error: 'Tu n’es pas en mode récompense.' });
+  }
+
+  if (pendingWithdrawal(uid)) {
+    return res.status(409).json({
+      ok: false,
+      code: 'pending',
+      error: 'Une demande est en cours de traitement : attends qu’elle soit payée.'
+    });
+  }
+
+  if (user.deposit.status === 'pending') {
+    return res.status(409).json({
+      ok: false,
+      code: 'deposit_pending',
+      error: 'Ton dépôt est en cours de vérification : attends sa confirmation.'
+    });
+  }
+
+  if (user.deposit.status === 'held') {
+    const built = buildPayout(req.body || {}, user);
+
+    if (built.error) {
+      return res.status(400).json({ ok: false, ...built.error });
+    }
+
+    const dueBy = new Date(Date.now() + state.config.depositRefundDays * 86400000).toISOString();
+
+    state.withdrawals.push({
+      id: state.nextWithdrawalId++,
+      uid,
+      email: user.email,
+      type: 'deposit_refund',
+      points: 0,
+      amountCents: user.deposit.amountCents,
+      payoutInfo: built.summary,
+      payout: built.payout,
+      status: 'pending',
+      createdAt: new Date().toISOString(),
+      dueBy
+    });
+
+    user.deposit.status = 'leaving';
+    user.deposit.refundDueBy = dueBy;
+  }
+
+  // Dépôt déjà rendu (premier retrait) : rien à rembourser. Les points restent sur le compte.
+  user.mode = 'free';
+
+  audit({ type: 'mode_left', uid, email: user.email, deposit: user.deposit.status });
 
   saveState();
 
@@ -1025,8 +1218,18 @@ router.get('/api/rewards/admin/overview', requireAdmin, (req, res) => {
       pendingCents: pending.reduce((sum, item) => sum + item.amountCents, 0),
       paidCents: state.withdrawals
         .filter(item => item.status === 'paid')
-        .reduce((sum, item) => sum + item.amountCents, 0)
+        .reduce((sum, item) => sum + item.amountCents, 0),
+      depositsHeldCents: users.reduce(
+        (sum, user) =>
+          user.deposit && ['held', 'refunding', 'leaving'].includes(user.deposit.status)
+            ? sum + user.deposit.amountCents
+            : sum,
+        0
+      )
     },
+    deposits: Object.entries(state.users)
+      .filter(([, user]) => user.deposit && user.deposit.status === 'pending')
+      .map(([uid, user]) => ({ uid, email: user.email, ...user.deposit })),
     withdrawals: state.withdrawals.slice(-200).reverse()
   });
 });
@@ -1070,6 +1273,26 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
     next.dailyVideoLimit = body.dailyVideoLimit;
   }
 
+  if (body.depositCents !== undefined) {
+    if (!integer(body.depositCents, 100, 100000)) {
+      return res.status(400).json({ ok: false, error: 'Montant du dépôt invalide.' });
+    }
+
+    next.depositCents = body.depositCents;
+  }
+
+  if (body.depositRefundDays !== undefined) {
+    if (!integer(body.depositRefundDays, 1, 30)) {
+      return res.status(400).json({ ok: false, error: 'Délai de remboursement invalide.' });
+    }
+
+    next.depositRefundDays = body.depositRefundDays;
+  }
+
+  if (body.depositInstructions !== undefined) {
+    next.depositInstructions = String(body.depositInstructions).trim().slice(0, 600);
+  }
+
   audit({ type: 'config', before: state.config, after: next });
 
   state.config = next;
@@ -1077,6 +1300,36 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
   saveState();
 
   return res.json({ ok: true, config: publicConfig() });
+});
+
+// Confirme (argent reçu) ou refuse (rien reçu) le dépôt déclaré par un élève
+router.post('/api/rewards/admin/deposits/:uid', requireAdmin, (req, res) => {
+  const user = state.users[req.params.uid];
+  const action = req.body && req.body.action;
+
+  if (!user || !user.deposit || user.deposit.status !== 'pending') {
+    return res.status(404).json({ ok: false, error: 'Aucun dépôt en attente pour ce compte.' });
+  }
+
+  if (action !== 'confirm' && action !== 'reject') {
+    return res.status(400).json({ ok: false, error: 'Action invalide.' });
+  }
+
+  if (action === 'confirm') {
+    user.deposit.status = 'held';
+    user.deposit.confirmedAt = new Date().toISOString();
+    user.mode = 'reward';
+  } else {
+    user.deposit.status = 'rejected';
+    user.deposit.note = String((req.body && req.body.note) || '').slice(0, 200);
+    user.mode = null;
+  }
+
+  audit({ type: `deposit_${action}`, uid: req.params.uid, email: user.email, amountCents: user.deposit.amountCents });
+
+  saveState();
+
+  return res.json({ ok: true });
 });
 
 // Relance la reprise des points Firebase d'un compte : l'import se refait à sa prochaine connexion
@@ -1174,6 +1427,22 @@ router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res)
 
       if (action === 'paid') {
         user.withdrawnPoints += withdrawal.points;
+      }
+
+      // Dépôt de garantie : rendu avec le premier retrait ou à la sortie du mode récompense
+      const touchesDeposit = withdrawal.type === 'deposit_refund' || withdrawal.depositCents > 0;
+
+      if (user.deposit && touchesDeposit && ['refunding', 'leaving'].includes(user.deposit.status)) {
+        if (action === 'paid') {
+          user.deposit.status = 'refunded';
+          user.deposit.refundedAt = new Date().toISOString();
+        } else {
+          user.deposit.status = 'held';
+
+          if (withdrawal.type === 'deposit_refund') {
+            user.mode = 'reward'; // remboursement refusé : l'élève reste en mode récompense
+          }
+        }
       }
     }
 
@@ -1278,6 +1547,12 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       <input id="minWithdrawal" type="number" step="1" min="1" max="10000">
       <label for="dailyLimit">Vidéos jouées par jour et par élève</label>
       <input id="dailyLimit" type="number" step="1" min="1" max="1000">
+      <label for="depositAmount">Dépôt de garantie du mode récompense (en dollars)</label>
+      <input id="depositAmount" type="number" step="1" min="1" max="1000">
+      <label for="depositDays">Délai de remboursement quand l'élève quitte (en jours)</label>
+      <input id="depositDays" type="number" step="1" min="1" max="30">
+      <label for="depositInstructions">Comment payer le dépôt (affiché aux élèves : PayPal, RIB, Wafacash…)</label>
+      <textarea id="depositInstructions" maxlength="600" style="width:100%;min-height:90px;padding:10px;border:1px solid #cbd5e1;border-radius:8px;font:inherit"></textarea>
       <div class="row" style="margin-top:12px"><button id="saveBtn">Enregistrer les réglages</button></div>
       <div class="muted" style="margin-top:8px">Un changement de la valeur du point s'applique aux soldes actuels. Le « jour » commence à minuit (<span id="tz"></span>).</div>
     </section>
@@ -1293,6 +1568,11 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     <section>
       <h2>Résumé</h2>
       <div class="grid" id="stats"></div>
+    </section>
+
+    <section>
+      <h2>Dépôts de garantie à vérifier</h2>
+      <div id="deposits"></div>
     </section>
 
     <section>
@@ -1345,12 +1625,30 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     $('pointValue').value = (cfg.pointValueCents / 100).toFixed(2);
     $('minWithdrawal').value = Math.round(cfg.minWithdrawalCents / 100);
     $('dailyLimit').value = cfg.dailyVideoLimit;
+    $('depositAmount').value = Math.round(cfg.depositCents / 100);
+    $('depositDays').value = cfg.depositRefundDays;
+    $('depositInstructions').value = cfg.depositInstructions || '';
     $('tz').textContent = data.timeZone;
 
     var s = data.stats, stats = $('stats'); stats.innerHTML = '';
     [['Élèves inscrits', s.users], ['Élèves avec des points', s.usersWithPoints], ['Points gagnés (total)', s.pointsEarned],
-     ['Dû aux élèves', money(s.owedCents)], ['En attente de paiement', s.pendingCount + ' · ' + money(s.pendingCents)], ['Déjà payé', money(s.paidCents)]]
+     ['Dû aux élèves', money(s.owedCents)], ['En attente de paiement', s.pendingCount + ' · ' + money(s.pendingCents)], ['Déjà payé', money(s.paidCents)], ['Dépôts détenus', money(s.depositsHeldCents)]]
       .forEach(function (x) { stats.appendChild(el('div', { class: 'stat' }, [el('b', { text: String(x[1]) }), el('span', { class: 'muted', text: x[0] })])); });
+
+    var depBox = $('deposits'); depBox.innerHTML = '';
+    (data.deposits || []).forEach(function (d) {
+      var ok = el('button', { text: 'Dépôt reçu' }), no = el('button', { class: 'secondary', text: 'Pas reçu' });
+      ok.addEventListener('click', function () { resolveDeposit(d, 'confirm'); });
+      no.addEventListener('click', function () { resolveDeposit(d, 'reject'); });
+      depBox.appendChild(el('div', { class: 'req' }, [
+        el('div', { text: d.email + ' · ' + money(d.amountCents) }),
+        el('div', { class: 'muted', text: 'Payé par : ' + d.payMethod + ' · Nom : ' + d.payerName }),
+        el('div', { text: 'Référence : ' + d.reference }),
+        el('div', { class: 'muted', text: new Date(d.declaredAt).toLocaleString('fr-FR') }),
+        el('div', { class: 'actions' }, [ok, no])
+      ]));
+    });
+    if (!depBox.firstChild) depBox.appendChild(el('div', { class: 'muted', text: 'Aucun dépôt à vérifier.' }));
 
     var pending = $('pending'), history = $('history'); pending.innerHTML = ''; history.innerHTML = '';
     var any = false;
@@ -1358,7 +1656,13 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       var when = new Date(w.createdAt).toLocaleString();
       var p = w.payout || {};
       var NAMES = { card: 'Carte / virement bancaire', paypal: 'PayPal', cash: 'Western Union / Wafacash' };
-      var lines = [el('div', { text: '#' + w.id + ' · ' + w.email + ' · ' + money(w.amountCents) + ' (' + w.points + ' points)' })];
+      var title = '#' + w.id + ' · ' + w.email + ' · ' + money(w.amountCents) + ' (' + w.points + ' points)';
+      if (w.type === 'deposit_refund') {
+        title = '#' + w.id + ' · ' + w.email + ' · REMBOURSEMENT DU DÉPÔT · ' + money(w.amountCents) + (w.dueBy ? ' · à payer avant le ' + new Date(w.dueBy).toLocaleDateString('fr-FR') : '');
+      } else if (w.depositCents) {
+        title += ' + dépôt remboursé ' + money(w.depositCents);
+      }
+      var lines = [el('div', { text: title })];
       if (p.method) {
         lines.push(el('div', { text: 'Moyen : ' + (NAMES[p.method] || p.method) + (p.network ? ' (' + (p.network === 'wafacash' ? 'Wafacash' : 'Western Union') + ')' : '') }));
         lines.push(el('div', { class: 'muted', text: 'Bénéficiaire : ' + p.fullName + ' · ' + (p.city ? p.city + ', ' : '') + p.country }));
@@ -1403,6 +1707,19 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     });
     if (!any) pending.appendChild(el('div', { class: 'muted', text: 'Aucune demande en attente.' }));
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
+  }
+
+  function resolveDeposit(d, action) {
+    var body = { action: action };
+    if (action === 'confirm') {
+      if (!confirm('Confirmer que tu as bien reçu ' + money(d.amountCents) + ' de ' + d.email + ' ?')) return;
+    } else {
+      if (!confirm('Refuser ce dépôt (rien reçu) ?')) return;
+      body.note = prompt('Motif (facultatif)') || '';
+    }
+    api('/deposits/' + d.uid, { method: 'POST', body: body }).then(function (r) {
+      notice(r.ok ? 'Dépôt mis à jour.' : (r.error || 'Erreur'), !r.ok); load();
+    });
   }
 
   function resolve(w, action, mode) {
@@ -1464,7 +1781,10 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     var body = {
       pointValueCents: Math.round(parseFloat($('pointValue').value) * 100),
       minWithdrawalCents: Math.round(parseFloat($('minWithdrawal').value) * 100),
-      dailyVideoLimit: parseInt($('dailyLimit').value, 10)
+      dailyVideoLimit: parseInt($('dailyLimit').value, 10),
+      depositCents: Math.round(parseFloat($('depositAmount').value) * 100),
+      depositRefundDays: parseInt($('depositDays').value, 10),
+      depositInstructions: $('depositInstructions').value
     };
     api('/config', { method: 'POST', body: body }).then(function (r) { notice(r.ok ? 'Réglages enregistrés.' : (r.error || 'Erreur'), !r.ok); load(); });
   });
