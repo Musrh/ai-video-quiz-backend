@@ -52,6 +52,17 @@ const PAYPAL_BASE =
     ? 'https://api-m.paypal.com'
     : 'https://api-m.sandbox.paypal.com';
 
+// Stripe (clé secrète « sk_test_… » en mode test, « sk_live_… » en production)
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_ENABLED = Boolean(STRIPE_SECRET_KEY);
+const STRIPE_TEST = STRIPE_SECRET_KEY.startsWith('sk_test_');
+
+// Adresses autorisées pour revenir sur la page de l'élève après un paiement
+const FRONTEND_ORIGINS = (process.env.FRONTEND_URLS || 'https://musrh.github.io')
+  .split(',')
+  .map(item => item.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
 const MAIL_ENABLED = Boolean(RESEND_API_KEY && MAIL_FROM);
 const PAYPAL_ENABLED = Boolean(PAYPAL_CLIENT_ID && PAYPAL_CLIENT_SECRET);
 
@@ -91,7 +102,8 @@ let state = {
   config: { ...DEFAULT_CONFIG },
   users: {}, // uid -> { email, points, lockedPoints, withdrawnPoints, plays, days, createdAt }
   withdrawals: [],
-  nextWithdrawalId: 1
+  nextWithdrawalId: 1,
+  payments: {} // identifiant de paiement Stripe/PayPal -> uid (un paiement ne sert qu'une fois)
 };
 
 function loadState() {
@@ -103,7 +115,8 @@ function loadState() {
         config: { ...DEFAULT_CONFIG, ...(raw.config || {}) },
         users: raw.users || {},
         withdrawals: raw.withdrawals || [],
-        nextWithdrawalId: raw.nextWithdrawalId || 1
+        nextWithdrawalId: raw.nextWithdrawalId || 1,
+        payments: raw.payments || {}
       };
     }
 
@@ -230,7 +243,8 @@ function publicConfig() {
     withdrawalsEnabled,
     depositCents,
     depositRefundDays,
-    depositInstructions
+    depositInstructions,
+    depositProviders: { stripe: STRIPE_ENABLED, stripeTest: STRIPE_TEST, paypal: PAYPAL_ENABLED }
   };
 }
 
@@ -272,6 +286,7 @@ function summarize(uid, user) {
       rewardActive: rewardActive(user),
       deposit: {
         status: user.deposit ? user.deposit.status : null,
+        provider: user.deposit ? user.deposit.provider || 'manual' : null,
         heldCents:
           user.deposit && ['held', 'refunding', 'leaving'].includes(user.deposit.status)
             ? user.deposit.amountCents
@@ -531,6 +546,7 @@ async function migrateLegacyPoints(req, res, next) {
 
         if (user.legacyAttempts >= 3) {
           finalize();
+          setLegacyStatus(user, 'ok', 'Aucun ancien compte à reprendre');
         }
       }
 
@@ -1060,6 +1076,237 @@ router.post('/api/rewards/withdraw', requireUser, migrateLegacyPoints, (req, res
   return res.json(summarize(uid, user));
 });
 
+// ----- Paiement du dépôt par Stripe / PayPal -----
+
+// Adresse de retour : seulement les sites autorisés (FRONTEND_URLS)
+function safeReturnUrl(value) {
+  try {
+    const url = new URL(String(value || ''));
+
+    if (!FRONTEND_ORIGINS.includes(url.origin)) return null;
+
+    return url.origin + url.pathname;
+  } catch (error) {
+    return null;
+  }
+}
+
+function gatewayError(prefix, error) {
+  const data = error.response && error.response.data;
+  const detail =
+    (data && data.error && (data.error.message || data.error)) ||
+    (data && (data.message || data.error_description)) ||
+    error.message;
+
+  return new Error(`${prefix} : ${typeof detail === 'string' ? detail : JSON.stringify(detail)}`);
+}
+
+async function paypalToken() {
+  const auth = await axios.post(`${PAYPAL_BASE}/v1/oauth2/token`, 'grant_type=client_credentials', {
+    auth: { username: PAYPAL_CLIENT_ID, password: PAYPAL_CLIENT_SECRET },
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    timeout: 15000
+  });
+
+  return auth.data.access_token;
+}
+
+async function stripeCall(method, path, form) {
+  const config = {
+    method,
+    url: `https://api.stripe.com/v1/${path}`,
+    auth: { username: STRIPE_SECRET_KEY, password: '' },
+    timeout: 20000
+  };
+
+  if (form) {
+    config.data = new URLSearchParams(form).toString();
+    config.headers = { 'Content-Type': 'application/x-www-form-urlencoded' };
+  }
+
+  return axios(config);
+}
+
+const confirming = new Set();
+
+router.post('/api/rewards/deposit/checkout', requireUser, async (req, res) => {
+  const uid = req.rewardUser.uid;
+  const user = getUser(uid, req.rewardUser.email);
+  const provider = String((req.body && req.body.provider) || '');
+  const base = safeReturnUrl(req.body && req.body.returnUrl);
+
+  if (depositBusy(user)) {
+    return res.status(409).json({ ok: false, code: 'deposit_exists', error: 'Tu as déjà un dépôt en cours ou un mode récompense actif.' });
+  }
+
+  if (!base) {
+    return res.status(400).json({ ok: false, error: 'Adresse de retour non autorisée.' });
+  }
+
+  const cents = state.config.depositCents;
+
+  try {
+    if (provider === 'stripe' && STRIPE_ENABLED) {
+      const session = await stripeCall('post', 'checkout/sessions', {
+        mode: 'payment',
+        'line_items[0][price_data][currency]': 'usd',
+        'line_items[0][price_data][unit_amount]': String(cents),
+        'line_items[0][price_data][product_data][name]': 'Dépôt de garantie AI Video Quiz',
+        'line_items[0][quantity]': '1',
+        success_url: `${base}?deposit=stripe&session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${base}?deposit=cancel`,
+        client_reference_id: uid,
+        customer_email: user.email,
+        'metadata[uid]': uid
+      });
+
+      return res.json({ ok: true, url: session.data.url });
+    }
+
+    if (provider === 'paypal' && PAYPAL_ENABLED) {
+      const token = await paypalToken();
+
+      const order = await axios.post(
+        `${PAYPAL_BASE}/v2/checkout/orders`,
+        {
+          intent: 'CAPTURE',
+          purchase_units: [
+            {
+              custom_id: uid,
+              description: 'Dépôt de garantie AI Video Quiz',
+              amount: { currency_code: 'USD', value: (cents / 100).toFixed(2) }
+            }
+          ],
+          application_context: {
+            brand_name: 'AI Video Quiz',
+            user_action: 'PAY_NOW',
+            return_url: `${base}?deposit=paypal`,
+            cancel_url: `${base}?deposit=cancel`
+          }
+        },
+        { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 }
+      );
+
+      const link = (order.data.links || []).find(item => item.rel === 'approve' || item.rel === 'payer-action');
+
+      if (!link) throw new Error('Lien de paiement PayPal introuvable.');
+
+      return res.json({ ok: true, url: link.href });
+    }
+  } catch (error) {
+    const wrapped = gatewayError(provider === 'stripe' ? 'Stripe' : 'PayPal', error);
+    console.error('⚠️ Paiement du dépôt :', wrapped.message);
+
+    return res.status(502).json({ ok: false, error: 'Paiement indisponible pour le moment. Réessaie plus tard.' });
+  }
+
+  return res.status(400).json({ ok: false, error: 'Moyen de paiement indisponible.' });
+});
+
+// Après le retour de Stripe / PayPal : le serveur vérifie lui-même le paiement chez le fournisseur
+router.post('/api/rewards/deposit/confirm', requireUser, async (req, res) => {
+  const uid = req.rewardUser.uid;
+  const user = getUser(uid, req.rewardUser.email);
+  const provider = String((req.body && req.body.provider) || '');
+  const id = String((req.body && req.body.id) || '').trim();
+
+  if (!id || id.length > 200 || !/^[A-Za-z0-9_\-]+$/.test(id)) {
+    return res.status(400).json({ ok: false, error: 'Paiement introuvable.' });
+  }
+
+  const key = `${provider}:${id}`;
+
+  // Même paiement présenté deux fois (rechargement de la page) : on répond sans rien recréditer
+  if (state.payments[key] === uid && user.deposit && user.deposit.paymentId === id) {
+    return res.json(summarize(uid, user));
+  }
+
+  if (state.payments[key]) {
+    return res.status(409).json({ ok: false, error: 'Ce paiement a déjà été utilisé.' });
+  }
+
+  if (depositBusy(user)) {
+    return res.status(409).json({ ok: false, code: 'deposit_exists', error: 'Tu as déjà un dépôt en cours ou un mode récompense actif.' });
+  }
+
+  if (confirming.has(key)) {
+    return res.status(409).json({ ok: false, error: 'Vérification en cours, réessaie dans un instant.' });
+  }
+
+  confirming.add(key);
+
+  try {
+    let amountCents = 0;
+    let refundRef = '';
+
+    if (provider === 'stripe' && STRIPE_ENABLED) {
+      const session = (await stripeCall('get', `checkout/sessions/${id}`)).data;
+
+      if (session.payment_status !== 'paid' || !session.metadata || session.metadata.uid !== uid || session.currency !== 'usd') {
+        return res.status(402).json({ ok: false, error: 'Paiement non confirmé par Stripe.' });
+      }
+
+      amountCents = session.amount_total;
+      refundRef = typeof session.payment_intent === 'string' ? session.payment_intent : (session.payment_intent && session.payment_intent.id) || '';
+    } else if (provider === 'paypal' && PAYPAL_ENABLED) {
+      const token = await paypalToken();
+      const headers = { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' };
+      let order;
+
+      try {
+        order = (await axios.post(`${PAYPAL_BASE}/v2/checkout/orders/${id}/capture`, {}, { headers, timeout: 20000 })).data;
+      } catch (error) {
+        const issues = (error.response && error.response.data && error.response.data.details) || [];
+
+        if (!issues.some(item => item.issue === 'ORDER_ALREADY_CAPTURED')) throw error;
+
+        order = (await axios.get(`${PAYPAL_BASE}/v2/checkout/orders/${id}`, { headers, timeout: 20000 })).data;
+      }
+
+      const unit = (order.purchase_units || [])[0] || {};
+      const capture = ((unit.payments || {}).captures || [])[0] || {};
+
+      if (order.status !== 'COMPLETED' || capture.status !== 'COMPLETED' || unit.custom_id !== uid || !capture.amount || capture.amount.currency_code !== 'USD') {
+        return res.status(402).json({ ok: false, error: 'Paiement non confirmé par PayPal.' });
+      }
+
+      amountCents = Math.round(Number(capture.amount.value) * 100);
+      refundRef = capture.id;
+    } else {
+      return res.status(400).json({ ok: false, error: 'Moyen de paiement indisponible.' });
+    }
+
+    if (!Number.isFinite(amountCents) || amountCents < state.config.depositCents) {
+      return res.status(402).json({ ok: false, error: 'Montant du paiement insuffisant.' });
+    }
+
+    user.mode = 'reward';
+    user.deposit = {
+      status: 'held',
+      provider,
+      paymentId: id,
+      refundRef,
+      amountCents,
+      paidAt: new Date().toISOString(),
+      confirmedAt: new Date().toISOString()
+    };
+
+    state.payments[key] = uid;
+
+    audit({ type: 'deposit_paid', uid, email: user.email, provider, paymentId: id, amountCents });
+
+    saveState();
+
+    return res.json(summarize(uid, user));
+  } catch (error) {
+    console.error('⚠️ Vérification du paiement :', gatewayError(provider, error).message);
+
+    return res.status(502).json({ ok: false, error: 'Impossible de vérifier le paiement pour le moment. Réessaie dans un instant.' });
+  } finally {
+    confirming.delete(key);
+  }
+});
+
 // Choix « jeu libre » : on joue sans points ni cumul
 router.post('/api/rewards/mode', requireUser, (req, res) => {
   const user = getUser(req.rewardUser.uid, req.rewardUser.email);
@@ -1126,7 +1373,7 @@ router.post('/api/rewards/deposit', requireUser, (req, res) => {
 });
 
 // Quitter le mode récompense : le dépôt est remboursé dans le délai prévu
-router.post('/api/rewards/leave', requireUser, (req, res) => {
+router.post('/api/rewards/leave', requireUser, async (req, res) => {
   const uid = req.rewardUser.uid;
   const user = getUser(uid, req.rewardUser.email);
 
@@ -1150,7 +1397,32 @@ router.post('/api/rewards/leave', requireUser, (req, res) => {
     });
   }
 
-  if (user.deposit.status === 'held') {
+  if (user.deposit.status === 'held' && ['stripe', 'paypal'].includes(user.deposit.provider)) {
+    // Dépôt payé en ligne : remboursé tout de suite sur le moyen de paiement d'origine
+    try {
+      if (user.deposit.provider === 'stripe') {
+        await stripeCall('post', 'refunds', { payment_intent: user.deposit.refundRef });
+      } else {
+        const token = await paypalToken();
+
+        await axios.post(
+          `${PAYPAL_BASE}/v2/payments/captures/${user.deposit.refundRef}/refund`,
+          {},
+          { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, timeout: 20000 }
+        );
+      }
+    } catch (error) {
+      console.error('⚠️ Remboursement du dépôt :', gatewayError(user.deposit.provider, error).message);
+
+      return res.status(502).json({
+        ok: false,
+        error: 'Remboursement impossible pour le moment. Réessaie plus tard ou contacte l’administrateur.'
+      });
+    }
+
+    user.deposit.status = 'refunded';
+    user.deposit.refundedAt = new Date().toISOString();
+  } else if (user.deposit.status === 'held') {
     const built = buildPayout(req.body || {}, user);
 
     if (built.error) {
@@ -1208,7 +1480,7 @@ router.get('/api/rewards/admin/overview', requireAdmin, (req, res) => {
     ok: true,
     config: publicConfig(),
     timeZone: TIME_ZONE,
-    capabilities: { mail: MAIL_ENABLED, paypalAuto: PAYPAL_ENABLED },
+    capabilities: { mail: MAIL_ENABLED, paypalAuto: PAYPAL_ENABLED, stripe: STRIPE_ENABLED, stripeTest: STRIPE_TEST },
     stats: {
       users: users.length,
       usersWithPoints: users.filter(user => user.points > 0).length,
@@ -1389,24 +1661,29 @@ router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res)
     if (action === 'paid') {
       if (payout.method === 'cash') {
         // Le code de retrait est envoyé à l'élève ; sans e-mail réussi, la demande reste en attente
-        const code = String(body.code || '').trim();
+        if (body.noEmail === true) {
+          // E-mail non configuré : l'administrateur a transmis le code à l'élève lui-même
+          withdrawal.codeSentManually = true;
+        } else {
+          const code = String(body.code || '').trim();
 
-        if (!/^[A-Za-z0-9 -]{4,40}$/.test(code)) {
-          return res.status(400).json({ ok: false, error: 'Code de retrait invalide (4 à 40 caractères).' });
+          if (!/^[A-Za-z0-9 -]{4,40}$/.test(code)) {
+            return res.status(400).json({ ok: false, error: 'Code de retrait invalide (4 à 40 caractères).' });
+          }
+
+          try {
+            await sendMail(
+              payout.deliveryEmail,
+              `Ton code de retrait ${CASH_NETWORKS[payout.network]}`,
+              cashCodeEmail(withdrawal, code)
+            );
+          } catch (error) {
+            return res.status(502).json({ ok: false, error: error.message });
+          }
+
+          withdrawal.cashCode = code;
+          withdrawal.codeSentAt = new Date().toISOString();
         }
-
-        try {
-          await sendMail(
-            payout.deliveryEmail,
-            `Ton code de retrait ${CASH_NETWORKS[payout.network]}`,
-            cashCodeEmail(withdrawal, code)
-          );
-        } catch (error) {
-          return res.status(502).json({ ok: false, error: error.message });
-        }
-
-        withdrawal.cashCode = code;
-        withdrawal.codeSentAt = new Date().toISOString();
       } else if (payout.method === 'paypal' && body.auto === true) {
         if (!PAYPAL_ENABLED) {
           return res.status(400).json({ ok: false, error: 'PayPal automatique non configuré.' });
@@ -1572,6 +1849,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
     <section>
       <h2>Dépôts de garantie à vérifier</h2>
+      <div id="depositGateways" class="muted"></div>
       <div id="deposits"></div>
     </section>
 
@@ -1635,6 +1913,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
      ['Dû aux élèves', money(s.owedCents)], ['En attente de paiement', s.pendingCount + ' · ' + money(s.pendingCents)], ['Déjà payé', money(s.paidCents)], ['Dépôts détenus', money(s.depositsHeldCents)]]
       .forEach(function (x) { stats.appendChild(el('div', { class: 'stat' }, [el('b', { text: String(x[1]) }), el('span', { class: 'muted', text: x[0] })])); });
 
+    $('depositGateways').textContent = 'Paiement en ligne du dépôt : ' +
+      (caps.stripe ? (caps.stripeTest ? 'Stripe (mode test)' : 'Stripe') : 'Stripe non configuré') + ' · ' +
+      (caps.paypalAuto ? 'PayPal' : 'PayPal non configuré') + '. Les paiements par RIB, Western Union ou Wafacash se confirment ci-dessous.';
     var depBox = $('deposits'); depBox.innerHTML = '';
     (data.deposits || []).forEach(function (d) {
       var ok = el('button', { text: 'Dépôt reçu' }), no = el('button', { class: 'secondary', text: 'Pas reçu' });
@@ -1681,9 +1962,8 @@ const ADMIN_PAGE = String.raw`<!doctype html>
         rej.addEventListener('click', function () { resolve(w, 'rejected', 'manual'); });
         var buttons = [];
         if (p.method === 'cash') {
-          var send = el('button', { text: caps.mail ? 'Envoyer le code et marquer payé' : 'E-mail non configuré' });
-          send.disabled = !caps.mail;
-          send.addEventListener('click', function () { resolve(w, 'paid', 'cash'); });
+          var send = el('button', { text: caps.mail ? 'Envoyer le code et marquer payé' : 'Marquer payé (code donné à la main)' });
+          send.addEventListener('click', function () { resolve(w, 'paid', caps.mail ? 'cash' : 'cash-manual'); });
           buttons.push(send);
         } else if (p.method === 'paypal' && caps.paypalAuto) {
           var auto = el('button', { text: 'Payer via PayPal' });
@@ -1731,6 +2011,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       var code = prompt('Code de retrait ' + (w.payout.network === 'wafacash' ? 'Wafacash' : 'Western Union') + ' (il sera envoyé par e-mail à ' + w.payout.deliveryEmail + ')');
       if (!code) return;
       body.code = code.trim();
+    } else if (mode === 'cash-manual') {
+      if (!confirm('Confirme que tu as envoyé l’argent ET transmis le code de retrait à l’élève (l’e-mail automatique n’est pas configuré).')) return;
+      body.noEmail = true;
     } else if (mode === 'paypal-auto') {
       if (!confirm('Envoyer ' + money(w.amountCents) + ' à ' + w.payout.paypalEmail + ' via PayPal ?')) return;
       body.auto = true;
