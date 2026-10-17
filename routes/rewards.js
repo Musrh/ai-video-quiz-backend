@@ -103,8 +103,54 @@ let state = {
   users: {}, // uid -> { email, points, lockedPoints, withdrawnPoints, plays, days, createdAt }
   withdrawals: [],
   nextWithdrawalId: 1,
-  payments: {} // identifiant de paiement Stripe/PayPal -> uid (un paiement ne sert qu'une fois)
+  payments: {}, // identifiant de paiement Stripe/PayPal -> uid (un paiement ne sert qu'une fois)
+  depositLog: [] // journal des dépôts : reçus, refusés, remboursés
 };
+
+// Journal des dépôts de garantie (affiché dans l'historique de /admin)
+function logDeposit(type, uid, user, extra) {
+  const deposit = user.deposit || {};
+
+  state.depositLog.push({
+    at: new Date().toISOString(),
+    type,
+    uid,
+    email: user.email,
+    provider: deposit.provider || 'manual',
+    payMethod: deposit.payMethod,
+    payerName: deposit.payerName,
+    reference: deposit.reference || deposit.paymentId,
+    amountCents: deposit.amountCents,
+    ...(extra || {})
+  });
+}
+
+// Reconstitue le journal à partir des dépôts déjà enregistrés (première mise à jour seulement)
+function backfillDepositLog() {
+  const log = [];
+
+  Object.entries(state.users).forEach(([uid, user]) => {
+    const deposit = user.deposit;
+
+    if (!deposit) return;
+
+    const base = {
+      uid,
+      email: user.email,
+      provider: deposit.provider || 'manual',
+      payMethod: deposit.payMethod,
+      payerName: deposit.payerName,
+      reference: deposit.reference || deposit.paymentId,
+      amountCents: deposit.amountCents
+    };
+
+    if (deposit.confirmedAt) log.push({ ...base, type: 'received', at: deposit.confirmedAt });
+    if (deposit.status === 'rejected' && deposit.declaredAt) log.push({ ...base, type: 'rejected', at: deposit.declaredAt });
+    if (deposit.refundedAt) log.push({ ...base, type: 'refunded', at: deposit.refundedAt });
+  });
+
+  return log;
+}
 
 function loadState() {
   try {
@@ -116,8 +162,13 @@ function loadState() {
         users: raw.users || {},
         withdrawals: raw.withdrawals || [],
         nextWithdrawalId: raw.nextWithdrawalId || 1,
-        payments: raw.payments || {}
+        payments: raw.payments || {},
+        depositLog: raw.depositLog || null
       };
+
+      if (!state.depositLog) {
+        state.depositLog = backfillDepositLog();
+      }
     }
 
     console.log(
@@ -1292,6 +1343,7 @@ router.post('/api/rewards/deposit/confirm', requireUser, async (req, res) => {
     };
 
     state.payments[key] = uid;
+    logDeposit('received', uid, user);
 
     audit({ type: 'deposit_paid', uid, email: user.email, provider, paymentId: id, amountCents });
 
@@ -1422,6 +1474,7 @@ router.post('/api/rewards/leave', requireUser, async (req, res) => {
 
     user.deposit.status = 'refunded';
     user.deposit.refundedAt = new Date().toISOString();
+    logDeposit('refunded', uid, user, { note: 'Remboursé à la sortie du mode récompense' });
   } else if (user.deposit.status === 'held') {
     const built = buildPayout(req.body || {}, user);
 
@@ -1499,6 +1552,7 @@ router.get('/api/rewards/admin/overview', requireAdmin, (req, res) => {
         0
       )
     },
+    depositLog: state.depositLog.slice(-300),
     deposits: Object.entries(state.users)
       .filter(([, user]) => user.deposit && user.deposit.status === 'pending')
       .map(([uid, user]) => ({ uid, email: user.email, ...user.deposit })),
@@ -1591,10 +1645,12 @@ router.post('/api/rewards/admin/deposits/:uid', requireAdmin, (req, res) => {
     user.deposit.status = 'held';
     user.deposit.confirmedAt = new Date().toISOString();
     user.mode = 'reward';
+    logDeposit('received', req.params.uid, user);
   } else {
     user.deposit.status = 'rejected';
     user.deposit.note = String((req.body && req.body.note) || '').slice(0, 200);
     user.mode = null;
+    logDeposit('rejected', req.params.uid, user, { note: user.deposit.note });
   }
 
   audit({ type: `deposit_${action}`, uid: req.params.uid, email: user.email, amountCents: user.deposit.amountCents });
@@ -1713,6 +1769,9 @@ router.post('/api/rewards/admin/withdrawals/:id', requireAdmin, async (req, res)
         if (action === 'paid') {
           user.deposit.status = 'refunded';
           user.deposit.refundedAt = new Date().toISOString();
+          logDeposit('refunded', withdrawal.uid, user, {
+            note: withdrawal.type === 'deposit_refund' ? 'Remboursement #' + withdrawal.id : 'Avec le retrait #' + withdrawal.id
+          });
         } else {
           user.deposit.status = 'held';
 
@@ -1933,6 +1992,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
     var pending = $('pending'), history = $('history'); pending.innerHTML = ''; history.innerHTML = '';
     var any = false;
+    var histItems = [];
     data.withdrawals.forEach(function (w) {
       var when = new Date(w.createdAt).toLocaleString();
       var p = w.payout || {};
@@ -1982,9 +2042,23 @@ const ADMIN_PAGE = String.raw`<!doctype html>
         pending.appendChild(el('div', { class: 'req' }, lines));
       } else {
         lines.push(el('div', { class: w.status === 'paid' ? 'on' : 'off', text: (w.status === 'paid' ? 'Payé' : 'Refusé') + (w.note ? ' · ' + w.note : '') }));
-        history.appendChild(el('div', { class: 'req' }, lines));
+        histItems.push({ t: new Date(w.resolvedAt || w.createdAt).getTime(), node: el('div', { class: 'req' }, lines) });
       }
     });
+    (data.depositLog || []).forEach(function (e) {
+      var LABELS = { received: 'DÉPÔT REÇU', refunded: 'DÉPÔT REMBOURSÉ', rejected: 'DÉPÔT REFUSÉ' };
+      var WAYS = { stripe: 'Stripe', paypal: 'PayPal', manual: 'Paiement à la main' };
+      var how = (WAYS[e.provider] || e.provider || '') + (e.payMethod ? ' (' + e.payMethod + ')' : '');
+      var dl = [el('div', { text: (LABELS[e.type] || e.type) + ' · ' + e.email + ' · ' + money(e.amountCents) })];
+      if (how) dl.push(el('div', { class: 'muted', text: 'Moyen : ' + how }));
+      if (e.payerName) dl.push(el('div', { class: 'muted', text: 'Payé par : ' + e.payerName }));
+      if (e.reference) dl.push(el('div', { class: 'muted', text: 'Référence : ' + e.reference }));
+      if (e.note) dl.push(el('div', { class: 'muted', text: e.note }));
+      dl.push(el('div', { class: 'muted', text: new Date(e.at).toLocaleString() }));
+      dl.push(el('div', { class: e.type === 'rejected' ? 'off' : 'on', text: e.type === 'received' ? 'Reçu' : e.type === 'refunded' ? 'Remboursé' : 'Refusé' }));
+      histItems.push({ t: new Date(e.at).getTime(), node: el('div', { class: 'req' }, dl) });
+    });
+    histItems.sort(function (a, b) { return b.t - a.t; }).forEach(function (item) { history.appendChild(item.node); });
     if (!any) pending.appendChild(el('div', { class: 'muted', text: 'Aucune demande en attente.' }));
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
   }
