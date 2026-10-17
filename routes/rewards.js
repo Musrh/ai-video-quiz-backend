@@ -91,7 +91,9 @@ const DEFAULT_CONFIG = {
   withdrawalsEnabled: true, // interrupteur général des retraits
   depositCents: 500, // dépôt de garantie du mode récompense : 5 $
   depositRefundDays: 3, // délai de remboursement quand l'élève quitte le mode récompense
-  depositInstructions: '' // comment payer le dépôt (affiché aux élèves)
+  depositInstructions: '', // comment payer le dépôt (affiché aux élèves)
+  // Moyens de paiement du dépôt, activés ou désactivés par l'administrateur
+  depositMethods: { stripe: true, paypal: true, rib: true, western_union: true, wafacash: true }
 };
 
 // ============================================================
@@ -252,6 +254,29 @@ function availablePoints(user) {
   return Math.max(0, user.points - user.lockedPoints - user.withdrawnPoints);
 }
 
+// Moyens de paiement du dépôt payés à la main (confirmés ensuite par l'administrateur)
+const MANUAL_DEPOSIT_METHODS = {
+  rib: 'Virement / RIB',
+  western_union: 'Western Union',
+  wafacash: 'Wafacash'
+};
+
+const DEPOSIT_METHOD_KEYS = ['stripe', 'paypal', 'rib', 'western_union', 'wafacash'];
+
+function methodEnabled(key) {
+  const flags = state.config.depositMethods || {};
+
+  return flags[key] !== false;
+}
+
+// Utilisable = activé par l'administrateur ET (pour Stripe / PayPal) configuré sur le serveur
+function methodAvailable(key) {
+  if (key === 'stripe') return STRIPE_ENABLED && methodEnabled(key);
+  if (key === 'paypal') return PAYPAL_ENABLED && methodEnabled(key);
+
+  return methodEnabled(key);
+}
+
 // Mode récompense actif : l'élève a choisi ce mode et son dépôt est confirmé
 // (statuts du dépôt : pending, held, refunding, leaving, refunded, rejected)
 function rewardActive(user) {
@@ -295,7 +320,9 @@ function publicConfig() {
     depositCents,
     depositRefundDays,
     depositInstructions,
-    depositProviders: { stripe: STRIPE_ENABLED, stripeTest: STRIPE_TEST, paypal: PAYPAL_ENABLED }
+    depositProviders: { stripe: STRIPE_ENABLED, stripeTest: STRIPE_TEST, paypal: PAYPAL_ENABLED },
+    depositMethods: Object.fromEntries(DEPOSIT_METHOD_KEYS.map(key => [key, methodAvailable(key)])),
+    depositMethodFlags: Object.fromEntries(DEPOSIT_METHOD_KEYS.map(key => [key, methodEnabled(key)]))
   };
 }
 
@@ -1205,7 +1232,7 @@ router.post('/api/rewards/deposit/checkout', requireUser, async (req, res) => {
   const cents = state.config.depositCents;
 
   try {
-    if (provider === 'stripe' && STRIPE_ENABLED) {
+    if (provider === 'stripe' && methodAvailable('stripe')) {
       const session = await stripeCall('post', 'checkout/sessions', {
         mode: 'payment',
         'line_items[0][price_data][currency]': 'usd',
@@ -1222,7 +1249,7 @@ router.post('/api/rewards/deposit/checkout', requireUser, async (req, res) => {
       return res.json({ ok: true, url: session.data.url });
     }
 
-    if (provider === 'paypal' && PAYPAL_ENABLED) {
+    if (provider === 'paypal' && methodAvailable('paypal')) {
       const token = await paypalToken();
 
       const order = await axios.post(
@@ -1259,7 +1286,11 @@ router.post('/api/rewards/deposit/checkout', requireUser, async (req, res) => {
     return res.status(502).json({ ok: false, error: 'Paiement indisponible pour le moment. Réessaie plus tard.' });
   }
 
-  return res.status(400).json({ ok: false, error: 'Moyen de paiement indisponible.' });
+  return res.status(403).json({
+    ok: false,
+    code: 'method_disabled',
+    error: 'Ce moyen de paiement est désactivé pour le moment.'
+  });
 });
 
 // Après le retour de Stripe / PayPal : le serveur vérifie lui-même le paiement chez le fournisseur
@@ -1411,7 +1442,26 @@ router.post('/api/rewards/deposit', requireUser, (req, res) => {
     });
   }
 
-  const payMethod = cleanText(body.payMethod, 2, 40);
+  // Le moyen vient de la page (rib, western_union, wafacash) ; les anciens libellés restent acceptés
+  let methodKey = String(body.payMethod || '').trim();
+
+  if (!MANUAL_DEPOSIT_METHODS[methodKey]) {
+    methodKey = Object.keys(MANUAL_DEPOSIT_METHODS).find(key => MANUAL_DEPOSIT_METHODS[key] === methodKey) || '';
+  }
+
+  if (!methodKey) {
+    return res.status(400).json({ ok: false, code: 'deposit_info', error: 'Choisis un moyen de paiement valide.' });
+  }
+
+  if (!methodAvailable(methodKey)) {
+    return res.status(403).json({
+      ok: false,
+      code: 'method_disabled',
+      error: 'Ce moyen de paiement est désactivé pour le moment.'
+    });
+  }
+
+  const payMethod = MANUAL_DEPOSIT_METHODS[methodKey];
   const payerName = cleanText(body.payerName, 2, 80);
   const reference = cleanText(body.reference, 4, 80);
 
@@ -1637,6 +1687,23 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
 
   if (body.depositInstructions !== undefined) {
     next.depositInstructions = String(body.depositInstructions).trim().slice(0, 600);
+  }
+
+  if (body.depositMethods !== undefined) {
+    const flags = { ...(state.config.depositMethods || {}) };
+    const sent = body.depositMethods && typeof body.depositMethods === 'object' ? body.depositMethods : {};
+
+    for (const key of DEPOSIT_METHOD_KEYS) {
+      if (sent[key] === undefined) continue;
+
+      if (typeof sent[key] !== 'boolean') {
+        return res.status(400).json({ ok: false, error: 'Réglage de moyen de paiement invalide.' });
+      }
+
+      flags[key] = sent[key];
+    }
+
+    next.depositMethods = flags;
   }
 
   audit({ type: 'config', before: state.config, after: next });
@@ -2046,6 +2113,12 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </section>
 
     <section>
+      <h2>Moyens de paiement du dépôt</h2>
+      <div class="muted">Les élèves voient chaque moyen avec son état (activé ou désactivé). Un moyen désactivé ne peut plus être utilisé pour un nouveau dépôt.</div>
+      <div id="methods"></div>
+    </section>
+
+    <section>
       <h2>Dépôts de garantie à vérifier</h2>
       <div id="depositGateways" class="muted"></div>
       <div id="deposits"></div>
@@ -2115,6 +2188,21 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     $('depositGateways').textContent = 'Paiement en ligne du dépôt : ' +
       (caps.stripe ? (caps.stripeTest ? 'Stripe (mode test)' : 'Stripe') : 'Stripe non configuré') + ' · ' +
       (caps.paypalAuto ? 'PayPal' : 'PayPal non configuré') + '. Les paiements par RIB, Western Union ou Wafacash se confirment ci-dessous.';
+    var METHODS = [['stripe', 'Carte bancaire (Stripe)'], ['paypal', 'PayPal'], ['rib', 'Virement / RIB'], ['western_union', 'Western Union'], ['wafacash', 'Wafacash']];
+    var methodsBox = $('methods'); methodsBox.innerHTML = '';
+    METHODS.forEach(function (m) {
+      var key = m[0], name = m[1];
+      var on = (cfg.depositMethodFlags || {})[key] !== false;
+      var configured = key === 'stripe' ? caps.stripe : key === 'paypal' ? caps.paypalAuto : true;
+      var label = !configured ? 'Non configuré sur le serveur' : (on ? 'Activé' : 'Désactivé');
+      var btn = el('button', { class: on ? 'secondary' : '', text: on ? 'Désactiver' : 'Activer' });
+      btn.addEventListener('click', function () { toggleMethod(key, !on, name); });
+      methodsBox.appendChild(el('div', { class: 'req' }, [
+        el('div', { text: name + ' : ' + label }),
+        el('div', { class: 'actions' }, [btn])
+      ]));
+    });
+
     var depBox = $('deposits'); depBox.innerHTML = '';
     (data.deposits || []).forEach(function (d) {
       var ok = el('button', { text: 'Dépôt reçu' }), no = el('button', { class: 'secondary', text: 'Pas reçu' });
@@ -2201,6 +2289,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     histItems.sort(function (a, b) { return b.t - a.t; }).forEach(function (item) { history.appendChild(item.node); });
     if (!any) pending.appendChild(el('div', { class: 'muted', text: 'Aucune demande en attente.' }));
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
+  }
+
+  function toggleMethod(key, value, name) {
+    if (!confirm((value ? 'Activer' : 'Désactiver') + ' « ' + name + ' » pour les nouveaux dépôts ?')) return;
+    var flags = {}; flags[key] = value;
+    api('/config', { method: 'POST', body: { depositMethods: flags } }).then(function (r) {
+      notice(r.ok ? 'Moyen de paiement mis à jour.' : (r.error || 'Erreur'), !r.ok); load();
+    });
   }
 
   function resolveDeposit(d, action) {
