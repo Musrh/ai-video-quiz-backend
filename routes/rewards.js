@@ -1503,6 +1503,10 @@ router.post('/api/rewards/leave', requireUser, async (req, res) => {
   }
 
   // Dépôt déjà rendu (premier retrait) : rien à rembourser. Les points restent sur le compte.
+  if (user.deposit.status === 'refunded') {
+    logDeposit('left', uid, user, { note: 'Dépôt déjà remboursé : aucun nouveau remboursement' });
+  }
+
   user.mode = 'free';
 
   audit({ type: 'mode_left', uid, email: user.email, deposit: user.deposit.status });
@@ -1626,6 +1630,125 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
   saveState();
 
   return res.json({ ok: true, config: publicConfig() });
+});
+
+// Export CSV : trace de toutes les opérations (retraits, remboursements, dépôts)
+function csvCell(value) {
+  let text = value === null || value === undefined ? '' : String(value);
+
+  // Une cellule ne doit jamais être lue comme une formule par Excel
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
+
+  return /[";\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function csvMoney(cents) {
+  return cents === null || cents === undefined ? '' : (cents / 100).toFixed(2).replace('.', ',');
+}
+
+function csvDate(iso) {
+  return iso ? String(iso).replace('T', ' ').slice(0, 19) : '';
+}
+
+router.get('/api/rewards/admin/export', requireAdmin, (req, res) => {
+  const rows = [];
+
+  state.withdrawals.forEach(item => {
+    const payout = item.payout || {};
+    const masked =
+      payout.bankAccountMasked || (payout.bankAccount ? '****' + payout.bankAccount.slice(-4) : '');
+    const how = payout.method
+      ? (PAYOUT_METHODS[payout.method] || payout.method) +
+        (payout.network ? ` (${CASH_NETWORKS[payout.network] || payout.network})` : '')
+      : item.payoutInfo || '';
+    const notes = [];
+
+    if (item.depositCents) notes.push(`dont dépôt remboursé ${csvMoney(item.depositCents)}`);
+    if (masked) notes.push(`RIB ${masked}`);
+    if (item.paypalBatchId) notes.push(`Lot PayPal ${item.paypalBatchId}`);
+    if (item.codeSentAt) notes.push('Code envoyé par e-mail');
+    if (item.codeSentManually) notes.push('Code transmis à la main');
+    if (item.note) notes.push(item.note);
+
+    rows.push({
+      at: item.createdAt,
+      cells: [
+        csvDate(item.createdAt),
+        item.type === 'deposit_refund' ? 'Remboursement de dépôt' : 'Retrait',
+        item.id,
+        item.email,
+        csvMoney(item.amountCents),
+        item.points,
+        how,
+        payout.fullName || '',
+        [payout.city, payout.country].filter(Boolean).join(', '),
+        '',
+        { pending: 'En attente', paid: 'Payé', rejected: 'Refusé' }[item.status] || item.status,
+        csvDate(item.resolvedAt),
+        notes.join(' · ')
+      ]
+    });
+  });
+
+  const TYPES = {
+    received: 'Dépôt reçu',
+    refunded: 'Dépôt remboursé',
+    rejected: 'Dépôt refusé',
+    left: 'Sortie du mode récompense'
+  };
+
+  (state.depositLog || []).forEach(event => {
+    const way =
+      { stripe: 'Stripe', paypal: 'PayPal', manual: 'Paiement à la main' }[event.provider] || event.provider || '';
+
+    rows.push({
+      at: event.at,
+      cells: [
+        csvDate(event.at),
+        TYPES[event.type] || event.type,
+        '',
+        event.email,
+        csvMoney(event.amountCents),
+        '',
+        way + (event.payMethod ? ` (${event.payMethod})` : ''),
+        event.payerName || '',
+        '',
+        event.reference || '',
+        { received: 'Reçu', refunded: 'Remboursé', rejected: 'Refusé', left: 'Sans remboursement' }[event.type] || '',
+        '',
+        event.note || ''
+      ]
+    });
+  });
+
+  rows.sort((a, b) => String(a.at).localeCompare(String(b.at)));
+
+  const header = [
+    'Date',
+    'Opération',
+    'N°',
+    'E-mail',
+    'Montant (USD)',
+    'Points',
+    'Moyen',
+    'Bénéficiaire / payeur',
+    'Lieu',
+    'Référence',
+    'Statut',
+    'Date de traitement',
+    'Notes'
+  ];
+
+  const csv = [header, ...rows.map(row => row.cells)].map(cells => cells.map(csvCell).join(';')).join('\r\n');
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="operations-${new Date().toISOString().slice(0, 10)}.csv"`
+  );
+
+  // Le BOM permet à Excel d'ouvrir correctement les accents
+  return res.send('\ufeff' + csv);
 });
 
 // Confirme (argent reçu) ou refuse (rien reçu) le dépôt déclaré par un élève
@@ -1919,6 +2042,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
     <section>
       <h2>Historique</h2>
+      <div class="row" style="margin-bottom:10px"><button id="exportBtn" class="secondary">Télécharger l'historique (CSV)</button></div>
       <div id="history"></div>
     </section>
 
@@ -2046,7 +2170,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       }
     });
     (data.depositLog || []).forEach(function (e) {
-      var LABELS = { received: 'DÉPÔT REÇU', refunded: 'DÉPÔT REMBOURSÉ', rejected: 'DÉPÔT REFUSÉ' };
+      var LABELS = { received: 'DÉPÔT REÇU', refunded: 'DÉPÔT REMBOURSÉ', rejected: 'DÉPÔT REFUSÉ', left: 'SORTIE DU MODE RÉCOMPENSE' };
       var WAYS = { stripe: 'Stripe', paypal: 'PayPal', manual: 'Paiement à la main' };
       var how = (WAYS[e.provider] || e.provider || '') + (e.payMethod ? ' (' + e.payMethod + ')' : '');
       var dl = [el('div', { text: (LABELS[e.type] || e.type) + ' · ' + e.email + ' · ' + money(e.amountCents) })];
@@ -2055,7 +2179,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
       if (e.reference) dl.push(el('div', { class: 'muted', text: 'Référence : ' + e.reference }));
       if (e.note) dl.push(el('div', { class: 'muted', text: e.note }));
       dl.push(el('div', { class: 'muted', text: new Date(e.at).toLocaleString() }));
-      dl.push(el('div', { class: e.type === 'rejected' ? 'off' : 'on', text: e.type === 'received' ? 'Reçu' : e.type === 'refunded' ? 'Remboursé' : 'Refusé' }));
+      dl.push(el('div', { class: e.type === 'rejected' ? 'off' : 'on', text: e.type === 'received' ? 'Reçu' : e.type === 'refunded' ? 'Remboursé' : e.type === 'left' ? 'Sans remboursement' : 'Refusé' }));
       histItems.push({ t: new Date(e.at).getTime(), node: el('div', { class: 'req' }, dl) });
     });
     histItems.sort(function (a, b) { return b.t - a.t; }).forEach(function (item) { history.appendChild(item.node); });
@@ -2119,6 +2243,21 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     });
   });
   $('pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
+
+  $('exportBtn').addEventListener('click', function () {
+    fetch('/api/rewards/admin/export', { headers: { 'x-admin-key': KEY || '' } })
+      .then(function (r) { if (!r.ok) throw new Error('Export impossible (erreur ' + r.status + ')'); return r.blob(); })
+      .then(function (blob) {
+        var a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'operations-' + new Date().toISOString().slice(0, 10) + '.csv';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+      })
+      .catch(function (e) { notice(e.message, true); });
+  });
 
   $('legacyBtn').addEventListener('click', function () {
     var email = $('legacyEmail').value.trim();
