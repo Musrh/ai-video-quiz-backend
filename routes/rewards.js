@@ -1186,6 +1186,14 @@ router.post('/api/rewards/deposit/checkout', requireUser, async (req, res) => {
   const provider = String((req.body && req.body.provider) || '');
   const base = safeReturnUrl(req.body && req.body.returnUrl);
 
+  if (!state.config.withdrawalsEnabled) {
+    return res.status(403).json({
+      ok: false,
+      code: 'reward_unavailable',
+      error: 'Le mode récompense n’est pas encore disponible.'
+    });
+  }
+
   if (depositBusy(user)) {
     return res.status(409).json({ ok: false, code: 'deposit_exists', error: 'Tu as déjà un dépôt en cours ou un mode récompense actif.' });
   }
@@ -1386,6 +1394,14 @@ router.post('/api/rewards/deposit', requireUser, (req, res) => {
   const uid = req.rewardUser.uid;
   const user = getUser(uid, req.rewardUser.email);
   const body = req.body || {};
+
+  if (!state.config.withdrawalsEnabled) {
+    return res.status(403).json({
+      ok: false,
+      code: 'reward_unavailable',
+      error: 'Le mode récompense n’est pas encore disponible.'
+    });
+  }
 
   if (depositBusy(user)) {
     return res.status(409).json({
@@ -1993,7 +2009,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
     <section>
       <div class="switch">
-        <div><h2 style="margin:0">Retraits</h2><div class="muted" id="switchText"></div></div>
+        <div><h2 style="margin:0">Retraits et mode récompense</h2><div class="muted" id="switchText"></div></div>
         <button id="toggleBtn"></button>
       </div>
     </section>
@@ -2079,9 +2095,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   function render(data) {
     cfg = data.config;
     caps = data.capabilities || {};
-    $('switchText').textContent = cfg.withdrawalsEnabled ? 'Les élèves peuvent demander un retrait.' : 'Le bouton « Retirer » est désactivé pour tous les élèves.';
+    $('switchText').textContent = cfg.withdrawalsEnabled ? 'Les élèves peuvent activer le mode récompense et demander un retrait.' : 'Retraits et mode récompense fermés : tout le monde joue en jeu libre. Les élèves déjà en mode récompense gardent leur dépôt.';
     var t = $('toggleBtn');
-    t.textContent = cfg.withdrawalsEnabled ? 'Désactiver les retraits' : 'Activer les retraits';
+    t.textContent = cfg.withdrawalsEnabled ? 'Fermer retraits et mode récompense' : 'Ouvrir retraits et mode récompense';
     t.className = cfg.withdrawalsEnabled ? 'danger' : '';
     $('pointValue').value = (cfg.pointValueCents / 100).toFixed(2);
     $('minWithdrawal').value = Math.round(cfg.minWithdrawalCents / 100);
@@ -2269,7 +2285,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 
   $('toggleBtn').addEventListener('click', function () {
     var next = !cfg.withdrawalsEnabled;
-    if (!confirm(next ? 'Réactiver les retraits pour tous les élèves ?' : 'Désactiver le bouton « Retirer » pour tous les élèves ?')) return;
+    if (!confirm(next ? 'Ouvrir les retraits et le mode récompense pour tous les élèves ?' : 'Fermer les retraits et le mode récompense ? Plus personne ne pourra payer un dépôt : tout le monde jouera en jeu libre. Les élèves déjà en mode récompense gardent leur dépôt et peuvent le récupérer en quittant.')) return;
     api('/config', { method: 'POST', body: { withdrawalsEnabled: next } }).then(function (r) { notice(r.ok ? 'Réglage enregistré.' : (r.error || 'Erreur'), !r.ok); load(); });
   });
 
