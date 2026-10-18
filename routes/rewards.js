@@ -361,6 +361,7 @@ function summarize(uid, user) {
       withdrawnPoints: user.withdrawnPoints,
       balanceCents,
       mode: user.mode || null,
+      blocked: Boolean(user.blocked),
       rewardActive: rewardActive(user),
       deposit: {
         status: user.deposit ? user.deposit.status : null,
@@ -378,6 +379,7 @@ function summarize(uid, user) {
     today: { used: todayCount(user), limit: state.config.dailyVideoLimit },
     canWithdraw:
       state.config.withdrawalsEnabled &&
+      !user.blocked &&
       rewardActive(user) &&
       !pending &&
       balanceCents >= state.config.minWithdrawalCents
@@ -492,6 +494,25 @@ async function requireUser(req, res, next) {
 
     req.rewardUser = user;
     req.rewardToken = token;
+
+    const record = getUser(user.uid, user.email);
+
+    // Dernière activité (enregistrée au plus toutes les 10 minutes)
+    if (!record.lastSeenAt || Date.now() - Date.parse(record.lastSeenAt) > 10 * 60 * 1000) {
+      record.lastSeenAt = new Date().toISOString();
+      saveState();
+    }
+
+    // Compte bloqué par l'administrateur : seule la lecture du solde reste possible (pour afficher le message)
+    const isMe = req.method === 'GET' && String(req.originalUrl || '').split('?')[0] === '/api/rewards/me';
+
+    if (record.blocked && !isMe) {
+      return res.status(403).json({
+        ok: false,
+        code: 'account_blocked',
+        error: 'Ton compte est bloqué. Contacte l’administrateur.'
+      });
+    }
 
     return next();
   } catch (error) {
@@ -1622,6 +1643,26 @@ router.get('/api/rewards/admin/overview', requireAdmin, (req, res) => {
         0
       )
     },
+    usersTotal: Object.keys(state.users).length,
+    users: Object.entries(state.users)
+      .map(([uid, user]) => ({
+        uid,
+        email: user.email,
+        createdAt: user.createdAt || null,
+        lastSeenAt: user.lastSeenAt || null,
+        mode: user.mode || null,
+        depositStatus: user.deposit ? user.deposit.status : null,
+        points: availablePoints(user),
+        earnedPoints: user.points,
+        videos: Object.keys(user.plays || {}).length,
+        blocked: Boolean(user.blocked),
+        blockedAt: user.blockedAt || null,
+        blockedReason: user.blockedReason || ''
+      }))
+      .sort((a, b) =>
+        String(b.lastSeenAt || b.createdAt || '').localeCompare(String(a.lastSeenAt || a.createdAt || ''))
+      )
+      .slice(0, 1000),
     depositLog: state.depositLog.slice(-300),
     deposits: Object.entries(state.users)
       .filter(([, user]) => user.deposit && user.deposit.status === 'pending')
@@ -1832,6 +1873,36 @@ router.get('/api/rewards/admin/export', requireAdmin, (req, res) => {
 
   // Le BOM permet à Excel d'ouvrir correctement les accents
   return res.send('\ufeff' + csv);
+});
+
+// Bloque ou débloque un élève : il ne peut plus jouer, gagner de points, payer un dépôt ni retirer
+router.post('/api/rewards/admin/users/:uid/block', requireAdmin, (req, res) => {
+  const user = state.users[req.params.uid];
+  const blocked = req.body && req.body.blocked;
+
+  if (!user) {
+    return res.status(404).json({ ok: false, error: 'Utilisateur introuvable.' });
+  }
+
+  if (typeof blocked !== 'boolean') {
+    return res.status(400).json({ ok: false, error: 'Action invalide.' });
+  }
+
+  if (blocked) {
+    user.blocked = true;
+    user.blockedAt = new Date().toISOString();
+    user.blockedReason = String((req.body && req.body.reason) || '').trim().slice(0, 200);
+  } else {
+    delete user.blocked;
+    delete user.blockedAt;
+    delete user.blockedReason;
+  }
+
+  audit({ type: blocked ? 'user_blocked' : 'user_unblocked', uid: req.params.uid, email: user.email, reason: user.blockedReason || '' });
+
+  saveState();
+
+  return res.json({ ok: true });
 });
 
 // Confirme (argent reçu) ou refuse (rien reçu) le dépôt déclaré par un élève
@@ -2113,6 +2184,13 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </section>
 
     <section>
+      <h2>Utilisateurs</h2>
+      <div class="muted" id="usersInfo"></div>
+      <input id="userSearch" type="search" placeholder="Rechercher par e-mail" autocomplete="off" style="margin:8px 0">
+      <div id="users"></div>
+    </section>
+
+    <section>
       <h2>Moyens de paiement du dépôt</h2>
       <div class="muted">Les élèves voient chaque moyen avec son état (activé ou désactivé). Un moyen désactivé ne peut plus être utilisé pour un nouveau dépôt.</div>
       <div id="methods"></div>
@@ -2144,6 +2222,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
   var cfg = null;
   var caps = {};
+  var usersData = [], usersTotal = 0;
 
   function $(id) { return document.getElementById(id); }
   function money(cents) { return '$' + (cents / 100).toFixed(2); }
@@ -2188,6 +2267,10 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     $('depositGateways').textContent = 'Paiement en ligne du dépôt : ' +
       (caps.stripe ? (caps.stripeTest ? 'Stripe (mode test)' : 'Stripe') : 'Stripe non configuré') + ' · ' +
       (caps.paypalAuto ? 'PayPal' : 'PayPal non configuré') + '. Les paiements par RIB, Western Union ou Wafacash se confirment ci-dessous.';
+    usersData = data.users || [];
+    usersTotal = data.usersTotal || 0;
+    renderUsers();
+
     var METHODS = [['stripe', 'Carte bancaire (Stripe)'], ['paypal', 'PayPal'], ['rib', 'Virement / RIB'], ['western_union', 'Western Union'], ['wafacash', 'Wafacash']];
     var methodsBox = $('methods'); methodsBox.innerHTML = '';
     METHODS.forEach(function (m) {
@@ -2291,6 +2374,44 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
   }
 
+  function fdate(iso) { return iso ? new Date(iso).toLocaleString('fr-FR') : '—'; }
+
+  function renderUsers() {
+    var q = ($('userSearch').value || '').trim().toLowerCase();
+    var box = $('users'); box.innerHTML = '';
+    var list = usersData.filter(function (u) { return !q || String(u.email).toLowerCase().indexOf(q) !== -1; });
+    var shown = list.slice(0, 100);
+    var blockedCount = usersData.filter(function (u) { return u.blocked; }).length;
+    $('usersInfo').textContent = usersTotal + ' compte(s) enregistré(s) sur le serveur · ' + blockedCount + ' bloqué(s)' +
+      (list.length > shown.length ? ' · ' + shown.length + ' affichés sur ' + list.length + ' (précise la recherche)' : '');
+    var MODES = { reward: 'Mode récompense', free: 'Jeu libre' };
+    var DEP = { pending: 'dépôt en vérification', held: 'dépôt détenu', refunding: 'dépôt rendu avec le retrait', leaving: 'remboursement en cours', refunded: 'dépôt rendu', rejected: 'dépôt refusé' };
+    shown.forEach(function (u) {
+      var lines = [el('div', { text: u.email + (u.blocked ? ' · BLOQUÉ' : '') })];
+      lines.push(el('div', { class: 'muted', text: (MODES[u.mode] || 'Mode non choisi') + (u.depositStatus ? ' · ' + (DEP[u.depositStatus] || u.depositStatus) : '') + ' · ' + u.points + ' point(s) · ' + u.videos + ' vidéo(s)' }));
+      lines.push(el('div', { class: 'muted', text: 'Inscrit le ' + fdate(u.createdAt) + ' · Dernière activité : ' + fdate(u.lastSeenAt) }));
+      if (u.blocked) lines.push(el('div', { class: 'muted', text: 'Bloqué le ' + fdate(u.blockedAt) + (u.blockedReason ? ' · Motif : ' + u.blockedReason : '') }));
+      var b = el('button', { class: u.blocked ? '' : 'secondary', text: u.blocked ? 'Débloquer' : 'Bloquer' });
+      b.addEventListener('click', function () { blockUser(u); });
+      lines.push(el('div', { class: 'actions' }, [b]));
+      box.appendChild(el('div', { class: 'req' }, lines));
+    });
+    if (!shown.length) box.appendChild(el('div', { class: 'muted', text: 'Aucun utilisateur.' }));
+  }
+
+  function blockUser(u) {
+    var body = { blocked: !u.blocked };
+    if (!u.blocked) {
+      if (!confirm('Bloquer ' + u.email + ' ? Il ne pourra plus jouer, gagner de points, payer un dépôt ni demander de retrait.')) return;
+      body.reason = prompt('Motif (facultatif)') || '';
+    } else if (!confirm('Débloquer ' + u.email + ' ?')) {
+      return;
+    }
+    api('/users/' + encodeURIComponent(u.uid) + '/block', { method: 'POST', body: body }).then(function (r) {
+      notice(r.ok ? (body.blocked ? 'Utilisateur bloqué.' : 'Utilisateur débloqué.') : (r.error || 'Erreur'), !r.ok); load();
+    });
+  }
+
   function toggleMethod(key, value, name) {
     if (!confirm((value ? 'Activer' : 'Désactiver') + ' « ' + name + ' » pour les nouveaux dépôts ?')) return;
     var flags = {}; flags[key] = value;
@@ -2355,6 +2476,8 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     });
   });
   $('pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
+
+  $('userSearch').addEventListener('input', renderUsers);
 
   $('exportBtn').addEventListener('click', function () {
     fetch('/api/rewards/admin/export', { headers: { 'x-admin-key': KEY || '' } })
