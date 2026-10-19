@@ -19,6 +19,11 @@ const path = require('path');
 const { adminGuard } = require('./ieltsLibrary');
 const library = require('./quizLibrary');
 
+// Clé interne (secrète, propre à ce démarrage) : permet au serveur d'appeler sa recherche et sa
+// génération de quiz pour l'administrateur, sans passer par un élève connecté.
+const INTERNAL_KEY = process.env.LIBRARY_INTERNAL_KEY || crypto.randomBytes(24).toString('hex');
+process.env.LIBRARY_INTERNAL_KEY = INTERNAL_KEY;
+
 const router = express.Router();
 
 // ============================================================
@@ -91,7 +96,8 @@ const DEFAULT_CONFIG = {
   dailyVideoLimit: 10, // vidéos jouées par jour et par élève
   withdrawalsEnabled: true, // interrupteur général des retraits
   libraryFirst: true, // servir d'abord les quiz approuvés de la bibliothèque (aucun appel API)
-  liveFallback: true, // si la bibliothèque est épuisée : permettre la recherche et la génération en direct
+  liveFallback: false, // fermée par défaut : la recherche et la génération en direct coûtent des appels API
+  liveFallbackChosen: false, // devient vrai dès que l'administrateur a lui-même ouvert ou fermé l'interrupteur
   depositCents: 500, // dépôt de garantie du mode récompense : 5 $
   depositRefundDays: 3, // délai de remboursement quand l'élève quitte le mode récompense
   depositInstructions: '', // comment payer le dépôt (affiché aux élèves)
@@ -173,6 +179,11 @@ function loadState() {
 
       if (!state.depositLog) {
         state.depositLog = backfillDepositLog();
+      }
+
+      // La recherche en direct reste fermée tant que l'administrateur ne l'a pas choisie lui-même
+      if (!state.config.liveFallbackChosen) {
+        state.config.liveFallback = false;
       }
     }
 
@@ -740,9 +751,22 @@ function limitError(user) {
 // Se place devant /api/youtube/questions : vérifie l'élève, applique la limite du jour,
 // puis retire les bonnes réponses de la réponse envoyée au navigateur.
 const quizGate = [
-  requireUser,
+  (req, res, next) => {
+    // Appel interne de l'administrateur (génération d'un quiz pour la bibliothèque)
+    const sent = String(req.get('x-internal-library') || '');
+
+    if (sent.length === INTERNAL_KEY.length && crypto.timingSafeEqual(Buffer.from(sent), Buffer.from(INTERNAL_KEY))) {
+      req.libraryInternal = true;
+
+      return next();
+    }
+
+    return requireUser(req, res, next);
+  },
 
   (req, res, next) => {
+    if (req.libraryInternal) return next();
+
     const videoId = normalizeVideoId((req.body && req.body.videoId) || req.query.videoId);
 
     if (!videoId) {
@@ -1491,8 +1515,10 @@ router.get('/api/rewards/library/next', requireUser, (req, res) => {
     return res.status(400).json({ ok: false, error: 'Langue invalide.' });
   }
 
+  const total = library.countFor({ language, category: String(req.query.category || '').slice(0, 60) });
+
   if (!state.config.libraryFirst) {
-    return res.json({ ok: true, video: null, liveFallback: state.config.liveFallback });
+    return res.json({ ok: true, video: null, total, liveFallback: state.config.liveFallback });
   }
 
   const seen = new Set([...Object.keys(user.seen || {}), ...Object.keys(user.plays || {})]);
@@ -1514,6 +1540,7 @@ router.get('/api/rewards/library/next', requireUser, (req, res) => {
     ok: true,
     video: record ? library.toVideo(record) : null,
     remaining,
+    total,
     liveFallback: state.config.liveFallback
   });
 });
@@ -1836,6 +1863,10 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
       }
 
       next[key] = body[key];
+
+      if (key === 'liveFallback') {
+        next.liveFallbackChosen = true;
+      }
     }
   }
 
@@ -1984,11 +2015,141 @@ router.get('/api/rewards/admin/export', requireAdmin, (req, res) => {
   return res.send('\ufeff' + csv);
 });
 
+// Recherche de vidéos par l'administrateur (même recherche que le jeu, plus mots-clés et page suivante)
+const LIBRARY_CATEGORIES = ['sport', 'sciences', 'art culinaire', 'culture générale'];
+const generating = new Set();
+
+function internalGet(pathname, params, timeout) {
+  return axios.get(`http://127.0.0.1:${process.env.PORT || 8080}${pathname}`, {
+    params,
+    headers: { 'x-internal-library': INTERNAL_KEY },
+    timeout,
+    validateStatus: () => true
+  });
+}
+
+router.get('/api/rewards/admin/library/search', requireAdmin, async (req, res) => {
+  const language = String(req.query.language || '').toLowerCase();
+  const category = String(req.query.category || '').toLowerCase();
+
+  if (!['fr', 'en', 'ar'].includes(language) || !LIBRARY_CATEGORIES.includes(category)) {
+    return res.status(400).json({ ok: false, error: 'Langue ou thème invalide.' });
+  }
+
+  try {
+    const response = await internalGet(
+      '/api/youtube/search',
+      {
+        language,
+        category,
+        q: String(req.query.q || '').slice(0, 80),
+        pageToken: String(req.query.pageToken || '').slice(0, 200)
+      },
+      30000
+    );
+
+    if (response.status !== 200 || !response.data || !response.data.ok) {
+      const detail = response.data && response.data.error ? response.data.error : `erreur ${response.status}`;
+
+      return res.status(502).json({ ok: false, error: `La recherche YouTube a échoué (${detail}).` });
+    }
+
+    return res.json({
+      ok: true,
+      nextPageToken: response.data.nextPageToken || null,
+      videos: (response.data.videos || []).map(video => ({
+        videoId: video.videoId,
+        title: video.title,
+        channelTitle: video.channelTitle,
+        durationFormatted: video.durationFormatted,
+        captionAvailable: Boolean(video.captionAvailable),
+        viewCount: video.viewCount || null,
+        status: library.statusOf(video.videoId, language)
+      }))
+    });
+  } catch (error) {
+    console.error('⚠️ Recherche administrateur :', error.message);
+
+    return res.status(502).json({ ok: false, error: 'La recherche n’a pas pu aboutir. Réessaie.' });
+  }
+});
+
+// Génère le quiz d'une vidéo choisie (appel payant) et le met dans « À valider »
+router.post('/api/rewards/admin/library/generate', requireAdmin, async (req, res) => {
+  const body = req.body || {};
+  const videoId = normalizeVideoId(body.videoId);
+  const language = String(body.language || '').toLowerCase();
+  const category = String(body.category || '').toLowerCase();
+
+  if (!videoId || !['fr', 'en', 'ar'].includes(language) || !LIBRARY_CATEGORIES.includes(category)) {
+    return res.status(400).json({ ok: false, error: 'Vidéo, langue ou thème invalide.' });
+  }
+
+  // Déjà connue : aucun appel payant
+  const known = library.statusOf(videoId, language);
+
+  if (known) {
+    library.capture({ videoId, language, category, video: {}, questions: [] });
+
+    return res.json({ ok: true, already: known });
+  }
+
+  const key = `${language}:${videoId}`;
+
+  if (generating.has(key)) {
+    return res.status(409).json({ ok: false, error: 'Génération déjà en cours pour cette vidéo.' });
+  }
+
+  generating.add(key);
+
+  try {
+    const response = await internalGet('/api/youtube/questions', { videoId, language, count: 4 }, 150000);
+
+    if (response.status !== 200 || !response.data || !response.data.ok) {
+      const detail = response.data && response.data.error ? response.data.error : `erreur ${response.status}`;
+
+      return res.status(502).json({ ok: false, error: `Quiz non généré : ${detail}` });
+    }
+
+    const record = library.capture({
+      videoId,
+      language,
+      category,
+      video: response.data.video,
+      questions: response.data.questions,
+      source: 'admin'
+    });
+
+    if (!record) {
+      return res.status(422).json({
+        ok: false,
+        error: 'Quiz invalide, ou liste « À valider » pleine (trie-la d’abord).'
+      });
+    }
+
+    audit({ type: 'library_generate', videoId, language, category });
+
+    return res.json({ ok: true, status: record.status });
+  } catch (error) {
+    console.error('⚠️ Génération administrateur :', error.message);
+
+    return res.status(502).json({ ok: false, error: 'La génération n’a pas pu aboutir. Réessaie.' });
+  } finally {
+    generating.delete(key);
+  }
+});
+
 // Bibliothèque de quiz : liste (à valider, approuvés, refusés) et décisions
 router.get('/api/rewards/admin/library', requireAdmin, (req, res) => {
   const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'pending';
 
-  return res.json({ ok: true, status, stats: library.stats(), items: library.list(status) });
+  return res.json({
+    ok: true,
+    status,
+    stats: library.stats(),
+    coverage: library.coverage(),
+    items: library.list(status)
+  });
 });
 
 router.post('/api/rewards/admin/library', requireAdmin, (req, res) => {
@@ -2313,7 +2474,19 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     <section>
       <h2>Bibliothèque de quiz</h2>
       <div class="muted" id="libInfo"></div>
+      <div class="muted" id="libCoverage"></div>
       <div id="libSettings"></div>
+
+      <h3 style="margin:18px 0 6px">Chercher des vidéos à valider</h3>
+      <div class="muted">La recherche utilise le quota YouTube. « Générer le quiz » utilise l'API de questions (tokens). Les quiz générés arrivent dans « À valider ».</div>
+      <select id="srLang" style="width:100%;margin:8px 0;padding:10px;border-radius:8px"><option value="fr">Français</option><option value="en">English</option><option value="ar">العربية</option></select>
+      <select id="srCat" style="width:100%;margin:0 0 8px;padding:10px;border-radius:8px"><option value="sciences">Sciences</option><option value="sport">Sport</option><option value="art culinaire">Art culinaire</option><option value="culture générale">Culture générale</option></select>
+      <input id="srQuery" type="text" maxlength="80" placeholder="Mots-clés en plus (facultatif)" autocomplete="off">
+      <div class="row" style="margin-top:8px"><button id="srBtn">Chercher</button></div>
+      <div class="muted" id="srInfo" style="margin-top:8px"></div>
+      <div id="srList"></div>
+      <div class="row" style="margin-top:8px"><button id="srMore" class="secondary" style="display:none">Résultats suivants</button></div>
+
       <div class="row" id="libTabs" style="margin:10px 0"></div>
       <div id="libList"></div>
     </section>
@@ -2359,6 +2532,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   var caps = {};
   var usersData = [], usersTotal = 0;
   var libStatus = 'pending';
+  var srToken = null;
 
   function $(id) { return document.getElementById(id); }
   function money(cents) { return '$' + (cents / 100).toFixed(2); }
@@ -2518,11 +2692,60 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   }
 
   function toggleLib(key, value, label) {
-    if (!confirm((value ? 'Activer' : 'Désactiver') + ' : ' + label + ' ?')) return;
+    var warning = key === 'liveFallback' && value
+      ? 'Attention : chaque élève qui a tout vu déclenchera une recherche YouTube et une génération de quiz payantes (tokens). Ouvrir quand même ?'
+      : (value ? 'Activer' : 'Désactiver') + ' : ' + label + ' ?';
+    if (!confirm(warning)) return;
     var body = {}; body[key] = value;
     api('/config', { method: 'POST', body: body }).then(function (r) {
       notice(r.ok ? 'Réglage enregistré.' : (r.error || 'Erreur'), !r.ok); load();
     });
+  }
+
+  function srRow(v, lang, cat) {
+    var STATUS = { pending: 'Quiz déjà généré (à valider)', approved: 'Déjà dans la bibliothèque', rejected: 'Déjà refusé' };
+    var lines = [
+      el('div', { text: v.title || v.videoId }),
+      el('div', { class: 'muted', text: (v.channelTitle || '') + ' · ' + (v.durationFormatted || '') + (v.captionAvailable ? ' · sous-titres' : ' · sous-titres non indiqués') + (v.viewCount ? ' · ' + v.viewCount + ' vues' : '') }),
+      el('a', { href: 'https://www.youtube.com/watch?v=' + v.videoId, target: '_blank', rel: 'noopener', text: 'Voir la vidéo sur YouTube' })
+    ];
+    var holder = el('div', { class: 'actions' });
+    if (v.status) {
+      holder.appendChild(el('div', { class: 'muted', text: STATUS[v.status] || v.status }));
+    } else {
+      var b = el('button', { text: 'Générer le quiz' });
+      b.addEventListener('click', function () {
+        if (!confirm('Générer le quiz de cette vidéo ? Cela utilise l’API (tokens).')) return;
+        b.disabled = true; b.textContent = 'Génération en cours…';
+        api('/library/generate', { method: 'POST', body: { videoId: v.videoId, language: lang, category: cat } }).then(function (r) {
+          if (r.ok) {
+            holder.innerHTML = '';
+            holder.appendChild(el('div', { class: 'muted', text: r.already ? 'Déjà dans la bibliothèque.' : 'Quiz généré : va dans l’onglet « À valider ».' }));
+            libStatus = 'pending'; loadLibrary();
+          } else {
+            b.disabled = false; b.textContent = 'Générer le quiz'; notice(r.error || 'Erreur', true);
+          }
+        }).catch(function () { b.disabled = false; b.textContent = 'Générer le quiz'; notice('Erreur réseau', true); });
+      });
+      holder.appendChild(b);
+    }
+    lines.push(holder);
+    return el('div', { class: 'req' }, lines);
+  }
+
+  function searchVideos(more) {
+    var lang = $('srLang').value, cat = $('srCat').value, q = $('srQuery').value.trim();
+    if (!more) { srToken = null; $('srList').innerHTML = ''; }
+    $('srInfo').textContent = 'Recherche en cours…';
+    var url = '/library/search?language=' + encodeURIComponent(lang) + '&category=' + encodeURIComponent(cat) +
+      '&q=' + encodeURIComponent(q) + (more && srToken ? '&pageToken=' + encodeURIComponent(srToken) : '');
+    api(url).then(function (d) {
+      if (!d || !d.ok) { $('srInfo').textContent = (d && d.error) || 'Erreur'; return; }
+      srToken = d.nextPageToken;
+      $('srInfo').textContent = d.videos.length + ' vidéo(s) dans cette page.';
+      d.videos.forEach(function (v) { $('srList').appendChild(srRow(v, lang, cat)); });
+      $('srMore').style.display = srToken ? '' : 'none';
+    }).catch(function () { $('srInfo').textContent = 'Erreur réseau'; });
   }
 
   function libDecide(item, action, question) {
@@ -2537,8 +2760,13 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     $('libInfo').textContent = 'Approuvés : ' + st.approved + ' · À valider : ' + st.pending + ' · Refusés : ' + st.rejected +
       ' · Quiz servis sans aucun appel API : ' + st.served;
 
+    var cov = d.coverage || [];
+    $('libCoverage').textContent = cov.length
+      ? 'Vidéos approuvées par langue et thème : ' + cov.map(function (c) { return c.language.toUpperCase() + ' · ' + c.category + ' : ' + c.approved; }).join(' — ')
+      : 'Aucune vidéo approuvée pour le moment : les élèves n’ont rien à jouer avec la recherche en direct fermée.';
+
     var box = $('libSettings'); box.innerHTML = '';
-    [['libraryFirst', 'Servir d’abord les quiz de la bibliothèque'], ['liveFallback', 'Recherche et génération en direct quand la bibliothèque est épuisée']].forEach(function (s) {
+    [['libraryFirst', 'Servir d’abord les quiz de la bibliothèque'], ['liveFallback', 'Recherche et génération en direct par les élèves (fermée : ils ne jouent que la bibliothèque)']].forEach(function (s) {
       var on = cfg[s[0]] !== false;
       var btn = el('button', { class: on ? 'secondary' : '', text: on ? 'Désactiver' : 'Activer' });
       btn.addEventListener('click', function () { toggleLib(s[0], !on, s[1]); });
@@ -2688,6 +2916,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     });
   });
   $('pass').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('loginBtn').click(); });
+
+  $('srBtn').addEventListener('click', function () { searchVideos(false); });
+  $('srMore').addEventListener('click', function () { searchVideos(true); });
 
   $('userSearch').addEventListener('input', renderUsers);
 

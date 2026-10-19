@@ -603,7 +603,8 @@ function containsExcludedTerm(
 
 async function searchYouTube(
   query,
-  language
+  language,
+  pageToken
 ) {
 
   const response =
@@ -636,6 +637,9 @@ async function searchYouTube(
 
           safeSearch:
             'moderate',
+
+          pageToken:
+            pageToken || undefined,
 
           key:
             YOUTUBE_API_KEY
@@ -797,11 +801,29 @@ router.get(
       // SEARCH
       // -----------------------------------------------------
 
+      // Options réservées à l'administrateur (appel interne du serveur) : mots-clés en plus
+      // et page suivante. Sans elles, la recherche reste exactement la même qu'avant.
+      const internalKey = process.env.LIBRARY_INTERNAL_KEY || '';
+      const internal =
+        Boolean(internalKey) &&
+        req.get('x-internal-library') === internalKey;
+      const extraKeywords = internal
+        ? String(req.query.q || '')
+            .replace(/[^\p{L}\p{N}\s'’-]/gu, ' ')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .slice(0, 80)
+        : '';
+      const pageToken =
+        internal &&
+        /^[A-Za-z0-9_-]{1,200}$/.test(String(req.query.pageToken || ''))
+          ? String(req.query.pageToken)
+          : '';
       const query =
         getSearchQuery(
           language,
           category
-        );
+        ) + (extraKeywords ? ' ' + extraKeywords : '');
 
 
       console.log(
@@ -813,7 +835,8 @@ router.get(
       const searchData =
         await searchYouTube(
           query,
-          language
+          language,
+          pageToken
         );
 
 

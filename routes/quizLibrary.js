@@ -144,16 +144,14 @@ function findApproved(videoId, language) {
 }
 
 // Garde un quiz fraîchement généré, « à valider ». Ne remplace jamais un quiz existant.
-function capture({ videoId, language, category, video, questions }) {
+function capture({ videoId, language, category, video, questions, source }) {
   if (!/^[A-Za-z0-9_-]{11}$/.test(String(videoId || '')) || !LANGUAGES.includes(language)) {
     return null;
   }
 
-  if (!validQuestions(questions)) return null;
-
   const id = makeId(language, videoId);
   const existing = state.videos[id];
-  const cleanCategory = String(category || '').trim().slice(0, 60);
+  const cleanCategory = String(category || '').trim().toLowerCase().slice(0, 60);
 
   if (existing) {
     // Même vidéo trouvée pour un autre thème : on retient le thème en plus
@@ -164,6 +162,8 @@ function capture({ videoId, language, category, video, questions }) {
 
     return existing;
   }
+
+  if (!validQuestions(questions)) return null;
 
   if (countByStatus().pending >= MAX_PENDING) return null;
 
@@ -179,7 +179,7 @@ function capture({ videoId, language, category, video, questions }) {
     duration: meta.duration || null,
     questions: JSON.parse(JSON.stringify(questions)),
     status: 'pending',
-    source: 'live',
+    source: source === 'admin' ? 'admin' : 'live',
     createdAt: new Date().toISOString(),
     served: 0
   };
@@ -191,7 +191,7 @@ function capture({ videoId, language, category, video, questions }) {
 
 // Une vidéo approuvée que cet élève n'a pas encore vue (au hasard)
 function pickUnseen({ language, category, seen }) {
-  const wanted = String(category || '').trim();
+  const wanted = String(category || '').trim().toLowerCase();
 
   const candidates = Object.values(state.videos).filter(
     record =>
@@ -207,6 +207,44 @@ function pickUnseen({ language, category, seen }) {
     record: candidates[Math.floor(Math.random() * candidates.length)],
     remaining: candidates.length
   };
+}
+
+// Combien de vidéos approuvées existent pour cette langue et ce thème (vues ou non)
+function countFor({ language, category }) {
+  const wanted = String(category || '').trim().toLowerCase();
+
+  return Object.values(state.videos).filter(
+    record =>
+      record.status === 'approved' &&
+      record.language === language &&
+      (!wanted || record.categories.includes(wanted))
+  ).length;
+}
+
+// Statut d'une vidéo dans la bibliothèque (pending, approved, rejected) ou null
+function statusOf(videoId, language) {
+  const record = state.videos[makeId(language, videoId)];
+
+  return record ? record.status : null;
+}
+
+// Nombre de vidéos approuvées par langue et par thème
+function coverage() {
+  const table = {};
+
+  Object.values(state.videos).forEach(record => {
+    if (record.status !== 'approved') return;
+
+    (record.categories.length ? record.categories : ['(sans thème)']).forEach(category => {
+      const key = `${record.language}|${category}`;
+
+      table[key] = (table[key] || 0) + 1;
+    });
+  });
+
+  return Object.entries(table)
+    .map(([key, approved]) => ({ language: key.split('|')[0], category: key.split('|')[1], approved }))
+    .sort((a, b) => (a.language + a.category).localeCompare(b.language + b.category));
 }
 
 function toVideo(record) {
@@ -281,6 +319,9 @@ module.exports = {
   capture,
   pickUnseen,
   toVideo,
+  countFor,
+  statusOf,
+  coverage,
   markServed,
   stats,
   list,
