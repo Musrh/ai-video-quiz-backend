@@ -17,6 +17,7 @@ const fsp = fs.promises;
 const path = require('path');
 
 const { adminGuard } = require('./ieltsLibrary');
+const library = require('./quizLibrary');
 
 const router = express.Router();
 
@@ -89,6 +90,8 @@ const DEFAULT_CONFIG = {
   minWithdrawalCents: 1000, // minimum de retrait : 10 $
   dailyVideoLimit: 10, // vidéos jouées par jour et par élève
   withdrawalsEnabled: true, // interrupteur général des retraits
+  libraryFirst: true, // servir d'abord les quiz approuvés de la bibliothèque (aucun appel API)
+  liveFallback: true, // si la bibliothèque est épuisée : permettre la recherche et la génération en direct
   depositCents: 500, // dépôt de garantie du mode récompense : 5 $
   depositRefundDays: 3, // délai de remboursement quand l'élève quitte le mode récompense
   depositInstructions: '', // comment payer le dépôt (affiché aux élèves)
@@ -309,7 +312,9 @@ function publicConfig() {
     withdrawalsEnabled,
     depositCents,
     depositRefundDays,
-    depositInstructions
+    depositInstructions,
+    libraryFirst,
+    liveFallback
   } = state.config;
 
   return {
@@ -320,6 +325,8 @@ function publicConfig() {
     depositCents,
     depositRefundDays,
     depositInstructions,
+    libraryFirst,
+    liveFallback,
     depositProviders: { stripe: STRIPE_ENABLED, stripeTest: STRIPE_TEST, paypal: PAYPAL_ENABLED },
     depositMethods: Object.fromEntries(DEPOSIT_METHOD_KEYS.map(key => [key, methodAvailable(key)])),
     depositMethodFlags: Object.fromEntries(DEPOSIT_METHOD_KEYS.map(key => [key, methodEnabled(key)]))
@@ -708,6 +715,18 @@ function normalizeVideoId(value) {
   return /^[A-Za-z0-9_-]{11}$/.test(id) ? id : '';
 }
 
+// Mémorise les vidéos déjà vues par l'élève (au plus 3000, les plus anciennes sont oubliées)
+function pruneSeen(user) {
+  const ids = Object.keys(user.seen || {});
+
+  if (ids.length <= 3000) return;
+
+  ids
+    .sort((a, b) => String(user.seen[a]).localeCompare(String(user.seen[b])))
+    .slice(0, ids.length - 3000)
+    .forEach(id => delete user.seen[id]);
+}
+
 function limitError(user) {
   return {
     ok: false,
@@ -732,6 +751,13 @@ const quizGate = [
 
     const uid = req.rewardUser.uid;
     const user = getUser(uid, req.rewardUser.email);
+
+    const language = String((req.body && req.body.language) || req.query.language || 'fr').trim().toLowerCase();
+    const category = String((req.body && req.body.category) || req.query.category || '').trim().slice(0, 60);
+
+    // Préparation IELTS : elle garde son fonctionnement d'origine (génération en direct à chaque fois).
+    // La bibliothèque, la mémoire des vidéos vues et la fermeture de la recherche ne la concernent pas.
+    const ielts = String((req.body && req.body.mode) || req.query.mode || '').trim().toLowerCase() === 'ielts';
 
     const alreadyToday = () => {
       const day = user.days[dayKey()];
@@ -761,6 +787,18 @@ const quizGate = [
       }
 
       const questions = body.questions.slice(0, QUIZ_QUESTION_COUNT);
+
+      // Vidéo désormais vue : l'élève ne la reverra plus. Un quiz généré en direct est gardé
+      // « à valider » : l'administrateur pourra l'approuver et il resservira sans coût.
+      if (!ielts) {
+        user.seen = user.seen || {};
+        user.seen[videoId] = dayKey();
+        pruneSeen(user);
+
+        if (!body.fromLibrary) {
+          library.capture({ videoId, language, category, video: body.video, questions });
+        }
+      }
 
       const today = dayKey();
 
@@ -809,6 +847,31 @@ const quizGate = [
         daily: { used: todayCount(user), limit: state.config.dailyVideoLimit }
       });
     };
+
+    // Quiz déjà approuvé : on le sert directement, sans aucun appel à YouTube, à la transcription ni à Claude
+    const cached = ielts ? null : library.findApproved(videoId, language);
+
+    if (cached) {
+      library.markServed(cached.id);
+
+      return res.json({
+        ok: true,
+        videoId,
+        language,
+        fromLibrary: true,
+        video: { title: cached.title, channelTitle: cached.channelTitle, duration: cached.duration },
+        questions: cached.questions
+      });
+    }
+
+    // Recherche en direct fermée : seules les vidéos de la bibliothèque sont disponibles
+    if (!ielts && !state.config.liveFallback) {
+      return res.status(403).json({
+        ok: false,
+        code: 'library_only',
+        error: 'Cette vidéo n’est pas disponible pour le moment.'
+      });
+    }
 
     return next();
   }
@@ -1419,6 +1482,42 @@ router.post('/api/rewards/deposit/confirm', requireUser, async (req, res) => {
   }
 });
 
+// Prochaine vidéo approuvée que l'élève n'a pas encore vue (aucun appel API)
+router.get('/api/rewards/library/next', requireUser, (req, res) => {
+  const user = getUser(req.rewardUser.uid, req.rewardUser.email);
+  const language = String(req.query.language || 'fr').trim().toLowerCase();
+
+  if (!['fr', 'en', 'ar'].includes(language)) {
+    return res.status(400).json({ ok: false, error: 'Langue invalide.' });
+  }
+
+  if (!state.config.libraryFirst) {
+    return res.json({ ok: true, video: null, liveFallback: state.config.liveFallback });
+  }
+
+  const seen = new Set([...Object.keys(user.seen || {}), ...Object.keys(user.plays || {})]);
+
+  String(req.query.exclude || '')
+    .split(',')
+    .slice(0, 200)
+    .forEach(id => {
+      if (/^[A-Za-z0-9_-]{11}$/.test(id)) seen.add(id);
+    });
+
+  const { record, remaining } = library.pickUnseen({
+    language,
+    category: String(req.query.category || '').slice(0, 60),
+    seen
+  });
+
+  return res.json({
+    ok: true,
+    video: record ? library.toVideo(record) : null,
+    remaining,
+    liveFallback: state.config.liveFallback
+  });
+});
+
 // Choix « jeu libre » : on joue sans points ni cumul
 router.post('/api/rewards/mode', requireUser, (req, res) => {
   const user = getUser(req.rewardUser.uid, req.rewardUser.email);
@@ -1730,6 +1829,16 @@ router.post('/api/rewards/admin/config', requireAdmin, (req, res) => {
     next.depositInstructions = String(body.depositInstructions).trim().slice(0, 600);
   }
 
+  for (const key of ['libraryFirst', 'liveFallback']) {
+    if (body[key] !== undefined) {
+      if (typeof body[key] !== 'boolean') {
+        return res.status(400).json({ ok: false, error: 'Réglage de la bibliothèque invalide.' });
+      }
+
+      next[key] = body[key];
+    }
+  }
+
   if (body.depositMethods !== undefined) {
     const flags = { ...(state.config.depositMethods || {}) };
     const sent = body.depositMethods && typeof body.depositMethods === 'object' ? body.depositMethods : {};
@@ -1873,6 +1982,24 @@ router.get('/api/rewards/admin/export', requireAdmin, (req, res) => {
 
   // Le BOM permet à Excel d'ouvrir correctement les accents
   return res.send('\ufeff' + csv);
+});
+
+// Bibliothèque de quiz : liste (à valider, approuvés, refusés) et décisions
+router.get('/api/rewards/admin/library', requireAdmin, (req, res) => {
+  const status = ['pending', 'approved', 'rejected'].includes(req.query.status) ? req.query.status : 'pending';
+
+  return res.json({ ok: true, status, stats: library.stats(), items: library.list(status) });
+});
+
+router.post('/api/rewards/admin/library', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const result = library.decide(String(body.id || ''), String(body.action || ''), body.note);
+
+  if (!result.ok) return res.status(404).json(result);
+
+  audit({ type: `library_${body.action}`, id: body.id });
+
+  return res.json({ ok: true, stats: library.stats() });
 });
 
 // Bloque ou débloque un élève : il ne peut plus jouer, gagner de points, payer un dépôt ni retirer
@@ -2184,6 +2311,14 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     </section>
 
     <section>
+      <h2>Bibliothèque de quiz</h2>
+      <div class="muted" id="libInfo"></div>
+      <div id="libSettings"></div>
+      <div class="row" id="libTabs" style="margin:10px 0"></div>
+      <div id="libList"></div>
+    </section>
+
+    <section>
       <h2>Utilisateurs</h2>
       <div class="muted" id="usersInfo"></div>
       <input id="userSearch" type="search" placeholder="Rechercher par e-mail" autocomplete="off" style="margin:8px 0">
@@ -2223,6 +2358,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   var cfg = null;
   var caps = {};
   var usersData = [], usersTotal = 0;
+  var libStatus = 'pending';
 
   function $(id) { return document.getElementById(id); }
   function money(cents) { return '$' + (cents / 100).toFixed(2); }
@@ -2267,6 +2403,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     $('depositGateways').textContent = 'Paiement en ligne du dépôt : ' +
       (caps.stripe ? (caps.stripeTest ? 'Stripe (mode test)' : 'Stripe') : 'Stripe non configuré') + ' · ' +
       (caps.paypalAuto ? 'PayPal' : 'PayPal non configuré') + '. Les paiements par RIB, Western Union ou Wafacash se confirment ci-dessous.';
+    loadLibrary();
     usersData = data.users || [];
     usersTotal = data.usersTotal || 0;
     renderUsers();
@@ -2372,6 +2509,81 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     histItems.sort(function (a, b) { return b.t - a.t; }).forEach(function (item) { history.appendChild(item.node); });
     if (!any) pending.appendChild(el('div', { class: 'muted', text: 'Aucune demande en attente.' }));
     if (!history.firstChild) history.appendChild(el('div', { class: 'muted', text: 'Rien pour le moment.' }));
+  }
+
+  function loadLibrary() {
+    return api('/library?status=' + libStatus).then(function (d) {
+      if (d && d.ok) renderLibrary(d);
+    });
+  }
+
+  function toggleLib(key, value, label) {
+    if (!confirm((value ? 'Activer' : 'Désactiver') + ' : ' + label + ' ?')) return;
+    var body = {}; body[key] = value;
+    api('/config', { method: 'POST', body: body }).then(function (r) {
+      notice(r.ok ? 'Réglage enregistré.' : (r.error || 'Erreur'), !r.ok); load();
+    });
+  }
+
+  function libDecide(item, action, question) {
+    if (question && !confirm(question)) return;
+    api('/library', { method: 'POST', body: { id: item.id, action: action } }).then(function (r) {
+      notice(r.ok ? 'Bibliothèque mise à jour.' : (r.error || 'Erreur'), !r.ok); loadLibrary();
+    });
+  }
+
+  function renderLibrary(d) {
+    var st = d.stats;
+    $('libInfo').textContent = 'Approuvés : ' + st.approved + ' · À valider : ' + st.pending + ' · Refusés : ' + st.rejected +
+      ' · Quiz servis sans aucun appel API : ' + st.served;
+
+    var box = $('libSettings'); box.innerHTML = '';
+    [['libraryFirst', 'Servir d’abord les quiz de la bibliothèque'], ['liveFallback', 'Recherche et génération en direct quand la bibliothèque est épuisée']].forEach(function (s) {
+      var on = cfg[s[0]] !== false;
+      var btn = el('button', { class: on ? 'secondary' : '', text: on ? 'Désactiver' : 'Activer' });
+      btn.addEventListener('click', function () { toggleLib(s[0], !on, s[1]); });
+      box.appendChild(el('div', { class: 'req' }, [el('div', { text: s[1] + ' : ' + (on ? 'Activé' : 'Désactivé') }), el('div', { class: 'actions' }, [btn])]));
+    });
+
+    var tabs = $('libTabs'); tabs.innerHTML = '';
+    [['pending', 'À valider (' + st.pending + ')'], ['approved', 'Approuvés (' + st.approved + ')'], ['rejected', 'Refusés (' + st.rejected + ')']].forEach(function (t) {
+      var b = el('button', { class: libStatus === t[0] ? '' : 'secondary', text: t[1] });
+      b.addEventListener('click', function () { libStatus = t[0]; loadLibrary(); });
+      tabs.appendChild(b);
+    });
+
+    var list = $('libList'); list.innerHTML = '';
+    d.items.forEach(function (item) {
+      var qs = item.questions.map(function (q, i) {
+        var rows = [el('div', { text: (i + 1) + '. ' + q.question })];
+        q.choices.forEach(function (c, k) {
+          rows.push(el('div', { class: 'muted', text: (k === Number(q.correctAnswer) ? '✔ ' : '• ') + c }));
+        });
+        return el('div', { style: 'margin:8px 0' }, rows);
+      });
+      var lines = [
+        el('div', { text: item.title || item.videoId }),
+        el('div', { class: 'muted', text: item.language.toUpperCase() + ' · ' + (item.categories.join(', ') || 'thème inconnu') + ' · ' + (item.channelTitle || 'chaîne inconnue') + ' · servi ' + (item.served || 0) + ' fois · ' + fdate(item.createdAt) }),
+        el('a', { href: 'https://www.youtube.com/watch?v=' + item.videoId, target: '_blank', rel: 'noopener', text: 'Voir la vidéo sur YouTube' }),
+        el('details', {}, [el('summary', { text: 'Voir les questions et les bonnes réponses (' + item.questions.length + ')' })].concat(qs))
+      ];
+      var buttons = [];
+      if (item.status === 'pending') {
+        var ok = el('button', { text: 'Approuver' }); ok.addEventListener('click', function () { libDecide(item, 'approve'); });
+        var no = el('button', { class: 'secondary', text: 'Refuser' }); no.addEventListener('click', function () { libDecide(item, 'reject'); });
+        buttons.push(ok, no);
+      } else if (item.status === 'approved') {
+        var out = el('button', { class: 'secondary', text: 'Retirer de la bibliothèque' }); out.addEventListener('click', function () { libDecide(item, 'reject', 'Retirer ce quiz de la bibliothèque ?'); });
+        buttons.push(out);
+      } else {
+        var back = el('button', { class: 'secondary', text: 'Remettre à valider' }); back.addEventListener('click', function () { libDecide(item, 'reopen'); });
+        var del = el('button', { class: 'secondary', text: 'Supprimer' }); del.addEventListener('click', function () { libDecide(item, 'delete', 'Supprimer définitivement ce quiz ?'); });
+        buttons.push(back, del);
+      }
+      lines.push(el('div', { class: 'actions' }, buttons));
+      list.appendChild(el('div', { class: 'req' }, lines));
+    });
+    if (!d.items.length) list.appendChild(el('div', { class: 'muted', text: 'Rien dans cette liste.' }));
   }
 
   function fdate(iso) { return iso ? new Date(iso).toLocaleString('fr-FR') : '—'; }
