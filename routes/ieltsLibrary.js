@@ -1111,7 +1111,10 @@ const PAGE = String.raw`<!doctype html>
 (function () {
   // Mot de passe administrateur : gardé dans le navigateur de l'administrateur uniquement
   var KEY = null;
-  try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
+  // Le mot de passe n'est gardé que dans CET onglet (sessionStorage) : un autre onglet, une autre
+  // session ou un compte élève ouvert ailleurs ne le voit pas. L'ancienne copie durable est effacée.
+  try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
+  try { KEY = sessionStorage.getItem('ieltsAdminKey'); } catch (e) {}
   var isAdminUI = false;
   var BASE = '/api/youtube/ielts/library';
 
@@ -1230,6 +1233,7 @@ const PAGE = String.raw`<!doctype html>
 
   function forgetKey() {
     KEY = null;
+    try { sessionStorage.removeItem('ieltsAdminKey'); } catch (e) {}
     try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
   }
 
@@ -1589,7 +1593,7 @@ const PAGE = String.raw`<!doctype html>
       .then(function (r) {
         if (r.ok) {
           KEY = value;
-          try { localStorage.setItem('ieltsAdminKey', value); } catch (e) {}
+          try { sessionStorage.setItem('ieltsAdminKey', value); } catch (e) {}
           adminPass.value = '';
           loginBox.hidden = true;
           loginMsg.textContent = '';

@@ -2527,7 +2527,9 @@ const ADMIN_PAGE = String.raw`<!doctype html>
 <script>
 (function () {
   var KEY = null;
-  try { KEY = localStorage.getItem('ieltsAdminKey'); } catch (e) {}
+  // Mot de passe gardé seulement dans cet onglet (sessionStorage) ; l'ancienne copie durable est effacée
+  try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
+  try { KEY = sessionStorage.getItem('ieltsAdminKey'); } catch (e) {}
   var cfg = null;
   var caps = {};
   var usersData = [], usersTotal = 0;
@@ -2911,7 +2913,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
     var v = $('pass').value; if (!v) return;
     KEY = v; $('loginMsg').textContent = 'Vérification…';
     api('/overview').then(function (data) {
-      if (data.ok) { try { localStorage.setItem('ieltsAdminKey', v); } catch (e) {} $('pass').value = ''; $('loginMsg').textContent = ''; $('loginBox').hidden = true; $('panel').hidden = false; render(data); }
+      if (data.ok) { try { sessionStorage.setItem('ieltsAdminKey', v); } catch (e) {} $('pass').value = ''; $('loginMsg').textContent = ''; $('loginBox').hidden = true; $('panel').hidden = false; render(data); }
       else { KEY = null; $('loginMsg').textContent = data.error || 'Mot de passe incorrect.'; }
     });
   });
@@ -2964,7 +2966,7 @@ const ADMIN_PAGE = String.raw`<!doctype html>
   });
 
   $('logoutBtn').addEventListener('click', function () {
-    KEY = null; try { localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
+    KEY = null; try { sessionStorage.removeItem('ieltsAdminKey'); localStorage.removeItem('ieltsAdminKey'); } catch (e) {}
     $('panel').hidden = true; $('loginBox').hidden = false;
   });
 
